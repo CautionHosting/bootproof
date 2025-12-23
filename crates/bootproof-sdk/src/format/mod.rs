@@ -2,6 +2,9 @@ type ErrorStr = std::borrow::Cow<'static, str>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("The attestation parameters are invalid: {0}")]
+    AttestationParameter(ErrorStr),
+
     #[error("The provided data could not be decoded ({0})")]
     MalformedData(ErrorStr),
 
@@ -15,7 +18,10 @@ pub enum Error {
     InvalidCABundle,
 
     #[error("An operation ({0}) was requested using an unsupported algorithm: {1}")]
-    UnsupportedAlgorithm(ErrorStr, ErrorStr)
+    UnsupportedAlgorithm(ErrorStr, ErrorStr),
+
+    #[error("The expected additional associated data was not successfully matched: {0}")]
+    InvalidAAD(ErrorStr),
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;

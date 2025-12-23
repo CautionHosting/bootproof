@@ -1,18 +1,33 @@
 use super::{Error, Result};
 use coset::{CborSerializable, CoseSign1, RegisteredLabelWithPrivate, iana::Algorithm};
 use serde_cbor::Value;
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 use tracing::{debug, error};
 use x509_parser::{certificate::X509Certificate, prelude::FromDer, x509::SubjectPublicKeyInfo};
 
 use super::VerifiableSignedAttestationFormat;
 
 /// A Nitro Enclave inline-signed attestation.
-pub struct Nitro(Vec<u8>);
+pub struct Nitro {
+    data: Vec<u8>,
+    pcrs: HashMap<u8, Vec<u8>>,
+}
+
+pub type NitroPcrs = HashMap<u8, Vec<u8>>;
 
 impl Nitro {
-    pub fn new(data: impl Into<Vec<u8>>) -> Self {
-        Self(data.into())
+    pub fn new(data: impl Into<Vec<u8>>, pcrs: NitroPcrs) -> Result<Self> {
+        let data = data.into();
+
+        for expected_pcr in [0, 1, 2] {
+            if !pcrs.contains_key(&expected_pcr) {
+                return Err(Error::AttestationParameter(
+                    format!("pcr {expected_pcr}").into(),
+                ));
+            }
+        }
+
+        Ok(Self { data, pcrs })
     }
 }
 
@@ -37,7 +52,7 @@ fn value_variant(v: &serde_cbor::Value) -> &'static str {
 
 fn extract_cert_and_bundle(payload: &Value) -> Result<(Vec<u8>, Vec<Vec<u8>>)> {
     let Value::Map(map) = payload else {
-        let variant = value_variant(&payload);
+        let variant = value_variant(payload);
         return Err(Error::MalformedData(
             format!("expected map, got: {variant}").into(),
         ));
@@ -169,7 +184,7 @@ impl super::VerifiableSignedAttestationFormat for Nitro {
     #[tracing::instrument(skip(self))]
     fn verify(&self, time_since_epoch: Duration) -> Result<serde_cbor::Value> {
         debug!("parsing cose data");
-        let cose_signed_blob = CoseSign1::from_slice(&self.0)
+        let cose_signed_blob = CoseSign1::from_slice(&self.data)
             .map_err(|_| Error::MalformedData("cose signed blob".into()))?;
 
         debug!("parsing payload as cbor value");
@@ -212,6 +227,7 @@ impl super::VerifiableSignedAttestationFormat for Nitro {
             .as_ref()
             .ok_or(Error::MalformedData("cose.protected.header.alg".into()))?;
 
+        debug!("verifying COSE signature");
         cose_signed_blob.verify_signature(&[], |sig, data| match alg {
             RegisteredLabelWithPrivate::Assigned(Algorithm::ES384) => {
                 verify_es384(pkey_bytes, sig, data)
@@ -221,6 +237,27 @@ impl super::VerifiableSignedAttestationFormat for Nitro {
                 format!("{alg:?}").into(),
             )),
         })?;
+
+        debug!("verifying local <-> remote PCRs");
+        if let Value::Map(map) = &payload
+            && let Some(Value::Map(pcrs)) = map.get(&Value::Text("pcrs".into()))
+        {
+            for (index, expected_pcr) in &self.pcrs {
+                if let Some(Value::Bytes(validated_pcr)) =
+                    pcrs.get(&Value::Integer(i128::from(*index)))
+                {
+                    if expected_pcr != validated_pcr {
+                        return Err(Error::InvalidAAD(format!("pcr {index}").into()));
+                    }
+                } else {
+                    return Err(Error::MissingData(
+                        format!("cose.payload.pcrs[{index}] as bytes").into(),
+                    ));
+                }
+            }
+        } else {
+            return Err(Error::MissingData("cose.payload.pcrs".into()));
+        }
 
         Ok(payload)
     }
@@ -239,9 +276,28 @@ mod tests {
     const CBOR_DATA: &'static [u8] = include_bytes!("data/aws-test.cbor");
     const VALID_DURATION: std::time::Duration = std::time::Duration::from_secs(1766510416);
 
+    const PCRS: std::sync::LazyLock<NitroPcrs> = std::sync::LazyLock::new(|| {
+        let hex0 = hex::decode("ef093e4c1fd13878956589833c0e396b935cdf5ae45c1cc595e1a19a6da5812850f0ef3e77df918cb2a86d88ddf9cc03").unwrap();
+        let hex1 = hex::decode("ef093e4c1fd13878956589833c0e396b935cdf5ae45c1cc595e1a19a6da5812850f0ef3e77df918cb2a86d88ddf9cc03").unwrap();
+        let hex2 = hex::decode("21b9efbc184807662e966d34f390821309eeac6802309798826296bf3e8bec7c10edb30948c90ba67310f7b964fc500a").unwrap();
+
+        HashMap::from_iter([(0, hex0), (1, hex1), (2, hex2)])
+    });
+
     #[test]
     fn it_works() {
-        let nitro = Nitro::new(CBOR_DATA);
+        let nitro = Nitro::new(CBOR_DATA, PCRS.clone()).unwrap();
+        nitro.verify(VALID_DURATION).unwrap();
+    }
+
+    #[test]
+    #[should_panic = "InvalidAAD"]
+    fn invalid_pcrs_fails() {
+        let mut pcrs = PCRS.clone();
+        let hex0 = pcrs.get_mut(&0).unwrap();
+        hex0[1] = !hex0[1];
+
+        let nitro = Nitro::new(CBOR_DATA, pcrs).unwrap();
         nitro.verify(VALID_DURATION).unwrap();
     }
 
@@ -254,7 +310,7 @@ mod tests {
                 60 /* seconds */ * 60 /* minutes */ * 24, /* hours */
             );
 
-        let nitro = Nitro::new(CBOR_DATA);
+        let nitro = Nitro::new(CBOR_DATA, PCRS.clone()).unwrap();
         nitro.verify(duration).unwrap();
     }
 
@@ -267,7 +323,7 @@ mod tests {
                 60 /* seconds */ * 60 /* minutes */ * 24, /* hours */
             );
 
-        let nitro = Nitro::new(CBOR_DATA);
+        let nitro = Nitro::new(CBOR_DATA, PCRS.clone()).unwrap();
         nitro.verify(duration).unwrap();
     }
 
@@ -278,7 +334,8 @@ mod tests {
         // let's mutate the CA Bundle. This is extracted from the payload, but is verified before
         // the payload is, so even though we modify the signed payload, the first error encountered
         // is an invalid CA.
-        let mut payload: Value = serde_cbor::from_slice(&cose_signed_blob.payload.take().unwrap()).unwrap();
+        let mut payload: Value =
+            serde_cbor::from_slice(&cose_signed_blob.payload.take().unwrap()).unwrap();
         // We mutate the `1` cert; mutating the `0` generates BadSignature but not InvalidCABundle
         // That should be looked into, maybe.
         if let Value::Map(ref mut map) = payload
@@ -292,7 +349,7 @@ mod tests {
         cose_signed_blob.payload = Some(serde_cbor::to_vec(&payload).unwrap());
         let evil_cbor_data = cose_signed_blob.to_vec().unwrap();
 
-        let nitro = Nitro::new(evil_cbor_data);
+        let nitro = Nitro::new(evil_cbor_data, PCRS.clone()).unwrap();
         nitro.verify(VALID_DURATION).unwrap();
     }
 
@@ -304,7 +361,7 @@ mod tests {
         cose_signed_blob.signature[2] = !cose_signed_blob.signature[2];
         let evil_cbor_data = cose_signed_blob.to_vec().unwrap();
 
-        let nitro = Nitro::new(evil_cbor_data);
+        let nitro = Nitro::new(evil_cbor_data, PCRS.clone()).unwrap();
         nitro.verify(VALID_DURATION).unwrap();
     }
 }
