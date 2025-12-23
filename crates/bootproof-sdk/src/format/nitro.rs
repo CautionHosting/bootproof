@@ -177,12 +177,22 @@ fn verify_es384(pubkey: &[u8], sig: &[u8], data: &[u8]) -> Result<()> {
 
 impl super::VerifiableSignedAttestationFormat for Nitro {
     // Strategy:
+    // * Validate provided nonce
     // * Parse payload to get COSE signature and CA info
     // * Verify Nitro certificate against AWS root
     // * Verify COSE signature
+    // * Verify PCRs
+    // * Verify nonce
+
+    // TODO: Should 
 
     #[tracing::instrument(skip(self))]
-    fn verify(&self, time_since_epoch: Duration) -> Result<serde_cbor::Value> {
+    fn verify(&self, time_since_epoch: Duration, nonce: &[u8]) -> Result<serde_cbor::Value> {
+        debug!("validating provided nonce");
+        if nonce.len() < 12 {
+            return Err(Error::InvalidNonceSize(nonce.len()));
+        }
+
         debug!("parsing cose data");
         let cose_signed_blob = CoseSign1::from_slice(&self.data)
             .map_err(|_| Error::MalformedData("cose signed blob".into()))?;
@@ -259,6 +269,15 @@ impl super::VerifiableSignedAttestationFormat for Nitro {
             return Err(Error::MissingData("cose.payload.pcrs".into()));
         }
 
+        debug!("verifying nonce");
+        if let Value::Map(map) = &payload && let Some(Value::Bytes(validated_nonce)) = map.get(&Value::Text("nonce".into())) {
+            if validated_nonce != nonce {
+                return Err(Error::InvalidNonce);
+            }
+        } else {
+            return Err(Error::MissingData("cose.payload.nonce".into()));
+        }
+
         Ok(payload)
     }
 }
@@ -266,6 +285,7 @@ impl super::VerifiableSignedAttestationFormat for Nitro {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::LazyLock;
 
     #[allow(dead_code)]
     fn setup_test_logging() {
@@ -275,8 +295,11 @@ mod tests {
     // A time shortly after a valid attestation was generated.
     const CBOR_DATA: &'static [u8] = include_bytes!("data/aws-test.cbor");
     const VALID_DURATION: std::time::Duration = std::time::Duration::from_secs(1766510416);
+    const NONCE: LazyLock<Vec<u8>> = LazyLock::new(|| {
+        hex::decode("d041b23bce8678bbc7c174bd8494c4f9759386eec963ec69bfd45c1452b10636").unwrap()
+    });
 
-    const PCRS: std::sync::LazyLock<NitroPcrs> = std::sync::LazyLock::new(|| {
+    const PCRS: LazyLock<NitroPcrs> = LazyLock::new(|| {
         let hex0 = hex::decode("ef093e4c1fd13878956589833c0e396b935cdf5ae45c1cc595e1a19a6da5812850f0ef3e77df918cb2a86d88ddf9cc03").unwrap();
         let hex1 = hex::decode("ef093e4c1fd13878956589833c0e396b935cdf5ae45c1cc595e1a19a6da5812850f0ef3e77df918cb2a86d88ddf9cc03").unwrap();
         let hex2 = hex::decode("21b9efbc184807662e966d34f390821309eeac6802309798826296bf3e8bec7c10edb30948c90ba67310f7b964fc500a").unwrap();
@@ -287,7 +310,21 @@ mod tests {
     #[test]
     fn it_works() {
         let nitro = Nitro::new(CBOR_DATA, PCRS.clone()).unwrap();
-        nitro.verify(VALID_DURATION).unwrap();
+        nitro.verify(VALID_DURATION, &NONCE).unwrap();
+    }
+
+    #[test]
+    #[should_panic = "InvalidNonceSize"]
+    fn invalid_nonce_size() {
+        let nitro = Nitro::new(CBOR_DATA, PCRS.clone()).unwrap();
+        nitro.verify(VALID_DURATION, &[0x10; 10]).unwrap();
+    }
+
+    #[test]
+    #[should_panic = "InvalidNonce"]
+    fn invalid_nonce() {
+        let nitro = Nitro::new(CBOR_DATA, PCRS.clone()).unwrap();
+        nitro.verify(VALID_DURATION, &[0x10; 12]).unwrap();
     }
 
     #[test]
@@ -298,7 +335,7 @@ mod tests {
         hex0[1] = !hex0[1];
 
         let nitro = Nitro::new(CBOR_DATA, pcrs).unwrap();
-        nitro.verify(VALID_DURATION).unwrap();
+        nitro.verify(VALID_DURATION, &NONCE).unwrap();
     }
 
     #[test]
@@ -308,7 +345,7 @@ mod tests {
         pcrs.insert(7, b"abcdefgh".into());
 
         let nitro = Nitro::new(CBOR_DATA, pcrs).unwrap();
-        nitro.verify(VALID_DURATION).unwrap();
+        nitro.verify(VALID_DURATION, &NONCE).unwrap();
     }
 
     #[test]
@@ -318,7 +355,7 @@ mod tests {
         pcrs.insert(17, b"abcdefgh".into());
 
         let nitro = Nitro::new(CBOR_DATA, pcrs).unwrap();
-        nitro.verify(VALID_DURATION).unwrap();
+        nitro.verify(VALID_DURATION, &NONCE).unwrap();
     }
 
     #[test]
@@ -331,7 +368,7 @@ mod tests {
             );
 
         let nitro = Nitro::new(CBOR_DATA, PCRS.clone()).unwrap();
-        nitro.verify(duration).unwrap();
+        nitro.verify(duration, &NONCE).unwrap();
     }
 
     #[test]
@@ -344,7 +381,7 @@ mod tests {
             );
 
         let nitro = Nitro::new(CBOR_DATA, PCRS.clone()).unwrap();
-        nitro.verify(duration).unwrap();
+        nitro.verify(duration, &NONCE).unwrap();
     }
 
     #[test]
@@ -370,7 +407,7 @@ mod tests {
         let evil_cbor_data = cose_signed_blob.to_vec().unwrap();
 
         let nitro = Nitro::new(evil_cbor_data, PCRS.clone()).unwrap();
-        nitro.verify(VALID_DURATION).unwrap();
+        nitro.verify(VALID_DURATION, &NONCE).unwrap();
     }
 
     #[test]
@@ -382,6 +419,6 @@ mod tests {
         let evil_cbor_data = cose_signed_blob.to_vec().unwrap();
 
         let nitro = Nitro::new(evil_cbor_data, PCRS.clone()).unwrap();
-        nitro.verify(VALID_DURATION).unwrap();
+        nitro.verify(VALID_DURATION, &NONCE).unwrap();
     }
 }

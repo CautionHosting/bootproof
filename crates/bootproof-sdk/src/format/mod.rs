@@ -22,6 +22,12 @@ pub enum Error {
 
     #[error("The expected additional associated data was not successfully matched: {0}")]
     InvalidAAD(ErrorStr),
+
+    #[error("The nonce was too small ({0} bytes < 12) to be considered secure")]
+    InvalidNonceSize(usize),
+
+    #[error("The provided nonce did not match the signed nonce")]
+    InvalidNonce,
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -32,7 +38,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[allow(private_bounds)]
 pub trait VerifiableSignedAttestationFormat: Sealed {
-    fn verify(&self, time_since_epoch: std::time::Duration) -> Result<serde_cbor::Value>;
+    fn verify(&self, time_since_epoch: std::time::Duration, nonce: &[u8]) -> Result<serde_cbor::Value>;
 }
 
 trait Sealed {}
