@@ -302,6 +302,26 @@ mod tests {
     }
 
     #[test]
+    #[should_panic = "InvalidAAD"]
+    fn invalid_existing_pcrs_fails() {
+        let mut pcrs = PCRS.clone();
+        pcrs.insert(7, b"abcdefgh".into());
+
+        let nitro = Nitro::new(CBOR_DATA, pcrs).unwrap();
+        nitro.verify(VALID_DURATION).unwrap();
+    }
+
+    #[test]
+    #[should_panic = "MissingData"]
+    fn invalid_additional_pcrs_fails() {
+        let mut pcrs = PCRS.clone();
+        pcrs.insert(17, b"abcdefgh".into());
+
+        let nitro = Nitro::new(CBOR_DATA, pcrs).unwrap();
+        nitro.verify(VALID_DURATION).unwrap();
+    }
+
+    #[test]
     #[should_panic = "InvalidCABundle"]
     fn early_signature_fails() {
         // let's add a day to the expiration
