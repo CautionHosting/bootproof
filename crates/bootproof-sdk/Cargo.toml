@@ -1,0 +1,22 @@
+[package]
+name = "bootproof-sdk"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["nitro"]
+nitro = ["dep:webpki", "dep:x509-parser", "dep:ring"]
+
+[dependencies]
+coset = "0.4.0"
+serde_cbor = "0.11.2"
+thiserror = "2.0.17"
+tracing = "0.1.44"
+
+# Nitro Attestation
+ring = { version = "0.17.14", optional = true }
+webpki = { version = "0.22.4", optional = true }
+x509-parser = { version = "0.18.0", optional = true }
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
