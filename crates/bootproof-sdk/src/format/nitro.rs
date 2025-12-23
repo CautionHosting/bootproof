@@ -272,6 +272,31 @@ mod tests {
     }
 
     #[test]
+    #[should_panic = "InvalidCABundle"]
+    fn mutated_certificate_fails() {
+        let mut cose_signed_blob = CoseSign1::from_slice(CBOR_DATA).unwrap();
+        // let's mutate the CA Bundle. This is extracted from the payload, but is verified before
+        // the payload is, so even though we modify the signed payload, the first error encountered
+        // is an invalid CA.
+        let mut payload: Value = serde_cbor::from_slice(&cose_signed_blob.payload.take().unwrap()).unwrap();
+        // We mutate the `1` cert; mutating the `0` generates BadSignature but not InvalidCABundle
+        // That should be looked into, maybe.
+        if let Value::Map(ref mut map) = payload
+            && let Some(Value::Array(cabundle)) = map.get_mut(&Value::Text("cabundle".into()))
+            && let Some(Value::Bytes(bytes)) = cabundle.get_mut(1)
+        {
+            bytes[17] = !bytes[17];
+        } else {
+            panic!("could not get cabundle");
+        }
+        cose_signed_blob.payload = Some(serde_cbor::to_vec(&payload).unwrap());
+        let evil_cbor_data = cose_signed_blob.to_vec().unwrap();
+
+        let nitro = Nitro::new(evil_cbor_data);
+        nitro.verify(VALID_DURATION).unwrap();
+    }
+
+    #[test]
     #[should_panic = "BadSignature"]
     fn mutated_signature_fails() {
         let mut cose_signed_blob = CoseSign1::from_slice(CBOR_DATA).unwrap();
