@@ -230,17 +230,33 @@ impl super::VerifiableSignedAttestationFormat for Nitro {
 mod tests {
     use super::*;
 
+    #[allow(dead_code)]
     fn setup_test_logging() {
         tracing_subscriber::fmt::init();
     }
 
+    // A time shortly after a valid attestation was generated.
+    const CBOR_DATA: &'static [u8] = include_bytes!("data/aws-test.cbor");
+    const VALID_DURATION: std::time::Duration = std::time::Duration::from_secs(1766510416);
+
     #[test]
     fn it_works() {
-        setup_test_logging();
-        let cbor_data = include_bytes!("data/aws-test.cbor");
-        let nitro = Nitro::new(cbor_data);
-        // A time shortly after a valid attestation was generated.
-        let valid_duration = std::time::Duration::from_secs(1766510416);
-        nitro.verify(valid_duration).unwrap();
+        let nitro = Nitro::new(CBOR_DATA);
+        nitro.verify(VALID_DURATION).unwrap();
+    }
+
+    #[test]
+    #[should_panic = "BadSignature"]
+    fn mutated_signature_fails() {
+        let mut cose_signed_blob = CoseSign1::from_slice(CBOR_DATA).unwrap();
+        let cbor_data_2 = cose_signed_blob.clone().to_vec().unwrap();
+        assert_eq!(&*CBOR_DATA, &*cbor_data_2);
+
+        // let's mutate the signature field
+        cose_signed_blob.signature[2] = !cose_signed_blob.signature[2];
+        let cbor_data_3 = cose_signed_blob.to_vec().unwrap();
+
+        let nitro = Nitro::new(cbor_data_3);
+        nitro.verify(VALID_DURATION).unwrap();
     }
 }
