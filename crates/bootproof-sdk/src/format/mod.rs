@@ -32,16 +32,35 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
+#[allow(private_bounds)]
+pub trait AsNonce: SealedNonce {
+    fn as_nonce(&self) -> Result<&[u8]>;
+}
+
+trait SealedNonce {}
+
+impl<T> AsNonce for T where T: AsRef<[u8]> + SealedNonce {
+    fn as_nonce(&self) -> Result<&[u8]> {
+        let len = self.as_ref().len();
+        if len < 12 {
+            return Err(Error::InvalidNonceSize(len));
+        }
+        Ok(self.as_ref())
+    }
+}
+
+impl<T> SealedNonce for T where T: AsRef<[u8]> {}
+
 // NOTE: The use of serde_cbor is mostly so we have a should-be-general-purpose "value" to return.
 // Once Facet gets CBOR support, we can probably move to facet-value as a format-agnostic
 // general-purpose "value".
 
 #[allow(private_bounds)]
-pub trait VerifiableSignedAttestationFormat: Sealed {
-    fn verify(&self, time_since_epoch: std::time::Duration, nonce: &[u8]) -> Result<serde_cbor::Value>;
+pub trait VerifiableSignedAttestationFormat: SealedFormat {
+    fn verify(&self, time_since_epoch: std::time::Duration, nonce: &dyn AsNonce) -> Result<serde_cbor::Value>;
 }
 
-trait Sealed {}
+trait SealedFormat {}
 
 #[cfg(feature = "nitro")]
 pub mod nitro;

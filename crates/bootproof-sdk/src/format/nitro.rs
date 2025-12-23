@@ -1,4 +1,4 @@
-use super::{Error, Result};
+use super::{Error, Result, AsNonce};
 use coset::{CborSerializable, CoseSign1, RegisteredLabelWithPrivate, iana::Algorithm};
 use serde_cbor::Value;
 use std::{collections::HashMap, time::Duration};
@@ -31,7 +31,7 @@ impl Nitro {
     }
 }
 
-impl super::Sealed for Nitro {}
+impl super::SealedFormat for Nitro {}
 
 const AWS_NITRO_ROOT_CA_DER: &[u8] = include_bytes!("data/nitro-root.der");
 
@@ -186,12 +186,10 @@ impl super::VerifiableSignedAttestationFormat for Nitro {
 
     // TODO: Should 
 
-    #[tracing::instrument(skip(self))]
-    fn verify(&self, time_since_epoch: Duration, nonce: &[u8]) -> Result<serde_cbor::Value> {
+    #[tracing::instrument(skip(self, nonce))]
+    fn verify(&self, time_since_epoch: Duration, nonce: &dyn AsNonce) -> Result<serde_cbor::Value> {
         debug!("validating provided nonce");
-        if nonce.len() < 12 {
-            return Err(Error::InvalidNonceSize(nonce.len()));
-        }
+        let nonce = nonce.as_nonce()?;
 
         debug!("parsing cose data");
         let cose_signed_blob = CoseSign1::from_slice(&self.data)
@@ -310,7 +308,7 @@ mod tests {
     #[test]
     fn it_works() {
         let nitro = Nitro::new(CBOR_DATA, PCRS.clone()).unwrap();
-        nitro.verify(VALID_DURATION, &NONCE).unwrap();
+        nitro.verify(VALID_DURATION, &*NONCE).unwrap();
     }
 
     #[test]
@@ -335,7 +333,7 @@ mod tests {
         hex0[1] = !hex0[1];
 
         let nitro = Nitro::new(CBOR_DATA, pcrs).unwrap();
-        nitro.verify(VALID_DURATION, &NONCE).unwrap();
+        nitro.verify(VALID_DURATION, &*NONCE).unwrap();
     }
 
     #[test]
@@ -345,7 +343,7 @@ mod tests {
         pcrs.insert(7, b"abcdefgh".into());
 
         let nitro = Nitro::new(CBOR_DATA, pcrs).unwrap();
-        nitro.verify(VALID_DURATION, &NONCE).unwrap();
+        nitro.verify(VALID_DURATION, &*NONCE).unwrap();
     }
 
     #[test]
@@ -355,7 +353,7 @@ mod tests {
         pcrs.insert(17, b"abcdefgh".into());
 
         let nitro = Nitro::new(CBOR_DATA, pcrs).unwrap();
-        nitro.verify(VALID_DURATION, &NONCE).unwrap();
+        nitro.verify(VALID_DURATION, &*NONCE).unwrap();
     }
 
     #[test]
@@ -368,7 +366,7 @@ mod tests {
             );
 
         let nitro = Nitro::new(CBOR_DATA, PCRS.clone()).unwrap();
-        nitro.verify(duration, &NONCE).unwrap();
+        nitro.verify(duration, &*NONCE).unwrap();
     }
 
     #[test]
@@ -381,7 +379,7 @@ mod tests {
             );
 
         let nitro = Nitro::new(CBOR_DATA, PCRS.clone()).unwrap();
-        nitro.verify(duration, &NONCE).unwrap();
+        nitro.verify(duration, &*NONCE).unwrap();
     }
 
     #[test]
@@ -407,7 +405,7 @@ mod tests {
         let evil_cbor_data = cose_signed_blob.to_vec().unwrap();
 
         let nitro = Nitro::new(evil_cbor_data, PCRS.clone()).unwrap();
-        nitro.verify(VALID_DURATION, &NONCE).unwrap();
+        nitro.verify(VALID_DURATION, &*NONCE).unwrap();
     }
 
     #[test]
@@ -419,6 +417,6 @@ mod tests {
         let evil_cbor_data = cose_signed_blob.to_vec().unwrap();
 
         let nitro = Nitro::new(evil_cbor_data, PCRS.clone()).unwrap();
-        nitro.verify(VALID_DURATION, &NONCE).unwrap();
+        nitro.verify(VALID_DURATION, &*NONCE).unwrap();
     }
 }
