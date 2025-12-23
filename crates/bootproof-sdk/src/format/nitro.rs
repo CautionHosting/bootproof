@@ -246,17 +246,40 @@ mod tests {
     }
 
     #[test]
+    #[should_panic = "InvalidCABundle"]
+    fn early_signature_fails() {
+        // let's add a day to the expiration
+        let duration = VALID_DURATION
+            - std::time::Duration::from_secs(
+                60 /* seconds */ * 60 /* minutes */ * 24, /* hours */
+            );
+
+        let nitro = Nitro::new(CBOR_DATA);
+        nitro.verify(duration).unwrap();
+    }
+
+    #[test]
+    #[should_panic = "InvalidCABundle"]
+    fn late_signature_fails() {
+        // let's add a day to the expiration
+        let duration = VALID_DURATION
+            + std::time::Duration::from_secs(
+                60 /* seconds */ * 60 /* minutes */ * 24, /* hours */
+            );
+
+        let nitro = Nitro::new(CBOR_DATA);
+        nitro.verify(duration).unwrap();
+    }
+
+    #[test]
     #[should_panic = "BadSignature"]
     fn mutated_signature_fails() {
         let mut cose_signed_blob = CoseSign1::from_slice(CBOR_DATA).unwrap();
-        let cbor_data_2 = cose_signed_blob.clone().to_vec().unwrap();
-        assert_eq!(&*CBOR_DATA, &*cbor_data_2);
-
         // let's mutate the signature field
         cose_signed_blob.signature[2] = !cose_signed_blob.signature[2];
-        let cbor_data_3 = cose_signed_blob.to_vec().unwrap();
+        let evil_cbor_data = cose_signed_blob.to_vec().unwrap();
 
-        let nitro = Nitro::new(cbor_data_3);
+        let nitro = Nitro::new(evil_cbor_data);
         nitro.verify(VALID_DURATION).unwrap();
     }
 }
