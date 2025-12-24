@@ -34,6 +34,13 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[allow(private_bounds)]
 pub trait AsNonce: SealedNonce {
+    /// Parse the value as a valid Nonce. This trait is sealed and is not intended to be
+    /// implemented for anything other than `AsRef<[u8]>`, as a way of ensuring every format uses
+    /// at least minimum-length validation.
+    ///
+    /// # Errors
+    ///
+    /// The method may return an error if the nonce is of an invalid length.
     fn as_nonce(&self) -> Result<&[u8]>;
 }
 
@@ -57,6 +64,23 @@ impl<T> SealedNonce for T where T: AsRef<[u8]> {}
 
 #[allow(private_bounds)]
 pub trait VerifiableSignedAttestationFormat: SealedFormat {
+    /// Verify the provided data, returning the decoded inner contents.
+    ///
+    /// Note: This function returns a `serde_cbor::Value` as an implementation detail, as there is
+    /// no general-purpose, format-agnostic "value". Eventually, a move to facet-value may provide
+    /// this type.
+    ///
+    /// # Errors
+    ///
+    /// The method may return an error if:
+    /// * The provided data could not be properly decoded
+    /// * An expected value was not found
+    /// * An expected attestation parameter (such as a PCR) was not found, or did not match
+    /// * The signature over the provided data was invalid
+    /// * The certificate or public key signing the data was not valid
+    /// * The nonce was of an invalid size
+    /// * The nonce in the signature did not match the provided nonce
+    /// * The algorithm used by signing is not supported
     fn verify(&self, time_since_epoch: std::time::Duration, nonce: &dyn AsNonce) -> Result<serde_cbor::Value>;
 }
 

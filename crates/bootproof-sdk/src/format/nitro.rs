@@ -16,6 +16,13 @@ pub struct Nitro {
 pub type NitroPcrs = HashMap<u8, Vec<u8>>;
 
 impl Nitro {
+    /// A Nitro Attested COSE value, and the associated PCRs. The PCRs are generated alongside the
+    /// EIF and can be used to ensure the Nitro Enclave is running the expected EIF. Additional
+    /// PCRs can be added and, if present, will be checked.
+    ///
+    /// # Errors
+    ///
+    /// The function may return an error if the 0, 1, or 2 PCRs are not added.
     pub fn new(data: impl Into<Vec<u8>>, pcrs: NitroPcrs) -> Result<Self> {
         let data = data.into();
 
