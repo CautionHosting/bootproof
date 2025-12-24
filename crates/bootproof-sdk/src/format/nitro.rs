@@ -3,7 +3,7 @@ use coset::{CborSerializable, CoseSign1, RegisteredLabelWithPrivate, iana::Algor
 use serde_cbor::Value;
 use std::{collections::HashMap, time::Duration};
 use tracing::{debug, error};
-use x509_parser::{certificate::X509Certificate, prelude::FromDer, x509::SubjectPublicKeyInfo};
+use x509_parser::{certificate::X509Certificate, prelude::FromDer};
 
 use super::VerifiableSignedAttestationFormat;
 
@@ -113,28 +113,29 @@ fn verify_cert_and_bundle_with_root(
 fn asn1_encode_int(value: &[u8]) -> Vec<u8> {
     let mut result = vec![0x02];
 
-    if value.get(0).is_some_and(|v| v & 0x80 != 0) {
+    if value.first().is_some_and(|v| v & 0x80 != 0) {
         // highest bit set, which would be interpreted as a negative integer
         // encode length as u8 followed by a 0x00
-        let encoded_len = u8::try_from(value.len() + 1).expect("value.len() < u8::MAX");
+        let len = value.len().checked_add(1).expect("value.len() + 1 overflow");
+        let encoded_len = u8::try_from(len).expect("padded value.len() < u8::MAX");
         result.push(encoded_len);
+        // push a zero byte so it's unsigned
         result.push(0x00);
         result.extend_from_slice(value);
     } else {
         // highest bit is not set, we can encode once we find the first nonzero byte
         let first_nonzero_index = value.iter().copied().position(|b| b != 0);
 
-        match first_nonzero_index {
-            Some(start) => {
-                // we have some acceptable value
-                let trimmed = &value[start..];
-                let len = u8::try_from(trimmed.len() + 1).expect("value.len() < u8::MAX");
-                result.push(len);
-                result.extend_from_slice(trimmed);
-            }
-            None => {
-                // it's all zeroes, let's just toss a zero in there
-            }
+        if let Some(start) = first_nonzero_index {
+            // we have some acceptable value
+            let trimmed = &value[start..];
+            let len = u8::try_from(trimmed.len()).expect("value.len() < u8::MAX");
+            result.push(len);
+            result.extend_from_slice(trimmed);
+        } else {
+            // it's all zeroes, let's just toss a zero in there
+            result.push(1);
+            result.push(0);
         }
     }
 
@@ -175,7 +176,7 @@ fn verify_es384(pubkey: &[u8], sig: &[u8], data: &[u8]) -> Result<()> {
     })
 }
 
-impl super::VerifiableSignedAttestationFormat for Nitro {
+impl VerifiableSignedAttestationFormat for Nitro {
     // Strategy:
     // * Validate provided nonce
     // * Parse payload to get COSE signature and CA info
@@ -187,7 +188,7 @@ impl super::VerifiableSignedAttestationFormat for Nitro {
     // TODO: Should 
 
     #[tracing::instrument(skip(self, nonce))]
-    fn verify(&self, time_since_epoch: Duration, nonce: &dyn AsNonce) -> Result<serde_cbor::Value> {
+    fn verify(&self, time_since_epoch: Duration, nonce: &dyn AsNonce) -> Result<Value> {
         debug!("validating provided nonce");
         let nonce = nonce.as_nonce()?;
 
