@@ -147,12 +147,14 @@ async fn generate_nonced_attestation(
         }
     };
 
+    let nonce = BASE64_STANDARD.decode(nonce).expect("add some error handling");
+
     // TODO: hash metadata and sign a hash of the metadata?
     // This is failure prone with the assumption you could read the metadata without having to
     // verify the bootproof, but we'll leave that as a problem for bootproof-client.
     let document = match attestation::generate_attestation(
         Some(&metadata),
-        Some(nonce.as_bytes()),
+        Some(&nonce),
         // NOTE: We never use the public key field. Should it be removed? We should probably stick
         // it as a known field in the user data.
         None,
