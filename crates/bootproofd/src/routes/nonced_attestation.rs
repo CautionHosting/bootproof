@@ -76,11 +76,7 @@ impl From<base64::DecodeError> for NoncedAttestationError {
 
 impl IntoResponse for NoncedAttestationError {
     fn into_response(self) -> axum::response::Response {
-        let error_response = crate::error_handling::ErrorResponse::from_error(&self);
-
-        let mut response = (self.status_code, Json(&error_response)).into_response();
-        response.extensions_mut().insert(Arc::new(error_response));
-        response
+        crate::error_handling::ErrorResponse::from_error(&self).into_response(self.status_code)
     }
 }
 

@@ -1,6 +1,13 @@
 // ref: https://github.com/tokio-rs/axum/blob/main/examples/error-handling/src/main.rs
 
-use axum::{extract::Request, middleware::Next, response::Response};
+use axum::{
+    Json,
+    extract::Request,
+    http::StatusCode,
+    middleware::Next,
+    response::{IntoResponse, Response},
+};
+use std::sync::Arc;
 use tracing::error;
 
 #[derive(Debug, serde::Serialize)]
@@ -24,13 +31,21 @@ impl ErrorResponse {
 
         Self { errors }
     }
+
+    pub fn into_response(self, status_code: impl Into<Option<StatusCode>>) -> Response {
+        let status_code = status_code.into().unwrap_or(StatusCode::OK);
+
+        let mut response = (status_code, Json(&self)).into_response();
+        response.extensions_mut().insert(Arc::new(self));
+        response
+    }
 }
 
 pub async fn error_logger_middleware(request: Request, next: Next) -> Response {
     let uri = request.uri().clone();
     let response = next.run(request).await;
 
-    if let Some(error_response) = response.extensions().get::<std::sync::Arc<ErrorResponse>>() {
+    if let Some(error_response) = response.extensions().get::<Arc<ErrorResponse>>() {
         // SAFETY: errors is instantiated to have at least one field when created by from_error,
         // and can't be created in any other way. we can safely assume &errors[1..] will not fail
         // with out of range start, even if it is an empty slice.
