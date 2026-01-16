@@ -6,15 +6,14 @@ use serde_bytes::ByteBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AttestationGenerationError {
-    #[error("Could not initialize the NSM driver")]
+    #[error("could not initialize the NSM driver")]
     DriverOpen,
 
-    #[error("An unexpected variant was returned from the NSM device")]
+    #[error("an unexpected variant was returned from the NSM device")]
     InvalidVariant,
 
-    #[error("An error {0:?} was returned from the NSM device")]
+    #[error("an error {0:?} was returned from the NSM device")]
     ApiError(nsm::api::ErrorCode),
-
 }
 
 pub type Result<T> = std::result::Result<T, AttestationGenerationError>;
@@ -48,14 +47,10 @@ pub fn generate_attestation(
     nsm::driver::nsm_exit(nsm_fd);
 
     match response {
-        aws_nitro_enclaves_nsm_api::api::Response::Attestation { document } => {
-            Ok(document)
-        },
+        aws_nitro_enclaves_nsm_api::api::Response::Attestation { document } => Ok(document),
         aws_nitro_enclaves_nsm_api::api::Response::Error(error_code) => {
             Err(AttestationGenerationError::ApiError(error_code))
-        },
-        _ => {
-            Err(AttestationGenerationError::InvalidVariant)
-        },
+        }
+        _ => Err(AttestationGenerationError::InvalidVariant),
     }
 }

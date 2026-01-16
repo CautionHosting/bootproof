@@ -1,7 +1,7 @@
-use crate::{log_error, AppState};
+use crate::AppState;
 
+use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use std::sync::Arc;
-use axum::{Json, extract::State, http::StatusCode};
 
 #[allow(clippy::wildcard_imports)]
 use base64::prelude::*;
@@ -28,53 +28,93 @@ pub struct NoncedAttestationResponse {
     pub manifest: serde_json::Value,
 }
 
-// TODO: We should impl an error here and have that error impl IntoResponse of JSON combined w/ the
-// StatusCode.
-//
-// Currently, an error returns empty body?
+#[derive(Debug, serde::Serialize)]
+pub enum NoncedAttestationErrorKind {
+    InvalidData,
+    InvalidNonce,
+    AttestationGeneration,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("unable to get nonced attestation: {kind:?}")]
+pub struct NoncedAttestationError {
+    #[source]
+    source: Box<dyn std::error::Error>,
+    kind: NoncedAttestationErrorKind,
+    status_code: StatusCode,
+}
+
+impl From<crate::versioned_json_file::VersionedJsonFileError> for NoncedAttestationError {
+    fn from(value: crate::versioned_json_file::VersionedJsonFileError) -> Self {
+        Self {
+            source: Box::new(value),
+            kind: NoncedAttestationErrorKind::InvalidData,
+            status_code: StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
+impl From<crate::attestation::AttestationGenerationError> for NoncedAttestationError {
+    fn from(value: crate::attestation::AttestationGenerationError) -> Self {
+        Self {
+            source: Box::new(value),
+            kind: NoncedAttestationErrorKind::AttestationGeneration,
+            status_code: StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
+impl From<base64::DecodeError> for NoncedAttestationError {
+    fn from(value: base64::DecodeError) -> Self {
+        Self {
+            source: Box::new(value),
+            kind: NoncedAttestationErrorKind::InvalidNonce,
+            status_code: StatusCode::BAD_REQUEST,
+        }
+    }
+}
+
+impl IntoResponse for NoncedAttestationError {
+    fn into_response(self) -> axum::response::Response {
+        let error_response = crate::error_handling::ErrorResponse::from_error(&self);
+
+        let mut response = (self.status_code, Json(&error_response)).into_response();
+        response.extensions_mut().insert(Arc::new(error_response));
+        response
+    }
+}
+
 pub async fn generate_nonced_attestation(
     State(app_state): State<Arc<AppState>>,
     Json(NoncedAttestationRequest { nonce }): Json<NoncedAttestationRequest>,
-) -> Result<Json<NoncedAttestationResponse>, StatusCode> {
-    let manifest = match app_state.manifest.lock().expect("manifest unpoisoned").get() {
-        Ok(manifest) => manifest.clone(),
-        Err(error) => {
-            log_error(error);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-    };
+) -> Result<Json<NoncedAttestationResponse>, NoncedAttestationError> {
+    let manifest = app_state
+        .manifest
+        .lock()
+        .expect("manifest unpoisoned")
+        .get()?
+        .clone();
 
     let metadata_bytes = if let Some(metadata) = &app_state.metadata {
-        match metadata.lock().expect("metadata unpoisoned").get() {
-            Ok(metadata) => serde_json::to_vec(metadata).expect("parse valid, write valid"),
-            Err(error) => {
-                log_error(error);
-                return Err(StatusCode::INTERNAL_SERVER_ERROR);
-            }
-        }
+        serde_json::to_vec(metadata.lock().expect("metadata unpoisoned").get()?)
+            .expect("parse valid, write valid")
     } else {
         b"{}".to_vec()
     };
 
-    let nonce = BASE64_STANDARD.decode(nonce).expect("add some error handling");
+    let nonce = BASE64_STANDARD.decode(nonce)?;
 
     // TODO: hash metadata and sign a hash of the metadata?
     // This is failure prone with the assumption you could read the metadata without having to
     // verify the bootproof, but we'll leave that as a problem for bootproof-client.
-    let document = match crate::attestation::generate_attestation(
+    let document_bytes = crate::attestation::generate_attestation(
         Some(&metadata_bytes),
         Some(&nonce),
         // NOTE: We never use the public key field. Should it be removed? We should probably stick
         // it as a known field in the user data.
         None,
-    ) {
-        Ok(bytes) => BASE64_STANDARD.encode(bytes),
-        Err(error) => {
-            log_error(error);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-    };
+    )?;
+    let document = BASE64_STANDARD.encode(document_bytes);
 
     Ok(Json(NoncedAttestationResponse { document, manifest }))
 }
-

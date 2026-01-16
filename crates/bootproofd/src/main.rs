@@ -1,49 +1,22 @@
 //! bootproof daemon
 
-use std::{
-    error::Error,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
 use axum::{Router, routing};
-use tracing::{debug, error};
+use tracing::debug;
 
 mod attestation;
+mod error_handling;
 mod routes;
 mod versioned_json_file;
 
 use versioned_json_file::VersionedJsonFile;
 
-fn log_error<E: Error>(error: E) {
-    error!("could not generate attestation: {error}");
-    let mut source = error.source();
-    while let Some(new_error) = source.take() {
-        error!("- caused by: {new_error}");
-        source = new_error.source();
-    }
-}
-
 #[derive(Debug)]
 struct AppState {
     metadata: Option<Mutex<VersionedJsonFile>>,
     manifest: Mutex<VersionedJsonFile>,
-}
-
-#[derive(Debug)]
-pub enum DataReadErrorKind {
-    BadRead,
-    ParseJson,
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("Could not read JSON file: {kind:?}")]
-pub struct DataReadError {
-    #[source]
-    source: Box<dyn std::error::Error>,
-    kind: DataReadErrorKind,
-    file: PathBuf,
 }
 
 // NOTE: Once execd supports checking that manifest.json and optionally metadata.json exist
@@ -59,10 +32,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let metadata = match VersionedJsonFile::new(METADATA_FILE) {
         Ok(vjf) => Some(vjf),
         Err(e) => {
-            if e.kind == versioned_json_file::ErrorKind::Io
+            if e.kind == versioned_json_file::VersionedJsonFileErrorKind::Io
                 && let Some(io_error) = e.source.downcast_ref::<std::io::Error>()
                 && io_error.kind() == std::io::ErrorKind::NotFound
             {
+                debug!("no metadata found, will use empty object");
                 None
             } else {
                 return Err(e.into());
@@ -90,9 +64,17 @@ async fn run_basic_server(app_state: AppState) -> Result<(), Box<dyn std::error:
 
     let app = Router::new()
         .route(
+            "/health",
+            routing::get(routes::health::health),
+        )
+        .route(
             "/attestation",
             routing::post(routes::nonced_attestation::generate_nonced_attestation),
         )
+        .layer(axum::middleware::from_fn(
+            error_handling::error_logger_middleware,
+        ))
+        .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state);
 
     let listen_addr =
