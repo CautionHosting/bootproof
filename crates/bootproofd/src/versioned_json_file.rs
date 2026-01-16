@@ -1,12 +1,14 @@
+use std::panic::Location;
 use tracing::debug;
 
 trait ResultExt<T> {
     type Error;
 
-    fn with_path_and_kind(
+    fn with_values(
         self,
         path: impl Into<std::path::PathBuf>,
         kind: VersionedJsonFileErrorKind,
+        location: &'static Location<'static>,
     ) -> Result<T, Self::Error>;
 }
 
@@ -16,10 +18,11 @@ where
 {
     type Error = VersionedJsonFileError;
 
-    fn with_path_and_kind(
+    fn with_values(
         self,
         path: impl Into<std::path::PathBuf>,
         kind: VersionedJsonFileErrorKind,
+        location: &'static Location<'static>,
     ) -> Result<T, Self::Error> {
         match self {
             Ok(o) => Ok(o),
@@ -27,6 +30,7 @@ where
                 file: path.into(),
                 source: Box::new(e),
                 kind,
+                location,
             }),
         }
     }
@@ -45,6 +49,7 @@ pub struct VersionedJsonFileError {
     pub source: Box<dyn std::error::Error>,
     pub kind: VersionedJsonFileErrorKind,
     pub file: std::path::PathBuf,
+    pub location: &'static Location<'static>,
 }
 
 #[derive(Debug)]
@@ -55,36 +60,55 @@ pub struct VersionedJsonFile {
 }
 
 impl VersionedJsonFile {
+    #[track_caller]
     pub fn new(path: impl AsRef<std::path::Path>) -> Result<Self, VersionedJsonFileError> {
         let path = path.as_ref();
         debug!(?path, "loading new versioned JSON file");
-        let modtime = path
-            .metadata()
-            .and_then(|m| m.modified())
-            .with_path_and_kind(path, VersionedJsonFileErrorKind::Io)?;
-        let json = std::fs::read_to_string(path)
-            .with_path_and_kind(path, VersionedJsonFileErrorKind::Io)?;
+        let modtime = path.metadata().and_then(|m| m.modified()).with_values(
+            path,
+            VersionedJsonFileErrorKind::Io,
+            Location::caller(),
+        )?;
+        let json = std::fs::read_to_string(path).with_values(
+            path,
+            VersionedJsonFileErrorKind::Io,
+            Location::caller(),
+        )?;
         Ok(Self {
             path: path.to_owned(),
             modtime,
-            data: serde_json::from_str(&json)
-                .with_path_and_kind(path, VersionedJsonFileErrorKind::Deserialize)?,
+            data: serde_json::from_str(&json).with_values(
+                path,
+                VersionedJsonFileErrorKind::Deserialize,
+                Location::caller(),
+            )?,
         })
     }
 
+    #[track_caller]
     pub fn get(&mut self) -> Result<&serde_json::Value, VersionedJsonFileError> {
         let current_modtime = self
             .path
             .metadata()
             .and_then(|m| m.modified())
-            .with_path_and_kind(&self.path, VersionedJsonFileErrorKind::Io)?;
+            .with_values(
+                &self.path,
+                VersionedJsonFileErrorKind::Io,
+                Location::caller(),
+            )?;
 
         if current_modtime > self.modtime {
             debug!(?self.path, "updating expired content");
-            let json = std::fs::read_to_string(&self.path)
-                .with_path_and_kind(&self.path, VersionedJsonFileErrorKind::Io)?;
-            self.data = serde_json::from_str(&json)
-                .with_path_and_kind(&self.path, VersionedJsonFileErrorKind::Deserialize)?;
+            let json = std::fs::read_to_string(&self.path).with_values(
+                &self.path,
+                VersionedJsonFileErrorKind::Io,
+                Location::caller(),
+            )?;
+            self.data = serde_json::from_str(&json).with_values(
+                &self.path,
+                VersionedJsonFileErrorKind::Deserialize,
+                Location::caller(),
+            )?;
             self.modtime = current_modtime;
         }
 

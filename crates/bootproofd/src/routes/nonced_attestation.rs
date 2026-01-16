@@ -1,7 +1,7 @@
 use crate::AppState;
 
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
-use std::sync::Arc;
+use std::{sync::Arc, panic::Location};
 
 #[allow(clippy::wildcard_imports)]
 use base64::prelude::*;
@@ -36,40 +36,47 @@ pub enum NoncedAttestationErrorKind {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("unable to get nonced attestation: {kind:?}")]
+#[error("unable to get nonced attestation: {kind:?} (at: {location:?})")]
 pub struct NoncedAttestationError {
     #[source]
     source: Box<dyn std::error::Error>,
     kind: NoncedAttestationErrorKind,
+    location: &'static Location<'static>,
     status_code: StatusCode,
 }
 
 impl From<crate::versioned_json_file::VersionedJsonFileError> for NoncedAttestationError {
+    #[track_caller]
     fn from(value: crate::versioned_json_file::VersionedJsonFileError) -> Self {
         Self {
             source: Box::new(value),
             kind: NoncedAttestationErrorKind::InvalidData,
             status_code: StatusCode::INTERNAL_SERVER_ERROR,
+            location: Location::caller(),
         }
     }
 }
 
 impl From<crate::attestation::AttestationGenerationError> for NoncedAttestationError {
+    #[track_caller]
     fn from(value: crate::attestation::AttestationGenerationError) -> Self {
         Self {
             source: Box::new(value),
             kind: NoncedAttestationErrorKind::AttestationGeneration,
             status_code: StatusCode::INTERNAL_SERVER_ERROR,
+            location: Location::caller(),
         }
     }
 }
 
 impl From<base64::DecodeError> for NoncedAttestationError {
+    #[track_caller]
     fn from(value: base64::DecodeError) -> Self {
         Self {
             source: Box::new(value),
             kind: NoncedAttestationErrorKind::InvalidNonce,
             status_code: StatusCode::BAD_REQUEST,
+            location: Location::caller(),
         }
     }
 }
