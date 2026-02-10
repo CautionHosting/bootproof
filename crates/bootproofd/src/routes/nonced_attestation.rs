@@ -1,7 +1,7 @@
 use crate::AppState;
 
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
-use std::{sync::Arc, panic::Location};
+use std::{panic::Location, sync::Arc};
 
 #[allow(clippy::wildcard_imports)]
 use base64::prelude::*;
@@ -98,11 +98,19 @@ pub async fn generate_nonced_attestation(
         .get()?
         .clone();
 
-    let metadata_bytes = if let Some(metadata) = &app_state.metadata {
-        serde_json::to_vec(metadata.lock().expect("metadata unpoisoned").get()?)
-            .expect("parse valid, write valid")
+    let mut metadata_opt = app_state.metadata.lock().expect("metadata lock");
+    let metadata_bytes = if let Some(metadata) = metadata_opt.as_mut() {
+        serde_json::to_vec(metadata.get()?).expect("should be able to write parsed JSON")
     } else {
-        b"{}".to_vec()
+        let new_file = crate::get_metadata()?;
+        if let Some(mut metadata) = new_file {
+            let bytes =
+                serde_json::to_vec(metadata.get()?).expect("should be able to write parsed JSON");
+            let _ = metadata_opt.insert(metadata);
+            bytes
+        } else {
+            b"{}".to_vec()
+        }
     };
 
     let nonce = BASE64_STANDARD.decode(nonce)?;

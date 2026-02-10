@@ -15,7 +15,7 @@ use versioned_json_file::VersionedJsonFile;
 
 #[derive(Debug)]
 struct AppState {
-    metadata: Option<Mutex<VersionedJsonFile>>,
+    metadata: Mutex<Option<VersionedJsonFile>>,
     manifest: Mutex<VersionedJsonFile>,
 }
 
@@ -24,32 +24,40 @@ struct AppState {
 static MANIFEST_FILE: &str = "/manifest.json";
 static METADATA_FILE: &str = "/metadata.json";
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
-
-    debug!("reading metadata");
-    let metadata = match VersionedJsonFile::new(METADATA_FILE) {
-        Ok(vjf) => Some(vjf),
+// TODO: move this into AppState?
+// it's currently being called in main() and generate_nonced_attestation(), which is not the best.
+// or we can just delay until we ship execd they're OnceCell'd.
+fn get_metadata() -> Result<Option<VersionedJsonFile>, versioned_json_file::VersionedJsonFileError>
+{
+    match VersionedJsonFile::new(METADATA_FILE) {
+        Ok(vjf) => Ok(Some(vjf)),
         Err(e) => {
             if e.kind == versioned_json_file::VersionedJsonFileErrorKind::Io
                 && let Some(io_error) = e.source.downcast_ref::<std::io::Error>()
                 && io_error.kind() == std::io::ErrorKind::NotFound
             {
                 debug!("no metadata found, will use empty object");
-                None
+                Ok(None)
             } else {
-                return Err(e.into());
+                Err(e)
             }
         }
-    };
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
+
+    debug!("reading metadata");
+    let metadata = get_metadata()?;
 
     debug!("reading manifest");
     let manifest = VersionedJsonFile::new(MANIFEST_FILE)?;
 
     debug!("setting up app state");
     let app_state = AppState {
-        metadata: metadata.map(Mutex::new),
+        metadata: Mutex::new(metadata),
         manifest: Mutex::new(manifest),
     };
 
@@ -63,10 +71,7 @@ async fn run_basic_server(app_state: AppState) -> Result<(), Box<dyn std::error:
     let state = Arc::new(app_state);
 
     let app = Router::new()
-        .route(
-            "/health",
-            routing::get(routes::health::health),
-        )
+        .route("/health", routing::get(routes::health::health))
         .route(
             "/attestation",
             routing::post(routes::nonced_attestation::generate_nonced_attestation),
