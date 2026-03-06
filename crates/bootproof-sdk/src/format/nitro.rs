@@ -91,6 +91,11 @@ fn extract_cert_and_bundle(payload: &Value) -> Result<(Vec<u8>, Vec<Vec<u8>>)> {
     Ok((certificate.clone(), cabundle))
 }
 
+/// XXX/TODO: Clock skew tolerance for certificate validation. Attestation certificates
+/// are issued by the enclave's HSM and the client clock may drift slightly.
+/// Adding a small forward offset prevents `CertNotValidYet` failures.
+const CLOCK_SKEW_TOLERANCE: Duration = Duration::from_secs(60);
+
 fn verify_cert_and_bundle_with_root(
     cert: &[u8],
     bundle: &[Vec<u8>],
@@ -101,7 +106,8 @@ fn verify_cert_and_bundle_with_root(
     let end_cert = webpki::EndEntityCert::try_from(cert)
         .map_err(|_| Error::MalformedData("provided cert".into()))?;
     let bundle = bundle.iter().map(Vec::as_slice).collect::<Vec<_>>();
-    let time = webpki::Time::from_seconds_since_unix_epoch(time_since_epoch.as_secs());
+    let adjusted_time = time_since_epoch.saturating_add(CLOCK_SKEW_TOLERANCE);
+    let time = webpki::Time::from_seconds_since_unix_epoch(adjusted_time.as_secs());
 
     if let Err(e) = end_cert.verify_is_valid_tls_server_cert(
         &[&webpki::ECDSA_P384_SHA384],
