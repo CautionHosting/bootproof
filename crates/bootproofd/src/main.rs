@@ -45,8 +45,7 @@ fn get_metadata() -> Result<Option<VersionedJsonFile>, versioned_json_file::Vers
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     debug!("reading metadata");
@@ -62,11 +61,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     debug!("launching bootproofd");
-    run_basic_server(app_state).await?;
+    run_basic_server(app_state)?;
 
     Ok(())
 }
 
+#[tokio::main]
 async fn run_basic_server(app_state: AppState) -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(app_state);
 

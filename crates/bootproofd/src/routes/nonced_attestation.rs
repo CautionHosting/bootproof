@@ -57,18 +57,6 @@ impl From<crate::versioned_json_file::VersionedJsonFileError> for NoncedAttestat
     }
 }
 
-impl From<crate::attestation::AttestationGenerationError> for NoncedAttestationError {
-    #[track_caller]
-    fn from(value: crate::attestation::AttestationGenerationError) -> Self {
-        Self {
-            source: Box::new(value),
-            kind: NoncedAttestationErrorKind::AttestationGeneration,
-            status_code: StatusCode::INTERNAL_SERVER_ERROR,
-            location: Location::caller(),
-        }
-    }
-}
-
 impl From<base64::DecodeError> for NoncedAttestationError {
     #[track_caller]
     fn from(value: base64::DecodeError) -> Self {
@@ -118,13 +106,15 @@ pub async fn generate_nonced_attestation(
     // TODO: hash metadata and sign a hash of the metadata?
     // This is failure prone with the assumption you could read the metadata without having to
     // verify the bootproof, but we'll leave that as a problem for bootproof-client.
-    let document_bytes = crate::attestation::generate_attestation(
-        Some(&metadata_bytes),
-        Some(&nonce),
-        // NOTE: We never use the public key field. Should it be removed? We should probably stick
-        // it as a known field in the user data.
-        None,
-    )?;
+    let document_bytes =
+        crate::attestation::generate_attestation(Some(&metadata_bytes), Some(&nonce)).map_err(
+            |source| NoncedAttestationError {
+                source,
+                kind: NoncedAttestationErrorKind::AttestationGeneration,
+                location: Location::caller(),
+                status_code: StatusCode::INTERNAL_SERVER_ERROR,
+            },
+        )?;
     let document = BASE64_STANDARD.encode(document_bytes);
 
     Ok(Json(NoncedAttestationResponse { document, manifest }))
