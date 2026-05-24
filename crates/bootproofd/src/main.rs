@@ -83,7 +83,7 @@ async fn run_basic_server(app_state: AppState) -> Result<(), Box<dyn std::error:
         .with_state(state);
 
     let listen_addr =
-        std::env::var("BOOTPROOFD_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8082".into());
+        std::env::var("BOOTPROOFD_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:49502".into());
     debug!(%listen_addr, "binding listener");
     let listener = TcpListener::bind(&listen_addr).await?;
 
