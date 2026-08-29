@@ -8,7 +8,7 @@ default: out/bootproof
 
 ## Primary targets
 
-out/bootproof: Containerfile $(shell git ls-files src) | out
+out/bootproof: Containerfile $(shell git ls-files crates Cargo.toml Cargo.lock) | out
 	docker build \
 		--progress=plain \
 		--output type=local,rewrite-timestamp=true,dest=out \

@@ -16,6 +16,17 @@ pub struct Nitro {
 pub type NitroPcrs = HashMap<u8, Vec<u8>>;
 
 impl Nitro {
+    /// Construct with an explicit PCR policy. `pcrs` is the set of expected
+    /// PCR values the verifier will require the attestation to match. An empty
+    /// set verifies the signature + certificate chain + nonce without any PCR
+    /// policy (useful before the PCR state is pinned to known-good values).
+    pub fn with_pcr_policy(data: impl Into<Vec<u8>>, pcrs: NitroPcrs) -> Self {
+        Self {
+            data: data.into(),
+            pcrs,
+        }
+    }
+
     /// A Nitro Attested COSE value, and the associated PCRs. The PCRs are generated alongside the
     /// EIF and can be used to ensure the Nitro Enclave is running the expected EIF. Additional
     /// PCRs can be added and, if present, will be checked.
@@ -24,8 +35,6 @@ impl Nitro {
     ///
     /// The function may return an error if the 0, 1, or 2 PCRs are not added.
     pub fn new(data: impl Into<Vec<u8>>, pcrs: NitroPcrs) -> Result<Self> {
-        let data = data.into();
-
         for expected_pcr in [0, 1, 2] {
             if !pcrs.contains_key(&expected_pcr) {
                 return Err(Error::AttestationParameter(
@@ -33,14 +42,19 @@ impl Nitro {
                 ));
             }
         }
-
-        Ok(Self { data, pcrs })
+        Ok(Self::with_pcr_policy(data, pcrs))
     }
 }
 
 impl super::SealedFormat for Nitro {}
 
 const AWS_NITRO_ROOT_CA_DER: &[u8] = include_bytes!("data/nitro-root.der");
+
+/// The embedded (pinned) AWS Nitro Enclaves root CA certificate (DER) that
+/// [`Nitro::verify`] chains to.
+pub fn aws_nitro_root_ca_der() -> &'static [u8] {
+    AWS_NITRO_ROOT_CA_DER
+}
 
 fn value_variant(v: &serde_cbor::Value) -> &'static str {
     match v {
@@ -261,23 +275,32 @@ impl VerifiableSignedAttestationFormat for Nitro {
         })?;
 
         debug!("verifying local <-> remote PCRs");
-        if let Value::Map(map) = &payload
-            && let Some(Value::Map(pcrs)) = map.get(&Value::Text("pcrs".into()))
-        {
-            for (index, expected_pcr) in &self.pcrs {
-                if let Some(Value::Bytes(validated_pcr)) =
-                    pcrs.get(&Value::Integer(i128::from(*index)))
-                {
-                    if expected_pcr != validated_pcr {
-                        return Err(Error::InvalidAAD(format!("pcr {index}").into()));
+        // The live NitroTPM wire dialect keys the PCR map as "nitrotpm_pcrs";
+        // the legacy enclave doc keys it "pcrs". Accept either.
+        if let Value::Map(map) = &payload {
+            let pcrs = map
+                .get(&Value::Text("nitrotpm_pcrs".into()))
+                .or_else(|| map.get(&Value::Text("pcrs".into())));
+            if let Some(Value::Map(pcrs)) = pcrs {
+                for (index, expected_pcr) in &self.pcrs {
+                    match pcrs.get(&Value::Integer(i128::from(*index))) {
+                        Some(Value::Bytes(validated_pcr)) => {
+                            if expected_pcr != validated_pcr {
+                                return Err(Error::InvalidAAD(format!("pcr {index}").into()));
+                            }
+                        }
+                        _ => {
+                            return Err(Error::MissingData(
+                                format!("cose.payload.pcrs[{index}] as bytes").into(),
+                            ));
+                        }
                     }
-                } else {
-                    return Err(Error::MissingData(
-                        format!("cose.payload.pcrs[{index}] as bytes").into(),
-                    ));
                 }
+            } else if !self.pcrs.is_empty() {
+                // A PCR policy is set but the document carries no PCR map.
+                return Err(Error::MissingData("cose.payload.pcrs".into()));
             }
-        } else {
+        } else if !self.pcrs.is_empty() {
             return Err(Error::MissingData("cose.payload.pcrs".into()));
         }
 
@@ -323,6 +346,98 @@ mod tests {
     fn it_works() {
         let nitro = Nitro::new(CBOR_DATA, PCRS.clone()).unwrap();
         nitro.verify(VALID_DURATION, &*NONCE).unwrap();
+    }
+
+    // A live NSM (NitroTPM) attestation captured from instance i-02a44cb68978c43af,
+    // produced by the vendor NSM_REQUEST command and returned in a TPM NV index.
+    // Its COSE_Sign1 signature is ECDSA P-384 / SHA-384 over the "Signature1"
+    // Sig_structure (coset's context string), signed by the leaf certificate carried
+    // in the payload. Unlike the legacy enclave doc (aws-test.cbor), this doc keys its
+    // PCRs as "nitrotpm_pcrs" rather than "pcrs", so the full Nitro::verify() PCR step
+    // doesn't apply yet (Phase 4); the signature itself is verified here.
+    const NSM_LIVE_DATA: &'static [u8] = include_bytes!("data/nsm-live.cbor");
+
+    fn nsm_live_leaf_key() -> Vec<u8> {
+        let blob = CoseSign1::from_slice(NSM_LIVE_DATA).unwrap();
+        let payload: serde_cbor::Value =
+            serde_cbor::from_slice(blob.payload.as_ref().unwrap()).unwrap();
+        if let serde_cbor::Value::Map(map) = &payload
+            && let Some(serde_cbor::Value::Bytes(certb)) =
+                map.get(&serde_cbor::Value::Text("certificate".into()))
+        {
+            let (_rem, c) = X509Certificate::from_der(certb).unwrap();
+            return c.public_key().subject_public_key.data.as_ref().to_vec();
+        }
+        panic!("no certificate in NSM doc");
+    }
+
+    #[test]
+    fn nsm_live_doc_signature_valid() {
+        let blob = CoseSign1::from_slice(NSM_LIVE_DATA).unwrap();
+        let key = nsm_live_leaf_key();
+        let tbs = blob.tbs_data(&[]);
+        assert!(
+            verify_es384(&key, &blob.signature, &tbs).is_ok(),
+            "live NSM doc signature must verify"
+        );
+        // A genuine verifier must reject a mutated message.
+        let mut tbs2 = tbs.clone();
+        let last = tbs2.len() - 1;
+        tbs2[last] ^= 0xFF;
+        assert!(
+            verify_es384(&key, &blob.signature, &tbs2).is_err(),
+            "verifier must reject a mutated tbs"
+        );
+    }
+
+    /// Full verification (signature + certificate chain to the AWS root + nonce
+    /// echo + PCR policy) of a live NitroTPM document. This is the Phase 4 path:
+    /// the doc keys its PCRs as `nitrotpm_pcrs`, which `verify` now accepts.
+    #[test]
+    fn nsm_live_doc_full_verify() {
+        let blob = CoseSign1::from_slice(NSM_LIVE_DATA).unwrap();
+        let payload: Value =
+            serde_cbor::from_slice(blob.payload.as_ref().unwrap()).unwrap();
+        let Value::Map(map) = &payload else {
+            panic!("payload not a map")
+        };
+        let pcrs_map = map.get(&Value::Text("nitrotpm_pcrs".into())).unwrap();
+        let Value::Map(pcrs) = pcrs_map else {
+            panic!("no nitrotpm_pcrs")
+        };
+        let mut policy: NitroPcrs = HashMap::new();
+        for (k, v) in pcrs {
+            let Value::Integer(idx) = k else { panic!("non-int pcr index") };
+            let Value::Bytes(b) = v else { panic!("non-bytes pcr value") };
+            policy.insert(u8::try_from(*idx).expect("pcr index fits u8"), b.clone());
+        }
+        let Value::Bytes(nonce) = map.get(&Value::Text("nonce".into())).unwrap() else {
+            panic!("no nonce")
+        };
+        let Value::Integer(ts_ms) = map.get(&Value::Text("timestamp".into())).unwrap() else {
+            panic!("no timestamp")
+        };
+        // The leaf cert is only valid for a ~3h window around issuance, so
+        // verify at the doc's own timestamp (not wall-clock "now").
+        let time = std::time::Duration::from_secs(u64::try_from(*ts_ms).unwrap() / 1000);
+        let nonce = nonce.clone();
+
+        // A wrong known-good PCR must be rejected (InvalidAAD).
+        let mut bad = policy.clone();
+
+        // With the doc's own PCRs as the known-good policy: full pass.
+        Nitro::with_pcr_policy(NSM_LIVE_DATA.to_vec(), policy)
+            .verify(time, &nonce)
+            .expect("live NSM doc must verify (sig + chain + nonce + PCRs)");
+
+        // With an empty policy: still verifies (sig + chain + nonce, no PCR pin).
+        Nitro::with_pcr_policy(NSM_LIVE_DATA.to_vec(), HashMap::new())
+            .verify(time, &nonce)
+            .expect("empty PCR policy must still verify sig + chain + nonce");
+
+        bad.get_mut(&0).unwrap()[0] ^= 0xFF;
+        let r = Nitro::with_pcr_policy(NSM_LIVE_DATA.to_vec(), bad).verify(time, &nonce);
+        assert!(matches!(r, Err(Error::InvalidAAD(_))), "wrong PCR must fail");
     }
 
     #[test]

@@ -1,1 +1,6 @@
 /target
+.target-musl/
+cap3.txt
+px3.log
+seq_esys.txt
+trace

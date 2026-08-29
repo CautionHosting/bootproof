@@ -1,0 +1,9 @@
+.git
+.gitignore
+out
+target
+**/target
+*.md
+docs
+LICENSE.md
+README.md

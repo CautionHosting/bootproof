@@ -1,3 +1,8 @@
 [workspace]
 resolver = "3"
-members = ["crates/bootproof","crates/bootproof-sdk", "crates/bootproofd"]
+members = [
+    "crates/bootproof",
+    "crates/bootproof-sdk",
+    "crates/bootproof-tpm",
+    "crates/bootproofd",
+]
