@@ -1,6 +1,6 @@
 # Bootproof
 
-<https://git.distrust.co/public/bootproof>
+<https://codeberg.org/caution/bootproof>
 
 CLI + daemon for TPM 2.0 / NitroTPM / SEV-SNP remote attestation. The core
 artifact is a **trust tree** where every fact carries a verdict and a vendor
@@ -27,14 +27,14 @@ container signatures).
 ```
 make                 # musl static binary via docker (bptpm-dev:latest) -> out/bootproof
 cargo build -p bootproof
-cargo test           # 59 unit tests across the workspace
+cargo test           # 61 unit tests across the workspace
 ```
 
 ## Commands
 
 | command | purpose |
 | --- | --- |
-| `bootproof verify` | local trust tree for this machine (default: succinct summary; `--expert` full evidence tree; `--json` machine output) |
+| `bootproof verify` | local trust tree for this machine (default: succinct summary; `--expert` full evidence tree; `--json` machine output; `--min-level 0-3` gates the derived attestation level) |
 | `bootproof verify <target>` | challenge a remote node, verify the proof offline, print the facts table |
 | `bootproof attest` | node server: REST remote-attestation API (challenge/nonce + channels) |
 | `bootproof serve` | self-contained plain-HTTP NitroTPM attestation API (`POST /attest`) |
@@ -54,6 +54,7 @@ bootproof verify --json [--expert]                # machine output
 bootproof verify --tcp host:port                  # via tpm-bridge (no local /dev/tpm0)
 bootproof verify --pcr-policy policy.json         # pin expected PCRs (v1 hex/b64 or v2 {"source": ..., "pcrs": ...})
 bootproof verify --user-data "release=sha256:..." # metadata into the AWS-signed attestation doc
+bootproof verify --min-level 2                    # require L2 CVM dual attestation (exit 4 if below)
 ```
 
 Summary on the reference c6a.large / StageX / us-east-2 instance (a
@@ -61,6 +62,8 @@ Summary on the reference c6a.large / StageX / us-east-2 instance (a
 
 ```
 TRUST SUMMARY
+ ✓ level        L2: CVM dual attestation (hardware TPM +  AWS AMD
+                SEV-SNP, cross-bound)
  ✓ instance     i-02a44cb68978c43af (c6a.large)           AWS
  ✓ account      412541033472                              AWS
  ✓ region       us-east-2 (us-east-2c)                    AWS
@@ -78,6 +81,26 @@ TRUST SUMMARY
 Cross-attestation binding: one fresh 32-byte nonce is embedded in TWO
 independently pinned-root-signed artifacts (the AWS-signed NitroTPM doc and
 the AMD-signed SEV-SNP report), so neither can be replayed or spliced.
+
+### Attestation levels
+
+Every run reports an **Attestation Level** derived from which pinned roots
+actually verified, not from what the guest claims:
+
+- **L0** software TPM: a TPM2 interface responds, but the attestation does
+  not verify to any pinned hardware vendor root (swtpm, or vendor hardware
+  whose root is not pinned in this binary).
+- **L1** hardware TPM: the attestation chain verifies to a pinned vendor
+  root (today AWS Nitro Enclaves; GCP/Azure roots to follow).
+- **L2** CVM dual attestation: L1 plus a CPU-attested report (SEV-SNP or
+  TDX) verified to its own pinned root, cross-bound to the TPM document by
+  a fresh shared nonce.
+- **L3** ring isolation: L2 plus an SVSM attested from a ring the
+  hypervisor cannot reach (SVSM + coconut-svsm). Reserved.
+
+A CVM report alone is not L2: the model requires the TPM side of the dual
+attestation. `--min-level N` exits 4 when the derived level is below N (a
+machine with no TPM at all is below L0).
 
 ### StageX provenance
 

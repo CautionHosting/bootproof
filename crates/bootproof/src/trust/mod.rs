@@ -29,6 +29,20 @@
 //!               they are reported as best observed.
 //!   `false`   — verified absence
 //!   `unknown` — undeterminable from the guest
+//!
+//! Attestation levels (derived from which pinned roots actually verified,
+//! never from what the guest claims):
+//!   `L0` — software TPM: a TPM2 interface responds, but the attestation
+//!          does not verify to any pinned hardware vendor root (swtpm, or
+//!          vendor hardware whose root is not pinned in this binary).
+//!   `L1` — hardware TPM: the attestation chain verifies to a pinned
+//!          vendor root (today AWS Nitro Enclaves; GCP/Azure roots to
+//!          follow).
+//!   `L2` — CVM dual attestation: L1 plus a CPU-attested report (SEV-SNP
+//!          or TDX) verified to its own pinned root, cross-bound to the
+//!          TPM document by a fresh shared nonce.
+//!   `L3` — ring isolation: L2 plus an SVSM attested from a ring the
+//!          hypervisor cannot reach (SVSM + coconut-svsm). Reserved.
 
 use std::fmt;
 use std::io::{Read, Write};
@@ -123,6 +137,72 @@ impl fmt::Display for Verdict {
     }
 }
 
+/// Attestation strength, derived from which pinned roots actually verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrustLevel {
+    /// No TPM2 interface at all.
+    None,
+    /// Software/unproven TPM2: the device responds but no pinned vendor
+    /// root verified (swtpm, or vendor hardware without a pinned root).
+    L0,
+    /// Hardware TPM: attestation chain verified to a pinned vendor root.
+    L1,
+    /// CVM dual attestation: L1 plus a CPU-attested report (SEV-SNP/TDX)
+    /// verified to its own pinned root, cross-bound by a fresh nonce.
+    L2,
+    /// Ring isolation: L2 plus an SVSM attested from a ring the hypervisor
+    /// cannot reach (SVSM + coconut-svsm). Reserved; not yet reachable.
+    L3,
+}
+
+impl TrustLevel {
+    /// Derive the level from the anchors. A CVM report alone is NOT L2:
+    /// the model requires the TPM side of the dual attestation too.
+    fn derive(nitro: &NitroFacts, snp: &SnpFacts, tpm_present: bool) -> TrustLevel {
+        if nitro.ok && snp.amd_anchored() && snp.report_data.is_some() {
+            return TrustLevel::L2;
+        }
+        if nitro.ok {
+            return TrustLevel::L1;
+        }
+        if tpm_present {
+            return TrustLevel::L0;
+        }
+        TrustLevel::None
+    }
+
+    pub fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            0 => TrustLevel::L0,
+            1 => TrustLevel::L1,
+            2 => TrustLevel::L2,
+            3 => TrustLevel::L3,
+            _ => return None,
+        })
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TrustLevel::None => "none",
+            TrustLevel::L0 => "L0",
+            TrustLevel::L1 => "L1",
+            TrustLevel::L2 => "L2",
+            TrustLevel::L3 => "L3",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            TrustLevel::None => "no TPM2 interface",
+            TrustLevel::L0 => "software/unproven TPM2 (no pinned vendor root)",
+            TrustLevel::L1 => "hardware TPM verified to a pinned vendor root",
+            TrustLevel::L2 => "CVM dual attestation (hardware TPM + CPU-attested report, cross-bound)",
+            TrustLevel::L3 => "ring isolation (SVSM)",
+        }
+    }
+}
+
 /// One piece of vendor-specific evidence supporting a fact.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Evidence {
@@ -168,6 +248,9 @@ pub struct TrustTree {
 struct NitroFacts {
     /// Whether the attestation fetched AND verified to the AWS Nitro root.
     ok: bool,
+    /// Whether a TPM2 interface opened and responded at all (device present,
+    /// whether or not its attestation verified to a pinned root).
+    device: bool,
     /// Whether the signature + chain + nonce verified (== ok on success).
     chain: bool,
     /// Module identity (e.g. `i-02a44cb68978c43af-tpm...`).
@@ -419,7 +502,10 @@ fn collect_nitro(
         None => bootproof_tpm::Tpm::open_started(device),
     };
     let mut tpm = match tpm {
-        Ok(t) => t,
+        Ok(t) => {
+            f.device = true;
+            t
+        }
         Err(e) => {
             f.error = Some(format!("open TPM: {e}"));
             return f;
@@ -1474,7 +1560,100 @@ fn provenance_branch(prov: &ProvenanceFacts) -> Option<Branch> {
     })
 }
 
+/// The "Attestation Level" fact: L0 software TPM, L1 hardware TPM, L2 CVM
+/// dual attestation, L3 ring isolation (reserved). Derived from the pinned
+/// roots that verified, never from guest claims.
+fn attestation_level_fact(nitro: &NitroFacts, snp: &SnpFacts) -> Fact {
+    let level = TrustLevel::derive(nitro, snp, nitro.device);
+    let (value, verdict, evidence) = match level {
+        TrustLevel::L3 => (
+            "L3: ring isolation (SVSM)".to_string(),
+            Verdict::True,
+            vec![Evidence {
+                source: "svsm".into(),
+                detail: "SVSM attestation verified from a ring the hypervisor cannot reach".into(),
+                proof: Verdict::True,
+            }],
+        ),
+        TrustLevel::L2 => (
+            "L2: CVM dual attestation (hardware TPM + SEV-SNP, cross-bound)".to_string(),
+            Verdict::True,
+            vec![
+                Evidence {
+                    source: "nitro-tpm".into(),
+                    detail: "TPM attestation chain verified to the pinned AWS Nitro Enclaves root (ES384 + chain + nonce)".into(),
+                    proof: Verdict::True,
+                },
+                Evidence {
+                    source: "sev-snp".into(),
+                    detail: "SEV-SNP report signature + TCB verified to the AMD ARK via the platform-provisioned VLEK".into(),
+                    proof: Verdict::True,
+                },
+                Evidence {
+                    source: "note".into(),
+                    detail: "a fresh 32-byte nonce sits in BOTH signed artifacts: the TPM and the CVM are the same run".into(),
+                    proof: Verdict::True,
+                },
+            ],
+        ),
+        TrustLevel::L1 => (
+            "L1: hardware TPM (pinned vendor root)".to_string(),
+            Verdict::True,
+            vec![
+                Evidence {
+                    source: "nitro-tpm".into(),
+                    detail: "TPM attestation chain verified to the pinned AWS Nitro Enclaves root (ES384 + chain + nonce)".into(),
+                    proof: Verdict::True,
+                },
+                Evidence {
+                    source: "note".into(),
+                    detail: "no CPU-attested report anchored (SEV-SNP/TDX), so L2 dual attestation is not established".into(),
+                    proof: Verdict::Likely,
+                },
+            ],
+        ),
+        TrustLevel::L0 => (
+            "L0: software/unproven TPM2 (no pinned vendor root)".to_string(),
+            Verdict::Likely,
+            vec![
+                Evidence {
+                    source: "tpm".into(),
+                    detail: "a TPM2 interface responds, but its attestation did not verify to a pinned hardware vendor root".into(),
+                    proof: Verdict::Likely,
+                },
+                Evidence {
+                    source: "note".into(),
+                    detail: nitro
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "software TPM (swtpm), or vendor hardware whose root is not pinned in this binary".into()),
+                    proof: Verdict::Unknown,
+                },
+            ],
+        ),
+        TrustLevel::None => (
+            "none: no TPM2 interface".to_string(),
+            Verdict::False,
+            vec![Evidence {
+                source: "tpm".into(),
+                detail: format!(
+                    "no TPM2 device or bridge endpoint: {}",
+                    nitro.error.clone().unwrap_or_else(|| "open failed".into())
+                ),
+                proof: Verdict::False,
+            }],
+        ),
+    };
+    Fact {
+        name: "Attestation Level".into(),
+        value,
+        verdict,
+        evidence,
+    }
+}
+
 fn crypto_branch(nitro: &NitroFacts, snp: &SnpFacts) -> Branch {
+    let level_fact = attestation_level_fact(nitro, snp);
     let binding_fact = if nitro.ok && snp.report && snp.report_data.is_some() {
         let nonce_hex: String = snp
             .report_data
@@ -1533,6 +1712,7 @@ fn crypto_branch(nitro: &NitroFacts, snp: &SnpFacts) -> Branch {
     Branch {
         name: "Cryptography".into(),
         facts: vec![
+            level_fact,
             Fact {
                 name: "Ephemeral Key".into(),
                 value: "N/A".into(),
@@ -2880,6 +3060,7 @@ fn summary_rows(tree: &TrustTree) -> Vec<(&'static str, &Fact)> {
     };
     let mut rows: Vec<(&'static str, &Fact)> = Vec::new();
     for (label, branch, name) in [
+        ("level", "Cryptography", "Attestation Level"),
         ("instance", "Custody", "Instance"),
         ("account", "Custody", "Owner / Account"),
         ("region", "Custody", "Location"),
@@ -3042,6 +3223,9 @@ pub struct Opts {
     /// authenticated by the pinned AWS root and bound to the same signed
     /// PCRs/nonce as the rest of the attestation.
     pub user_data: Option<String>,
+    /// Require at least this attestation level (0..=3). Exit 4 if the
+    /// derived level is below it.
+    pub min_level: Option<u8>,
 }
 
 /// Gather all evidence, build the tree, and print it.
@@ -3054,6 +3238,7 @@ pub fn run(opts: Opts) -> anyhow::Result<i32> {
     };
     let user_data = opts.user_data.as_ref().map(|s| s.as_bytes().to_vec());
     let nitro = collect_nitro(&opts.device, &opts.tcp, opts.nv_index, binding_nonce, &policy, user_data);
+    let level = TrustLevel::derive(&nitro, &snp, nitro.device);
     let imds = collect_imds();
     let iidd = collect_iidd(nitro.region.as_deref());
     let guest = collect_guest();
@@ -3073,6 +3258,22 @@ pub fn run(opts: Opts) -> anyhow::Result<i32> {
     } else {
         print!("{}", render_summary(&tree));
     }
+    if let Some(min) = opts.min_level {
+        match TrustLevel::from_u8(min) {
+            Some(minl) if level >= minl => {}
+            Some(minl) => {
+                eprintln!(
+                    "attestation level {} ({}) below required {} ({})",
+                    level.label(),
+                    level.description(),
+                    minl.label(),
+                    minl.description()
+                );
+                return Ok(4);
+            }
+            None => return Err(anyhow::anyhow!("--min-level must be 0, 1, 2, or 3")),
+        }
+    }
     Ok(0)
 }
 
@@ -3088,6 +3289,58 @@ mod tests {
         assert_eq!(Verdict::Likely.to_string(), "likely");
         assert_eq!(Verdict::False.to_string(), "false");
         assert_eq!(Verdict::Unknown.to_string(), "unknown");
+    }
+
+    #[test]
+    fn trust_level_derive() {
+        // No device at all.
+        assert_eq!(
+            TrustLevel::derive(&NitroFacts::default(), &SnpFacts::default(), false),
+            TrustLevel::None
+        );
+        // Device responds but nothing verifies to a pinned root: L0.
+        let mut f = NitroFacts::default();
+        f.device = true;
+        f.error = Some("attestation_document: vendor command unsupported".into());
+        assert_eq!(
+            TrustLevel::derive(&f, &SnpFacts::default(), f.device),
+            TrustLevel::L0
+        );
+        // Hardware TPM chain verified, no CVM report: L1.
+        let mut n = NitroFacts::default();
+        n.device = true;
+        n.ok = true;
+        n.chain = true;
+        assert_eq!(
+            TrustLevel::derive(&n, &SnpFacts::default(), n.device),
+            TrustLevel::L1
+        );
+        // CVM report anchored but stale (no fresh report_data): still L1.
+        let mut s = SnpFacts::default();
+        s.report = true;
+        s.vlek_verified = Some(true);
+        s.amd_chain_ok = Some(true);
+        assert_eq!(TrustLevel::derive(&n, &s, n.device), TrustLevel::L1);
+        // Fresh, anchored report with the shared nonce: L2.
+        s.report_data = Some(vec![0u8; 32]);
+        assert_eq!(TrustLevel::derive(&n, &s, n.device), TrustLevel::L2);
+        // Anchored CVM without a verified TPM is NOT L2 under the model.
+        let mut n2 = NitroFacts::default();
+        n2.device = true;
+        assert_eq!(TrustLevel::derive(&n2, &s, n2.device), TrustLevel::L0);
+    }
+
+    #[test]
+    fn trust_level_from_u8() {
+        assert_eq!(TrustLevel::from_u8(0), Some(TrustLevel::L0));
+        assert_eq!(TrustLevel::from_u8(1), Some(TrustLevel::L1));
+        assert_eq!(TrustLevel::from_u8(2), Some(TrustLevel::L2));
+        assert_eq!(TrustLevel::from_u8(3), Some(TrustLevel::L3));
+        assert_eq!(TrustLevel::from_u8(4), None);
+        assert!(TrustLevel::None < TrustLevel::L0);
+        assert!(TrustLevel::L0 < TrustLevel::L1);
+        assert!(TrustLevel::L1 < TrustLevel::L2);
+        assert!(TrustLevel::L2 < TrustLevel::L3);
     }
 
     #[test]

@@ -123,6 +123,11 @@ enum Command {
         /// bound to the same signed PCRs/nonce (8 KiB request limit).
         #[arg(long)]
         user_data: Option<String>,
+        /// Require at least this attestation level (0..=3); exit 4 if the
+        /// derived level is below it (local tree only). Levels: 0 software
+        /// TPM, 1 hardware TPM, 2 CVM dual attestation, 3 ring isolation.
+        #[arg(long)]
+        min_level: Option<u8>,
     },
     /// Decrypt a blob with the local TPM (gated by the attested PCR state).
     Decrypt {
@@ -483,6 +488,7 @@ fn main() -> anyhow::Result<()> {
             expert,
             pcr_policy,
             user_data,
+            min_level,
         } => {
             match target {
                 // Local trust tree (default when no target is given).
@@ -496,6 +502,7 @@ fn main() -> anyhow::Result<()> {
                         expert,
                         pcr_policy,
                         user_data,
+                        min_level,
                     })?);
                 }
                 // Remote client flow.

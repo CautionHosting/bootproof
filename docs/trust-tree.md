@@ -11,6 +11,7 @@ Final rendered verdicts on the c6a.large / StageX / us-east-2 instance:
 
 | Branch | Fact | Verdict |
 | --- | --- | --- |
+| Cryptography | Attestation Level (L2: CVM dual attestation) | true |
 | Cryptography | Ephemeral / System / User / Provider Key | unknown (N/A) |
 | Cryptography | Cross-Attestation Binding (TPM + SEV-SNP shared nonce) | true |
 | Custody | Owner / Account | true (signed IIDD) |
@@ -94,6 +95,21 @@ value is **`N/A`** (per operator direction). Real key-wrapping comes later:
    system, in this run, after the nonce existed. Artifacts from different
    machines or times cannot be spliced. `unknown` when a fresh report with
    report_data wasn't obtained or the TPM attestation didn't verify.
+6. **Attestation Level** — the tree's strength, derived from which pinned
+   roots actually verified (never from what the guest claims):
+   - **L0 software TPM** — a TPM2 interface responds, but the attestation
+     does not verify to any pinned hardware vendor root (swtpm, or vendor
+     hardware whose root is not pinned in this binary).
+   - **L1 hardware TPM** — the attestation chain verifies to a pinned
+     vendor root (today AWS Nitro Enclaves; GCP/Azure roots to follow).
+   - **L2 CVM dual attestation** — L1 plus a CPU-attested report (SEV-SNP
+     or TDX) verified to its own pinned root, cross-bound to the TPM
+     document by a fresh shared nonce.
+   - **L3 ring isolation** — L2 plus an SVSM attested from a ring the
+     hypervisor cannot reach (SVSM + coconut-svsm). Reserved.
+   A CVM report alone is not L2: the model requires the TPM side. `bootproof
+   verify --min-level N` exits 4 when the derived level is below N (a
+   machine with no TPM at all is below L0).
 
 ## Custody branch (who owns it)
 
