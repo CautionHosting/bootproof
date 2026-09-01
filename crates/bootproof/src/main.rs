@@ -11,10 +11,12 @@
 mod tpm_probe;
 mod verify_nitro;
 
+use std::io::Write;
 use std::path::PathBuf;
 
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
+use sha2::{Digest, Sha256};
 
 use bootproof_tpm::Tpm;
 #[derive(Parser)]
@@ -37,6 +39,10 @@ enum Command {
         /// Connect to swtpm over a Unix socket (socket path).
         #[arg(long)]
         unix: Option<PathBuf>,
+        /// swtpm control-channel socket (for --unix): sends `CMD_INIT` to
+        /// bring the emulated TPM up before any data-channel command.
+        #[arg(long)]
+        ctrl: Option<PathBuf>,
         /// Comma-separated list of PCR indices to read (default: 0-23).
         #[arg(long)]
         pcrs: Option<String>,
@@ -314,6 +320,75 @@ enum Command {
         #[arg(long)]
         compare: Option<PathBuf>,
     },
+    /// Seal a file behind a PCR policy and persist the sealed object.
+    Seal {
+        /// PCR indices for the policy (comma-separated, e.g. 5,7).
+        #[arg(long)]
+        pcrs: String,
+        /// Persistent handle to store the sealed object (hex, e.g. 0x81010200).
+        #[arg(long, default_value = "0x81010200")]
+        handle: String,
+        /// Input file to seal.
+        input: PathBuf,
+        /// TPM kernel character device (default /dev/tpm0).
+        #[arg(long, default_value = "/dev/tpm0")]
+        device: PathBuf,
+        /// Connect to swtpm over TCP (host:port). Overrides --device.
+        #[arg(long)]
+        tcp: Option<String>,
+        /// Connect to swtpm over a Unix data socket. Overrides --device.
+        #[arg(long)]
+        unix: Option<PathBuf>,
+        /// swtpm control-channel socket (for --unix): sends `CMD_INIT`.
+        #[arg(long)]
+        ctrl: Option<PathBuf>,
+    },
+    /// Unseal a previously sealed object using a PCR policy.
+    Unseal {
+        /// PCR indices for the policy (comma-separated, e.g. 5,7).
+        #[arg(long)]
+        pcrs: String,
+        /// Persistent handle of the sealed object (hex, e.g. 0x81010200).
+        #[arg(long, default_value = "0x81010200")]
+        handle: String,
+        /// Output file (default: stdout).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// TPM kernel character device (default /dev/tpm0).
+        #[arg(long, default_value = "/dev/tpm0")]
+        device: PathBuf,
+        /// Connect to swtpm over TCP (host:port). Overrides --device.
+        #[arg(long)]
+        tcp: Option<String>,
+        /// Connect to swtpm over a Unix data socket. Overrides --device.
+        #[arg(long)]
+        unix: Option<PathBuf>,
+        /// swtpm control-channel socket (for --unix): sends `CMD_INIT`.
+        #[arg(long)]
+        ctrl: Option<PathBuf>,
+    },
+    /// Extend a PCR with the SHA-256 of a file (the S54tpm-rootfs step).
+    PcrExtend {
+        /// PCR index to extend.
+        pcr: u32,
+        /// File whose SHA-256 is extended into the PCR.
+        input: PathBuf,
+        /// TPM kernel character device (default /dev/tpm0).
+        #[arg(long, default_value = "/dev/tpm0")]
+        device: PathBuf,
+        /// Connect to swtpm over TCP (host:port). Overrides --device.
+        #[arg(long)]
+        tcp: Option<String>,
+        /// Connect to swtpm over a Unix data socket. Overrides --device.
+        #[arg(long)]
+        unix: Option<PathBuf>,
+        /// swtpm control-channel socket (for --unix): sends `CMD_INIT`.
+        #[arg(long)]
+        ctrl: Option<PathBuf>,
+        /// Number of retries (default 5) with a 2s backoff.
+        #[arg(long, default_value_t = 5)]
+        retries: u32,
+    },
 }
 
 fn parse_pcrs(s: &Option<String>) -> Option<Vec<u8>> {
@@ -323,6 +398,29 @@ fn parse_pcrs(s: &Option<String>) -> Option<Vec<u8>> {
             .map(|x| x.trim().parse::<u8>().expect("bad PCR index"))
             .collect(),
     )
+}
+
+/// Connect to a TPM given the device / swtpm options, ensuring it is started.
+fn connect_tpm(
+    device: &std::path::Path,
+    tcp: &Option<String>,
+    unix: &Option<PathBuf>,
+    ctrl: &Option<PathBuf>,
+) -> anyhow::Result<Tpm> {
+    Ok(match (tcp, unix) {
+        (Some(addr), _) => Tpm::connect_swtpm_tcp_started(addr)?,
+        (None, Some(path)) => match ctrl {
+            Some(c) => Tpm::connect_swtpm_unix_with_ctrl(path, c)?,
+            None => Tpm::connect_swtpm_unix_started(path)?,
+        },
+        (None, None) => Tpm::open_started(device)?,
+    })
+}
+
+/// Parse a hex handle string (e.g. `0x81010200` or `81010200`).
+fn parse_handle(s: &str) -> anyhow::Result<u32> {
+    let t = s.trim().trim_start_matches("0x").trim_start_matches("0X");
+    u32::from_str_radix(t, 16).map_err(|e| anyhow::anyhow!("bad handle: {e}"))
 }
 
 fn hex_str(b: &[u8]) -> String {
@@ -363,10 +461,98 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
+        Command::Seal {
+            pcrs,
+            handle,
+            input,
+            device,
+            tcp,
+            unix,
+            ctrl,
+        } => {
+            let pcrs = parse_pcrs(&Some(pcrs)).ok_or_else(|| anyhow::anyhow!("bad pcrs"))?;
+            let handle = parse_handle(&handle)?;
+            let data = std::fs::read(&input)
+                .map_err(|e| anyhow::anyhow!("read {}: {e}", input.display()))?;
+            let mut tpm = connect_tpm(&device, &tcp, &unix, &ctrl)?;
+            let name = tpm.seal(&pcrs, &data, handle)?;
+            println!(
+                "sealed {} bytes behind PCRs {:?} at 0x{:08x}",
+                data.len(),
+                pcrs,
+                handle
+            );
+            println!("object name: {}", hex_str(&name));
+        }
+        Command::Unseal {
+            pcrs,
+            handle,
+            out,
+            device,
+            tcp,
+            unix,
+            ctrl,
+        } => {
+            let pcrs = parse_pcrs(&Some(pcrs)).ok_or_else(|| anyhow::anyhow!("bad pcrs"))?;
+            let handle = parse_handle(&handle)?;
+            let mut tpm = connect_tpm(&device, &tcp, &unix, &ctrl)?;
+            let data = tpm.unseal(&pcrs, handle)?;
+            match out {
+                Some(o) => {
+                    std::fs::write(&o, &data)
+                        .map_err(|e| anyhow::anyhow!("write {}: {e}", o.display()))?;
+                    println!("unsealed {} bytes -> {}", data.len(), o.display());
+                }
+                None => std::io::stdout().write_all(&data)?,
+            }
+        }
+        Command::PcrExtend {
+            pcr,
+            input,
+            device,
+            tcp,
+            unix,
+            ctrl,
+            retries,
+        } => {
+            let data = std::fs::read(&input)
+                .map_err(|e| anyhow::anyhow!("read {}: {e}", input.display()))?;
+            let digest = Sha256::digest(&data);
+            let mut tpm = connect_tpm(&device, &tcp, &unix, &ctrl)?;
+            let mut last: Option<String> = None;
+            let mut success = false;
+            for attempt in 0..=retries {
+                match tpm.pcr_extend(pcr, &digest) {
+                    Ok(()) => {
+                        println!(
+                            "extended PCR {pcr} with sha256 {} (attempt {})",
+                            hex_str(&digest),
+                            attempt
+                        );
+                        success = true;
+                        break;
+                    }
+                    Err(e) => {
+                        last = Some(format!("{e}"));
+                        if attempt < retries {
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                        }
+                    }
+                }
+            }
+            if !success {
+                anyhow::bail!(
+                    "pcr_extend PCR {pcr} failed after {} retries: {}",
+                    retries,
+                    last.unwrap_or_default()
+                );
+            }
+        }
         Command::TpmProbe {
             device,
             tcp,
             unix,
+            ctrl,
             pcrs,
             raw,
             create_key,
@@ -377,10 +563,13 @@ fn main() -> anyhow::Result<()> {
                     Tpm::connect_swtpm_tcp_started(&addr)?,
                     format!("swtpm-tcp://{}", addr),
                 ),
-                (None, Some(path)) => (
-                    Tpm::connect_swtpm_unix_started(&path)?,
-                    format!("swtpm-unix://{}", path.display()),
-                ),
+                (None, Some(path)) => {
+                    let tpm = match &ctrl {
+                        Some(c) => Tpm::connect_swtpm_unix_with_ctrl(&path, c)?,
+                        None => Tpm::connect_swtpm_unix_started(&path)?,
+                    };
+                    (tpm, format!("swtpm-unix://{}", path.display()))
+                }
                 (None, None) => (Tpm::open_started(&device)?, device.display().to_string()),
             };
             if let Some(hex_cmd) = raw {

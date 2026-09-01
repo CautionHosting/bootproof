@@ -14,6 +14,7 @@
 pub mod commands;
 pub mod commands_key;
 pub mod commands_policy;
+pub mod commands_seal;
 pub mod conn;
 pub mod constants;
 pub mod error;
@@ -26,7 +27,7 @@ pub mod session;
 pub use commands::{PcrReadResult, PcrSelection, PcrValue};
 pub use commands_key::{Key, Quote};
 pub use commands_policy::{policy_pcr_auth_policy, parse_public_area, PublicArea};
-pub use conn::{Command, Tpm};
+pub use conn::{Command, Tpm, swtpm_ctrl_init};
 pub use error::{Error, Result};
 #[cfg(feature = "esys")]
 pub use esys::EsysTpm;
@@ -51,9 +52,11 @@ impl Tpm {
     }
 
     /// Open a TPM kernel char device and ensure it is started.
+    ///
+    /// The wire profile is set explicitly by [`Tpm::open`] (libtpms-derived),
+    /// not probed at open time.
     pub fn open_started(path: &std::path::Path) -> Result<Self> {
         let mut tpm = Self::open(path)?;
-        tpm.detect_dialect();
         tpm.ensure_started()?;
         Ok(tpm)
     }
@@ -61,7 +64,6 @@ impl Tpm {
     /// Connect to swtpm over TCP and ensure started.
     pub fn connect_swtpm_tcp_started(addr: &str) -> Result<Self> {
         let mut tpm = Self::connect_swtpm_tcp(addr)?;
-        tpm.detect_dialect();
         tpm.ensure_started()?;
         Ok(tpm)
     }
@@ -69,7 +71,20 @@ impl Tpm {
     /// Connect to swtpm over a Unix socket and ensure started.
     pub fn connect_swtpm_unix_started(path: &std::path::Path) -> Result<Self> {
         let mut tpm = Self::connect_swtpm_unix(path)?;
-        tpm.detect_dialect();
+        tpm.ensure_started()?;
+        Ok(tpm)
+    }
+
+    /// Connect to swtpm over a Unix **data** socket, first bringing the
+    /// emulated TPM up via the **control** channel (`swtpm_ctrl_init`).
+    /// `data_path` is the `--server type=unixio` socket; `ctrl_path` is the
+    /// `--ctrl type=unixio` socket.
+    pub fn connect_swtpm_unix_with_ctrl(
+        data_path: &std::path::Path,
+        ctrl_path: &std::path::Path,
+    ) -> Result<Self> {
+        swtpm_ctrl_init(ctrl_path)?;
+        let mut tpm = Self::connect_swtpm_unix(data_path)?;
         tpm.ensure_started()?;
         Ok(tpm)
     }

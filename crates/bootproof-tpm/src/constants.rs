@@ -7,10 +7,11 @@ pub mod cc {
     // Command codes (TPM_CC). Values verified against the TPM 2.0 spec Table 4.
     pub const EVICT_CONTROL: u16 = 0x0120;
     pub const PCR_ALLOCATE: u16 = 0x012B;
-    pub const CREATE_PRIMARY: u16 = 0x0135;
+    pub const CREATE_PRIMARY: u16 = 0x0131;
     pub const STARTUP: u16 = 0x0144;
     pub const CERTIFY: u16 = 0x0148;
     pub const CREATE: u16 = 0x0153;
+    pub const LOAD: u16 = 0x0157;
     pub const ECDH_ZGEN: u16 = 0x0154;
     pub const QUOTE: u16 = 0x0158;
     pub const SIGN: u16 = 0x015D;
@@ -19,19 +20,19 @@ pub mod cc {
     pub const CONTEXT_SAVE: u16 = 0x0162;
     pub const ECDH_KEYGEN: u16 = 0x0163;
     pub const FLUSH_CONTEXT: u16 = 0x0165;
-    pub const READ_PUBLIC: u16 = 0x016A;
+    pub const READ_PUBLIC: u16 = 0x0173;
     pub const START_AUTH_SESSION: u16 = 0x0176;
     pub const VERIFY_SIGNATURE: u16 = 0x0177;
     pub const ECC_PARAMETERS: u16 = 0x0178;
     pub const GET_CAPABILITY: u16 = 0x017A;
     pub const GET_RANDOM: u16 = 0x017B;
     pub const GET_TEST_RESULT: u16 = 0x017C;
-    pub const HASH: u16 = 0x0160;
+    pub const HASH: u16 = 0x017d;
     pub const PCR_READ: u16 = 0x017E;
     pub const POLICY_PCR: u16 = 0x017F;
     pub const POLICY_RESTART: u16 = 0x0180;
-    pub const PCR_EXTEND: u16 = 0x015C;
-    pub const NV_READ_PUBLIC: u16 = 0x01C9;
+    pub const PCR_EXTEND: u16 = 0x0182;
+    pub const NV_READ_PUBLIC: u16 = 0x0169;
 }
 
 pub mod alg {
@@ -40,15 +41,19 @@ pub mod alg {
     pub const SHA256: u16 = 0x000B;
     pub const SHA384: u16 = 0x000C;
     pub const SHA512: u16 = 0x000D;
+    pub const HMAC: u16 = 0x0005;
     pub const AES: u16 = 0x0006;
+    pub const KEYEDHASH: u16 = 0x0008;
+    pub const XOR: u16 = 0x000A;
+    pub const SYMCIPHER: u16 = 0x0025;
     pub const CTR: u16 = 0x0040;
     pub const CFB: u16 = 0x0043;
-    pub const ECDH: u16 = 0x001B;
+    pub const ECDH: u16 = 0x0019;
     pub const ECDSA: u16 = 0x0018;
     pub const ECC: u16 = 0x0023;
-    pub const KDF1_SP800_56A: u16 = 0x001C;
+    pub const KDF1_SP800_56A: u16 = 0x0020;
     pub const EC_P256: u16 = 0x0003;
-    pub const EC_P384: u16 = 0x0015;
+    pub const EC_P384: u16 = 0x0004;
     pub const RSASSA: u16 = 0x0014;
     pub const RSAPSS: u16 = 0x0016;
 }
@@ -71,19 +76,22 @@ pub mod st {
 }
 
 pub mod rh {
-    // Resource handle constants (TPM_RH), TCG Part 2 Table 42.
-    // Verified against the Linux kernel and captured tpm2-tools traffic.
-    pub const ENDORSEMENT: u32 = 0x4000_0001;
-    pub const OWNER: u32 = 0x4000_0002;
-    pub const LOCKOUT: u32 = 0x4000_0003;
-    pub const ENDORSEMENT_AUTH: u32 = 0x4000_0004;
-    pub const OWNER_AUTH: u32 = 0x4000_0005;
-    pub const LOCKOUT_AUTH: u32 = 0x4000_0006;
-    pub const PLATFORM: u32 = 0x4000_0007;
-    pub const PLATFORM_AUTH: u32 = 0x4000_0008;
+    // Resource handle constants (TPM_RH).
+    //
+    // These match libtpms 0.10.2 exactly (TpmTypes.h, TPM_RH_*): the libtpms
+    // wire profile does NOT renumber the hierarchy handles — they are the
+    // standard TCG values. An earlier revision of this table fabricated a
+    // renumbering (OWNER=0x40000002, PLATFORM=0x40000007, ...) that matched no
+    // real TPM and broke CreatePrimary / EvictControl with TPM_RC_HIERARCHY
+    // (0x0184). `rh_std` below holds the identical values; the two are kept
+    // separate only because the command builders still branch on `dialect`.
+    pub const OWNER: u32 = 0x4000_0001;
+    pub const ENDORSEMENT: u32 = 0x4000_000B;
+    pub const PLATFORM: u32 = 0x4000_000C;
+    pub const LOCKOUT: u32 = 0x4000_000A;
 
-    // The "none" / null hierarchy (ephemeral keys).
-    pub const NULL: u32 = 0x0000_0001;
+    // The null (unbound) hierarchy: identical in both profiles.
+    pub const NULL: u32 = 0x4000_0007;
 
     pub const EK_CERT_NV: u32 = 0x01C0_0002;
     pub const PLATFORM_CERT_NV: u32 = 0x01C0_000A;

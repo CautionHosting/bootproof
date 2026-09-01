@@ -245,19 +245,13 @@ impl Tpm {
         Ok(out)
     }
 
-    /// Map a spec command code to the firmware's wire code. The dialect
-    /// renumbers some commands (verified against working esys traffic):
-    /// CreatePrimary 0x0135 -> 0x0131, ReadPublic 0x016A -> 0x0173. All
-    /// other codes used by this client are unchanged.
+    /// Map a command code to the wire code. The StageX firmware speaks
+    /// standard TCG command codes (proven by the working esys capture,
+    /// which shows 0x0131 CreatePrimary, 0x0173 ReadPublic, 0x0158 Quote,
+    /// 0x015D Sign), so this is currently the identity. Kept as a hook in
+    /// case a firmware revision renumbers codes.
     pub fn wire_cc(&self, standard: u16) -> u16 {
-        if !self.dialect {
-            return standard;
-        }
-        match standard {
-            cc::CREATE_PRIMARY => 0x0131,
-            cc::READ_PUBLIC => 0x0173,
-            other => other,
-        }
+        standard
     }
 
     /// TPM2_GetCapability for a single TPM property (TPM_CAP_TPM_PROPERTIES).
@@ -271,12 +265,15 @@ impl Tpm {
         parse_get_capability_property(&body)
     }
 
-    /// Detect the renumbered StageX dialect and record it. The dialect
-    /// renumbers symmetric algorithms: it advertises CFB as `0x0043`, a code
-    /// the spec does not define (spec CFB is `0x0045`). Querying
-    /// GetCapability(ALGORITHMS) for `0x0043` therefore marks the dialect:
-    /// a count > 0 means the firmware speaks it, NO_RESULT (0x0001) means a
-    /// standard TPM. Best effort: on any error the TPM is treated as standard.
+    /// Probe a live TPM to confirm it advertises the libtpms symmetric
+    /// algorithm set, and record the result in `self.dialect`.
+    ///
+    /// NOTE: this is a debug/verification helper, NOT the normal connection
+    /// path. The wire profile is set explicitly by the connectors (both real
+    /// targets are libtpms-derived), so a transient probe error here must not
+    /// be allowed to flip the profile. Querying GetCapability(ALGORITHMS) for
+    /// CFB (`0x0043`, the code libtpms 0.10.2 assigns to CFB) returns a count
+    /// > 0 on any libtpms TPM; NO_RESULT means it is absent.
     pub fn detect_dialect(&mut self) {
         let mut cmd = Command::new(cc::GET_CAPABILITY, st::NO_SESSIONS);
         cmd.push_u32(cap::ALGS);

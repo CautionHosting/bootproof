@@ -114,7 +114,7 @@ fn read_response<W: Read + Write>(conn: &mut W, cmd: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Parse a complete response buffer into `(response_code, body)`.
-fn parse_response(resp: &[u8]) -> Result<(u32, Vec<u8>)> {
+pub(crate) fn parse_response(resp: &[u8]) -> Result<(u32, Vec<u8>)> {
     if resp.len() < HEADER_SIZE {
         return Err(Error::Malformed(format!(
             "response too short: {} bytes",
@@ -125,11 +125,50 @@ fn parse_response(resp: &[u8]) -> Result<(u32, Vec<u8>)> {
     Ok((code, resp[HEADER_SIZE..].to_vec()))
 }
 
+/// Send `CMD_INIT` over a swtpm **control** channel to bring the emulated
+/// TPM up. swtpm (libtpms) will not process any command on the data channel
+/// until `TPMInit` has run, which this control command triggers.
+///
+/// Control-channel protocol (swtpm `tpm_ioctl.h`): each message is a
+/// `{ u32 ordinal (BE), body }`. `CMD_INIT = 2`; its request body is
+/// `ptm_init.u.req.init_flags` (a `u32`, 0 = keep volatile state) and its
+/// response is a `u32` TPM result (0 = success). The control connection can
+/// be closed afterwards; the data channel is independent.
+pub fn swtpm_ctrl_init(ctrl_path: &Path) -> Result<()> {
+    let mut stream = UnixStream::connect(ctrl_path).map_err(Error::from)?;
+    let mut msg = Vec::new();
+    msg.extend_from_slice(&2u32.to_be_bytes()); // CMD_INIT
+    msg.extend_from_slice(&0u32.to_be_bytes()); // init_flags = 0
+    stream.write_all(&msg)?;
+    let mut resp = [0u8; 4];
+    stream.read_exact(&mut resp)?;
+    let result = u32::from_be_bytes(resp);
+    if result != 0 {
+        return Err(Error::Other(format!(
+            "swtpm control INIT failed: 0x{:04x}",
+            result
+        )));
+    }
+    Ok(())
+}
+
 /// A raw TPM2 connection.
 pub struct Tpm {
     backend: Backend,
-    /// True when the firmware speaks the renumbered StageX/NitroTPM dialect
-    /// (detected via GetCapability; see `detect_dialect`).
+    /// True when the TPM speaks the libtpms-derived wire profile. Both
+    /// targets (the firmware TPM and the in-tree swtpm) are built from
+    /// libtpms 0.10.2, which is a fixed, byte-for-byte verifiable format —
+    /// not a runtime-detected "dialect". The profile is therefore set
+    /// explicitly by each connector (always `true`) rather than probed.
+    ///
+    /// The profile diverges from the TCG spec text in a few places that are
+    /// pinned by the libtpms source and confirmed on the wire:
+    ///   * `TPMA_SESSION` is a single byte (spec: 4).
+    ///   * `TPM_SE` numbering is HMAC=0x00, POLICY=0x01, TRIAL=0x03 (the spec
+    ///     inserts PASSWORD=0x00, shifting the rest).
+    ///   * `TPMS_SENSITIVE_CREATE` has no `sensitiveType` field.
+    ///   * `TPML_DIGEST_VALUES` / `TPMT_HA` entries are `hashAlg u16` + RAW
+    ///     digest (no `TPM2B` size prefix) in command parameters.
     pub dialect: bool,
 }
 
@@ -142,7 +181,8 @@ impl Tpm {
             .open(path)?;
         Ok(Self {
             backend: Backend::Device(fd),
-            dialect: false,
+            // The firmware TPM is libtpms-derived; set the profile explicitly.
+            dialect: true,
         })
     }
 
@@ -154,7 +194,7 @@ impl Tpm {
             .map_err(|e: std::net::AddrParseError| Error::Other(e.to_string()))?;
         Ok(Self {
             backend: Backend::SwtpmTcp(a, None),
-            dialect: false,
+            dialect: true,
         })
     }
 
@@ -162,7 +202,7 @@ impl Tpm {
     pub fn connect_swtpm_unix(path: &Path) -> Result<Self> {
         Ok(Self {
             backend: Backend::SwtpmUnix(path.to_path_buf(), None),
-            dialect: false,
+            dialect: true,
         })
     }
 

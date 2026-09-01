@@ -79,7 +79,7 @@ pub const TPM_SE_TRIAL: u8 = 0x02;
 /// the platform's working tss2 stack (its low-order bit numbering is
 /// shifted, as with the other TPMA fields). The same byte goes into the
 /// request HMAC.
-fn session_attrs(dialect: bool) -> u8 {
+pub(crate) fn session_attrs(dialect: bool) -> u8 {
     if dialect {
         0x01
     } else {
@@ -218,14 +218,14 @@ impl Tpm {
         in_sensitive: &[u8],
         in_public: &[u8],
     ) -> Result<(u32, Vec<u8>)> {
-        // The dialect renumbers the command code (0x0135 -> 0x0131); the
-        // cpHash must use the wire code.
+        // cpHash uses the wire code (identical to the spec code today).
         let code = self.wire_cc(cc::CREATE_PRIMARY) as u32;
         let attrs = session_attrs(self.dialect);
         let mut params = Vec::new();
         // inSensitive is a TPMS_SENSITIVE_CREATE (userAuth TPM2B, data
-        // TPM2B). The dialect wraps it in a u16 size prefix (verified
-        // against working esys traffic).
+        // TPM2B) - a fixed-size structure with no size prefix in the
+        // standard spec. The StageX firmware dialect additionally wraps it
+        // in a u16 size prefix (verified against working esys traffic).
         if self.dialect {
             params.extend_from_slice(&(in_sensitive.len() as u16).to_be_bytes());
         }
@@ -354,6 +354,14 @@ impl Tpm {
         } else {
             None
         };
+        // Policy sessions carry no parameter encryption and no HMAC; the
+        // decrypt/encrypt bits must be clear (libtpms rejects the decrypt bit
+        // on commands without encryptable params: TPM_RCS_ATTRIBUTES).
+        let area_attrs = if session.session_type == TPM_SE_HMAC {
+            session_attrs(self.dialect)
+        } else {
+            0
+        };
 
         // Session area: sessionHandle | nonceCaller TPM2B | attributes |
         // hmac TPM2B, placed after the handles and before the parameters.
@@ -362,7 +370,7 @@ impl Tpm {
         sess_area.extend_from_slice(&session.handle.to_be_bytes());
         sess_area.extend_from_slice(&(area_nonce.len() as u16).to_be_bytes());
         sess_area.extend_from_slice(&area_nonce);
-        sess_area.push(session_attrs(self.dialect));
+        sess_area.push(area_attrs);
         match &req_hmac {
             Some(h) => {
                 sess_area.extend_from_slice(&(h.len() as u16).to_be_bytes());

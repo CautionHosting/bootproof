@@ -145,19 +145,25 @@ impl Tpm {
         let session =
             self.start_auth_session(crate::constants::rh_std::NULL, TPM_SE_POLICY)?;
 
-        // params: pcrSelect TPML_PCR_SELECTION | pcrs TPML_PCR_DIGEST
-        let mut params = marshal_pcr_selection_list(selections);
-        params.extend_from_slice(&(per_pcr.len() as u32).to_be_bytes());
-        for (_idx, d) in per_pcr {
-            params.extend_from_slice(&(d.len() as u16).to_be_bytes());
-            params.extend_from_slice(d);
-        }
+        // params: pcrDigest TPM2B_DIGEST | pcrs TPML_PCR_SELECTION
+        // (libtpms 0.10.2 `PolicyPCR_In` order: the single expected digest
+        // comes first, then the PCR selection). The digest is SHA256 of the
+        // concatenated selected PCR values — the same value the TPM computes
+        // in `PCRComputeCurrentDigest` and compares against (TPM_RCS_VALUE on
+        // mismatch).
+        let pcr_digest = pcr_digest(per_pcr);
+        let mut params = Vec::new();
+        params.extend_from_slice(&(pcr_digest.len() as u16).to_be_bytes());
+        params.extend_from_slice(&pcr_digest); // pcrDigest TPM2B
+        params.extend_from_slice(&marshal_pcr_selection_list(selections)); // pcrs
 
-        // PolicyPCR has no handles; cpHash entity is empty.
+        // The policy session is the command's single handle (TPMI_SH_POLICY);
+        // it also appears in the session area (a policy session carries no
+        // HMAC — `call_with_session` emits an empty auth value for it).
         let (rc, body) = self.call_with_session(
             cc::POLICY_PCR as u32,
-            &[],
-            &[],
+            &session.handle.to_be_bytes(),
+            &[session.handle],
             &params,
             &session,
             &[],
@@ -222,22 +228,37 @@ impl Tpm {
     }
 }
 
-/// The expected `authPolicy` after a single `TPM2_PolicyPCR` (empty previous
-/// policy). Per TPM 2.0 Part 1 the policy digest updates as
-/// `H( policyDigest || TPM_CC_PolicyPCR || pcrSelections || pcrDigests )`,
-/// where `pcrDigests` is the full `TPML_PCR_DIGEST` (count u32 + each digest
-/// as a TPM2B, ascending index order).
+/// The `pcrDigest` a `TPM2_PolicyPCR` binds: SHA256 of the concatenated
+/// selected PCR values in ascending index order. This mirrors the TPM's own
+/// `PCRComputeCurrentDigest` (libtpms 0.10.2), which feeds the raw PCR values
+/// to a single hash and returns a `TPM2B_DIGEST`.
+pub fn pcr_digest(per_pcr: &[(u8, Vec<u8>)]) -> Vec<u8> {
+    let mut h = Sha256::new();
+    for (_, d) in per_pcr {
+        h.update(d);
+    }
+    h.finalize().to_vec()
+}
+
+/// The expected `authPolicy` after a single `TPM2_PolicyPCR` on a fresh
+/// session (previous policy digest = all zeros). Mirrors libtpms 0.10.2
+/// `TPM2_PolicyPCR`:
+///
+/// ```text
+/// policyDigest = SHA256( prevPolicyDigest(32 zero bytes)
+///                       || TPM_CC_PolicyPCR
+///                       || TPML_PCR_SELECTION (marshaled)
+///                       || pcrDigest (raw digest bytes) )
+/// ```
 pub fn policy_pcr_auth_policy(
     selections: &[PcrSelection],
     per_pcr: &[(u8, Vec<u8>)],
 ) -> Vec<u8> {
+    let pcr_digest = pcr_digest(per_pcr);
     let mut h = Sha256::new();
+    h.update([0u8; 32]); // fresh session's policy digest (zeroed)
     h.update((cc::POLICY_PCR as u32).to_be_bytes());
     h.update(marshal_pcr_selection_list(selections));
-    h.update(&(per_pcr.len() as u32).to_be_bytes());
-    for (_, d) in per_pcr {
-        h.update(&(d.len() as u16).to_be_bytes());
-        h.update(d);
-    }
+    h.update(&pcr_digest);
     h.finalize().to_vec()
 }

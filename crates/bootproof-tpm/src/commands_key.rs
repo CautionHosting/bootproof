@@ -9,6 +9,7 @@ use crate::commands::PcrSelection;
 use crate::constants::{alg, cc, st, GENERATED_VALUE};
 use crate::conn::{Command, Tpm};
 use crate::error::{Error, Result};
+use crate::session::TPM_SE_HMAC;
 use digest::Digest;
 use sha2::Sha256;
 
@@ -261,14 +262,42 @@ impl Tpm {
         parse_quote(&body)
     }
 
-    /// TPM2_PCR_Extend: extend a PCR with a digest (no auth session).
+    /// TPM2_PCR_Extend: extend a PCR with a digest.
+    ///
+    /// This TPM requires an authorization session for PCR_Extend (a no-session
+    /// command is rejected with TPM_RC_AUTH_MISSING). The `digests` parameter
+    /// is a `TPML_DIGEST_VALUES` whose entries are `TPMT_HA`: a `hashAlg u16`
+    /// followed by the RAW digest bytes (no `TPM2B` size prefix) — verified
+    /// byte-for-byte against the in-tree swtpm (libtpms 0.10.2), where the
+    /// size-prefixed form is rejected with TPM_RC_SIZE.
     pub fn pcr_extend(&mut self, pcr: u32, digest: &[u8]) -> Result<()> {
-        let mut cmd = Command::new(cc::PCR_EXTEND, st::NO_SESSIONS);
-        cmd.push_u32(pcr);
-        // data: TPM2B_DIGEST
-        cmd.push_u16(digest.len() as u16);
-        cmd.push_bytes(digest);
-        let (_rc, _body) = self.call(&cmd)?;
+        let hash_alg = match digest.len() {
+            20 => 0x0004, // SHA1
+            32 => alg::SHA256,
+            48 => alg::SHA384,
+            64 => alg::SHA512,
+            _ => return Err(Error::Other(format!(
+                "pcr_extend: unsupported digest length {}",
+                digest.len()
+            ))),
+        };
+        let session = self.start_auth_session(0x4000_0007, TPM_SE_HMAC)?;
+        let mut params = Vec::new();
+        params.extend_from_slice(&1u32.to_be_bytes()); // count = 1
+        params.extend_from_slice(&hash_alg.to_be_bytes());
+        params.extend_from_slice(digest); // raw, no TPM2B prefix
+        let (rc, _body) = self.call_with_session(
+            self.wire_cc(cc::PCR_EXTEND) as u32,
+            &pcr.to_be_bytes(), // cpHash entity name = raw PCR handle
+            &[pcr],
+            &params,
+            &session,
+            &[], // empty auth value
+        )?;
+        let _ = self.flush_context(session.handle);
+        if rc != 0 {
+            return Err(Error::Tpm(rc as u16, crate::error::rc_name(rc as u16)));
+        }
         Ok(())
     }
 
