@@ -30,15 +30,15 @@ use crate::session::{Session, TPM_SE_HMAC};
 const SYM_MODE_CFB_STD: u16 = 0x0045;
 const SYM_MODE_CFB_DIALECT: u16 = 0x0043;
 
-// TPMA_OBJECT attribute bits (TCG Part 2, Table 33).
+// TPMA_OBJECT attribute bits (TCG Part 2, Table 33). Standard spec values.
 const OBJ_FIXED_TPM: u32 = 0x0000_0002;
-const OBJ_FIXED_PARENT: u32 = 0x0000_0010;
-const OBJ_SENS_DATA_ORIGIN: u32 = 0x0000_0020;
-const OBJ_USER_WITH_AUTH: u32 = 0x0000_0040;
-const OBJ_ADMIN_WITH_POLICY: u32 = 0x0000_0080;
-const OBJ_NO_DA: u32 = 0x0000_0400;
-const OBJ_RESTRICTED: u32 = 0x0001_0000;
-const OBJ_DECRYPT: u32 = 0x0002_0000;
+const OBJ_FIXED_PARENT: u32 = 0x0000_0008;
+const OBJ_SENS_DATA_ORIGIN: u32 = 0x0000_0010;
+const OBJ_USER_WITH_AUTH: u32 = 0x0000_0020;
+const OBJ_ADMIN_WITH_POLICY: u32 = 0x0000_0040;
+const OBJ_NO_DA: u32 = 0x0000_0080;
+const OBJ_RESTRICTED: u32 = 0x0000_0200;
+const OBJ_DECRYPT: u32 = 0x0000_0400;
 
 fn read_u16(b: &[u8], o: usize) -> Result<u16> {
     if b.len() < o + 2 {
@@ -62,12 +62,11 @@ pub fn storage_key_template(dialect: bool) -> Vec<u8> {
     let mut b = Vec::new();
     b.extend_from_slice(&alg::SYMCIPHER.to_be_bytes()); // type = SYMCIPHER
     b.extend_from_slice(&alg::SHA256.to_be_bytes()); // nameAlg
-    let attrs = OBJ_FIXED_TPM
-        | OBJ_FIXED_PARENT
-        | OBJ_SENS_DATA_ORIGIN
-        | OBJ_USER_WITH_AUTH
-        | OBJ_RESTRICTED
-        | OBJ_DECRYPT; // = 0x00030072
+    // fixedTPM | fixedParent | sensitiveDataOrigin | userWithAuth |
+    // restricted | decrypt. Standard bits: 0x1|0x4|0x8|0x10|0x100|0x200.
+    // The StageX firmware dialect shifts the low bits (0x2|0x10|0x20|0x40)
+    // and the high bits to 0x10000|0x20000.
+    let attrs: u32 = if dialect { 0x0003_0072 } else { 0x0000_031D };
     b.extend_from_slice(&attrs.to_be_bytes());
     b.extend_from_slice(&0u16.to_be_bytes()); // authPolicy (empty)
     // TPMT_SYM_DEF_OBJECT (TPMS_SYMCIPHER_PARMS)
@@ -85,13 +84,22 @@ pub fn sealed_object_template(policy_digest: &[u8]) -> Vec<u8> {
     let mut b = Vec::new();
     b.extend_from_slice(&alg::KEYEDHASH.to_be_bytes()); // type = KEYEDHASH
     b.extend_from_slice(&alg::SHA256.to_be_bytes()); // nameAlg
-    let attrs = OBJ_FIXED_TPM | OBJ_FIXED_PARENT | OBJ_ADMIN_WITH_POLICY | OBJ_NO_DA; // 0x00000492
+    // For KEYEDHASH the spec REQUIRES fixedTPM=0, fixedParent=0, and
+    // signEncrypt=0; setting any of them is a parameter error. Attributes:
+    // sensitiveDataOrigin(0x8) | userWithAuth(0x40) | adminWithPolicy(0x80)
+    // | noDA(0x400) = 0x000004C8.
+    let attrs: u32 = OBJ_SENS_DATA_ORIGIN | OBJ_USER_WITH_AUTH | OBJ_ADMIN_WITH_POLICY | OBJ_NO_DA;
     b.extend_from_slice(&attrs.to_be_bytes());
     // authPolicy: TPM2B_DIGEST
     b.extend_from_slice(&(policy_digest.len() as u16).to_be_bytes());
     b.extend_from_slice(policy_digest);
-    // TPMS_KEYEDHASH_PARMS: scheme NULL only (no symmetric field on the wire)
-    b.extend_from_slice(&alg::NULL.to_be_bytes());
+    // TPMS_KEYEDHASH_PARMS: scheme | symmetric (TPMT_SYM_DEF: alg + 4B) |
+    // unique. scheme NULL, symmetric NULL (no size field — the 4-byte
+    // keyBits/mode union is present but zeroed). Omitting the symmetric
+    // field makes the TPM reject Create with TPM_RCP(1)+RC_SIZE (0x0922).
+    b.extend_from_slice(&alg::NULL.to_be_bytes()); // scheme
+    b.extend_from_slice(&alg::NULL.to_be_bytes()); // symmetric.alg
+    b.extend_from_slice(&0u32.to_be_bytes()); // symmetric union (zeroed)
     b.extend_from_slice(&0u16.to_be_bytes()); // unique (empty)
     b
 }
@@ -179,7 +187,13 @@ impl Tpm {
         let in_public = sealed_object_template(policy_digest);
 
         let mut params = Vec::new();
-        params.extend_from_slice(&(in_sensitive.len() as u16).to_be_bytes());
+        // TPMS_SENSITIVE_CREATE is a fixed structure (no outer size prefix)
+        // in the standard spec. The StageX firmware dialect wraps it in a u16
+        // size prefix (the seal flow was built and debugged against that
+        // dialect; keep the prefix on the dialect path).
+        if self.dialect {
+            params.extend_from_slice(&(in_sensitive.len() as u16).to_be_bytes());
+        }
         params.extend_from_slice(&in_sensitive);
         params.extend_from_slice(&(in_public.len() as u16).to_be_bytes());
         params.extend_from_slice(&in_public);
