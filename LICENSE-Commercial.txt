@@ -1,0 +1,47 @@
+Caution Commercial License
+
+Copyright (c) 2025 Caution SEZC
+
+This is a proprietary commercial license that grants you rights to use Caution
+without the obligations of the GNU Affero General Public License (AGPL-3.0).
+
+WHAT THIS LICENSE GRANTS
+========================
+
+By purchasing a commercial license, you receive:
+
+1. PROPRIETARY USE - Use Caution in proprietary/closed-source products
+2. NO SOURCE DISCLOSURE - No obligation to share your source code
+3. SAAS RIGHTS - Run Caution as a hosted service without AGPL obligations
+4. MODIFICATIONS - Keep your modifications private
+5. REDISTRIBUTION - Distribute Caution as part of your proprietary product
+
+WHEN YOU NEED THIS LICENSE
+==========================
+
+You need a commercial license if you want to:
+
+- Use Caution in proprietary software without sharing source code
+- Offer Caution as a hosted/SaaS service without source disclosure
+- Integrate Caution into commercial products
+- Keep your infrastructure and deployment code private
+
+HOW TO OBTAIN
+=============
+
+Contact Caution SEZC for commercial licensing:
+
+  Email:   info@caution.co
+  Website: https://caution.co
+
+Pricing is based on your use case, scale, and support requirements.
+
+ALTERNATIVE: AGPL-3.0
+=====================
+
+If you do not have a commercial license, Caution is available under the
+GNU Affero General Public License v3.0 (AGPL-3.0). Under AGPL-3.0, you must:
+
+- Share all source code (including modifications) with users
+- License derivative works under AGPL-3.0
+- Provide source code to users who interact with the software over a network

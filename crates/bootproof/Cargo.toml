@@ -2,6 +2,8 @@
 name = "bootproof"
 version = "0.1.0"
 edition = "2024"
+LICENSE = "MIT"
+publish = false
 
 [features]
 default = ["platform-aws"]
