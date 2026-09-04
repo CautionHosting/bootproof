@@ -4,7 +4,11 @@
 //! Checks (in order):
 //! 1. Doc parses (v1 layout).
 //! 2. `TPMS_ATTEST` magic + type QUOTE; `qualifiedData == nonce`.
-//! 3. `qualifiedSigner == Name(AK public)` (Name = nameAlg || H(0x0013 || public)).
+//! 3. `qualifiedSigner` matches the AK's qualified Name:
+//!    `nameAlg || H(0x40000001 || Name)` where Name = `nameAlg || H(public)`
+//!    and 0x40000001 is the OWNER hierarchy the primary was created in
+//!    (verified against a live TPM; the raw Name is also accepted, e.g.
+//!    for keys with the null parent).
 //! 4. AK public area parses; ECDSA-SHA256 quote signature verifies over the
 //!    raw attestation bytes.
 //! 5. `SHA256(concat(per_pcr)) == quote pcrDigest` (per-PCR values are the
@@ -88,18 +92,31 @@ fn parse_attest(att: &[u8]) -> Result<Attest, String> {
     })
 }
 
-/// `Name(TPMT_PUBLIC)` = `nameAlg || H(0x0013 || public)`.
+/// `Name(TPMT_PUBLIC)` = `nameAlg || H(public)` (TPM 2.0 Part 1, 16.8).
 fn public_name(name_alg: u16, public: &[u8]) -> Result<Vec<u8>, String> {
     if name_alg != alg::SHA256 {
         return Err(format!("AK nameAlg is 0x{name_alg:04X}, expected SHA256"));
     }
-    let mut h = Sha256::new();
-    h.update([0x00u8, 0x13]);
-    h.update(public);
-    let d = h.finalize();
     let mut out = name_alg.to_be_bytes().to_vec();
-    out.extend_from_slice(&d);
+    out.extend_from_slice(&Sha256::digest(public));
     Ok(out)
+}
+
+/// The hierarchy `create_primary_ecc_sign` creates the AK in: the standard
+/// OWNER handle (matches `bootproof_tpm::commands_key::create_primary_ecc_sign`).
+const AK_PARENT: u32 = 0x4000_0001;
+
+/// The qualified Name of a primary object: `nameAlg || H(parent || name)`,
+/// where parent is the 4-byte big-endian parent hierarchy handle. This is
+/// what the TPM reports as `qualifiedSigner` in a QUOTE attestation
+/// (verified against a live AWS NitroTPM).
+fn qualified_name(name: &[u8], parent: u32) -> Vec<u8> {
+    let mut out = name[..2].to_vec();
+    let mut h = Sha256::new();
+    h.update(parent.to_be_bytes());
+    h.update(name);
+    out.extend_from_slice(&h.finalize());
+    out
 }
 
 pub struct Tpm2Verifier;
@@ -147,8 +164,11 @@ impl Verifier for Tpm2Verifier {
             return Err(format!("AK curve is 0x{:04X}, expected P-256", ak.curve));
         }
         let ak_name = public_name(ak.name_alg, ak_public)?;
-        if attest.qualified_signer != ak_name {
-            return Err("qualifiedSigner != Name(AK public)".into());
+        // The AK is a primary object in the OWNER hierarchy, so the TPM
+        // reports its qualified Name: nameAlg || H(0x40000001 || name).
+        let qualified = qualified_name(&ak_name, AK_PARENT);
+        if attest.qualified_signer != qualified && attest.qualified_signer != ak_name {
+            return Err("qualifiedSigner != qualified Name(AK public)".into());
         }
 
         // 4. ECDSA-SHA256 signature over the attestation bytes.
