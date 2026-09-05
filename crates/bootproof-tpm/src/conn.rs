@@ -128,9 +128,6 @@ fn parse_response(resp: &[u8]) -> Result<(u32, Vec<u8>)> {
 /// A raw TPM2 connection.
 pub struct Tpm {
     backend: Backend,
-    /// True when the firmware speaks the renumbered StageX/NitroTPM dialect
-    /// (detected via GetCapability; see `detect_dialect`).
-    pub dialect: bool,
 }
 
 impl Tpm {
@@ -142,7 +139,6 @@ impl Tpm {
             .open(path)?;
         Ok(Self {
             backend: Backend::Device(fd),
-            dialect: false,
         })
     }
 
@@ -154,7 +150,6 @@ impl Tpm {
             .map_err(|e: std::net::AddrParseError| Error::Other(e.to_string()))?;
         Ok(Self {
             backend: Backend::SwtpmTcp(a, None),
-            dialect: false,
         })
     }
 
@@ -162,7 +157,6 @@ impl Tpm {
     pub fn connect_swtpm_unix(path: &Path) -> Result<Self> {
         Ok(Self {
             backend: Backend::SwtpmUnix(path.to_path_buf(), None),
-            dialect: false,
         })
     }
 

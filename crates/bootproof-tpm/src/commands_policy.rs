@@ -139,11 +139,10 @@ impl Tpm {
         selections: &[PcrSelection],
         per_pcr: &[(u8, Vec<u8>)],
     ) -> Result<Session> {
-        // Unbound session: StartAuthSession's authHandle is TPM_RH_NULL in
-        // both the dialect and the standard (the session is not bound to any
-        // parent key); the command's own hierarchy handle is separate.
-        let session =
-            self.start_auth_session(crate::constants::rh_std::NULL, TPM_SE_POLICY)?;
+        // Unbound session: StartAuthSession's authHandle is TPM_RH_NULL
+        // (the session is not bound to any parent key); the command's own
+        // hierarchy handle is separate.
+        let session = self.start_auth_session(crate::constants::rh::NULL, TPM_SE_POLICY)?;
 
         // params: pcrSelect TPML_PCR_SELECTION | pcrs TPML_PCR_DIGEST
         let mut params = marshal_pcr_selection_list(selections);
@@ -183,13 +182,9 @@ impl Tpm {
         selections: &[PcrSelection],
         per_pcr: &[(u8, Vec<u8>)],
     ) -> Result<crate::commands_key::Key> {
-        let hierarchy = if self.dialect {
-            crate::constants::rh::OWNER
-        } else {
-            crate::constants::rh_std::OWNER
-        };
+        let hierarchy = crate::constants::rh::OWNER;
         let session = self.start_policy_pcr_session(selections, per_pcr)?;
-        let sensitive = crate::commands_key::build_ecc_sign_sensitive(self.dialect);
+        let sensitive = crate::commands_key::build_ecc_sign_sensitive();
         let public = crate::commands_key::build_ecc_sign_template();
         let (rc, body) =
             self.call_create_primary_with_session(hierarchy, &session, &sensitive, &public)?;
@@ -204,7 +199,7 @@ impl Tpm {
     /// indexes too, where the "public" data is the raw stored bytes, e.g. an
     /// X.509 EK certificate).
     pub fn read_public_raw(&mut self, handle: u32) -> Result<(Vec<u8>, Vec<u8>)> {
-        let mut cmd = Command::new(self.wire_cc(cc::READ_PUBLIC), st::NO_SESSIONS);
+        let mut cmd = Command::new(cc::READ_PUBLIC, st::NO_SESSIONS);
         cmd.push_u32(handle);
         let (_rc, body) = self.call(&cmd)?;
         // outPublic TPM2B | outName TPM2B

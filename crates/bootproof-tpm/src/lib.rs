@@ -53,7 +53,6 @@ impl Tpm {
     /// Open a TPM kernel char device and ensure it is started.
     pub fn open_started(path: &std::path::Path) -> Result<Self> {
         let mut tpm = Self::open(path)?;
-        tpm.detect_dialect();
         tpm.ensure_started()?;
         Ok(tpm)
     }
@@ -61,7 +60,6 @@ impl Tpm {
     /// Connect to swtpm over TCP and ensure started.
     pub fn connect_swtpm_tcp_started(addr: &str) -> Result<Self> {
         let mut tpm = Self::connect_swtpm_tcp(addr)?;
-        tpm.detect_dialect();
         tpm.ensure_started()?;
         Ok(tpm)
     }
@@ -69,7 +67,6 @@ impl Tpm {
     /// Connect to swtpm over a Unix socket and ensure started.
     pub fn connect_swtpm_unix_started(path: &std::path::Path) -> Result<Self> {
         let mut tpm = Self::connect_swtpm_unix(path)?;
-        tpm.detect_dialect();
         tpm.ensure_started()?;
         Ok(tpm)
     }

@@ -92,19 +92,11 @@ impl Channel for Tpm2 {
         // next StartAuthSession (0x0903), and it refuses
         // GetCapability(HANDLES) -- so flush the small auto-allocated ranges
         // directly.
-        if tpm.dialect {
-            let _ = tpm.flush_session_pools();
-            // Stale transient objects (primaries from prior runs) occupy
-            // the finite context pool and starve the AK CreatePrimary
-            // (0x0902); the platform tss2 stack flushes them in its
-            // preamble, so do the same.
-            let _ = tpm.flush_range(0x8000_0000, 0x8000_00FF);
-        } else {
-            let _ = tpm.flush_all();
-            let _ = tpm.flush_range(0x0200_0000, 0x0200_003F);
-            let _ = tpm.flush_range(0x0300_0000, 0x0300_003F);
-            let _ = tpm.flush_range(0x8000_0000, 0x8000_003F);
-        }
+        let _ = tpm.flush_session_pools();
+        // Stale transient objects (primaries from prior runs) occupy the
+        // finite context pool and starve the AK CreatePrimary (0x0902); the
+        // platform tss2 stack flushes them in its preamble, so do the same.
+        let _ = tpm.flush_range(0x8000_0000, 0x8000_00FF);
 
         // 1. Discover the PCR set this TPM actually exposes, and intersect it
         //    with the desired measured-boot set (PCRs 0-16 + slot PCR22). This

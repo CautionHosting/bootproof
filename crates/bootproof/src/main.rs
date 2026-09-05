@@ -223,7 +223,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Probe NV_DefineSpace attribute layouts (dialect discovery).
+    /// Probe NV_DefineSpace attribute layouts against a live TPM.
     NvTest {
         /// TPM kernel character device (default /dev/tpm0).
         #[arg(long, default_value = "/dev/tpm0")]
@@ -415,18 +415,18 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             if create_ek {
-                // StageX-dialect RSA2048 restricted-decrypt template,
-                // byte-identical to what the platform tss2 stack marshals
-                // (verified working via the esys path): type | nameAlg |
-                // attrs | authPolicy | sym {AES,128,CFB} | scheme NULL |
-                // keyBits | exponent 0 (=65537) | unique. A restricted
-                // decrypt key REQUIRES scheme = NULL (OAEP is rejected).
+                // RSA2048 restricted-decrypt template, byte-identical to what
+                // the platform tss2 stack marshals (verified working via the
+                // esys path): type | nameAlg | attrs | authPolicy | sym
+                // {AES,128,CFB} | scheme NULL | keyBits | exponent 0 (=65537)
+                // | unique. A restricted decrypt key REQUIRES scheme = NULL
+                // (OAEP is rejected).
                 let ek_public: [u8; 26] = [
                     0x00, 0x01, // type RSA
                     0x00, 0x0b, // nameAlg SHA256
                     0x00, 0x03, 0x00, 0x72, // attrs userWithAuth|restricted|decrypt
                     0x00, 0x00, // authPolicy size 0
-                    // TPMS_RSA_PARMS (dialect): symmetric {alg, keyBits, mode}
+                    // TPMS_RSA_PARMS: symmetric {alg, keyBits, mode}
                     0x00, 0x06, 0x00, 0x80, 0x00, 0x43, // sym AES-128-CFB
                     0x00, 0x10, // scheme NULL (required for restricted decrypt)
                     0x08, 0x00, // keyBits 2048
@@ -812,7 +812,6 @@ fn main() -> anyhow::Result<()> {
                 }
             } else if mimic {
                 let mut tpm = open_raw()?;
-                tpm.dialect = true;
                 let (rc, handle) = tpm.nv_define_mimic(size)?;
                 println!("rc=0x{rc:04x} handle={handle:?}");
             } else {

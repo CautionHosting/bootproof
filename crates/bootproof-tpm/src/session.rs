@@ -7,18 +7,19 @@
 //!   Complete`, `iesys_compute_cp_hash`, `iesys_crypto_authHmac`.
 //!
 //! StartAuthSession request (standard TCG layout, verified against
-//! tpm2-tss `Tss2_Sys_StartAuthSession_Prepare`):
+//! `ms-tpm-20-ref` `StartAuthSession_fp.h` and tpm2-tss
+//! `Tss2_Sys_StartAuthSession_Prepare`):
 //! ```text
 //! tpmKey          u32        (TPMI_DH_OBJECT; TPM_RH_NULL = unsalted)
 //! bind            u32        (TPM_RH_NULL = unbound)
 //! nonceCaller     TPM2B { u16 size, bytes }   (32 bytes for SHA256)
 //! encryptedSalt   TPM2B { u16 size = 0 }      (empty: unsalted)
-//! sessionType     u8         (standard: 0x01 HMAC, 0x02 policy, 0x03 trial)
+//! sessionType     u8         (TPM_SE: 0x00 HMAC, 0x01 policy, 0x03 trial)
 //! symmetricAlg    u16        = 0x0010 (TPM_ALG_NULL)
 //! authHash        u16        = 0x000B (SHA256)
 //! ```
-//! The platform dialect omits `encryptedSalt` and adds a `keyBits u16 = 0`
-//! field instead.
+//! `TPM_SE` (ms-tpm-20-ref `TpmTypes.h`): HMAC=0x00, POLICY=0x01,
+//! TRIAL=0x03; there is no PASSWORD type, so `wire_type == session_type`.
 //!
 //! This TPM's responses use a 10-byte header (tag, size, responseCode), so
 //! the responseCode is read at offset 6 and the body starts at offset 10.
@@ -42,24 +43,26 @@
 //! request HMAC = HMAC_SHA256( key, cpHash || nonceCaller || nonceTPM || sessionAttributes )
 //! - all inputs are raw buffers (no TPM2B size prefixes)
 //!
-//! Command with one HMAC session (this platform places the session area
-//! AFTER the handles and BEFORE the parameters):
+//! Command with one HMAC session (standard layout, verified against
+//! `ms-tpm-20-ref` `ExecCommand.c`: after the handles, a TPM_ST_SESSIONS
+//! command carries a u32 `authSize` giving the byte length of the session
+//! area, then the area, then the parameters):
 //! ```text
 //! tag           u16 = 0x8002 (TPM_ST_SESSIONS)
 //! size          u32
 //! code          u32
 //! authHandle    u32
-//! [dialect only] u32 = byte length of the session area that follows
+//! authSize      u32 = byte length of the session area that follows
 //! --- session area (73 bytes for a 32-byte nonce) ---
 //! sessionHandle u32 (from the StartAuthSession response)
 //! nonceCaller   TPM2B { u16 size, bytes }
-//! attributes    u8   standard: 0x00 (no bits; 0x01 is the audit bit)
-//!                           dialect:  0x01
+//! attributes    u8   = 0x01 (TPMA_SESSION_continueSession, bit 0)
 //! hmac          TPM2B { u16 size, bytes }
 //! parameters    ...
 //! ```
-//! The dialect prefixes the session area with a u32 length and sets the
-//! attributes byte to 0x01; the standard layout has neither.
+//! `nonceCaller` is freshly generated per command: the firmware rejects a
+//! nonce it has already seen (observed RC 0x0184 / 0x04d6); supplying a fresh
+//! caller nonce each time is spec-legal.
 
 use digest::Digest;
 use hmac::{Hmac, Mac};
@@ -73,21 +76,11 @@ type HmacSha256 = Hmac<Sha256>;
 
 pub const TPM_SE_HMAC: u8 = 0x00;
 pub const TPM_SE_POLICY: u8 = 0x01;
-pub const TPM_SE_TRIAL: u8 = 0x02;
-/// sessionAttributes for the per-command session area. Standard: 0x00 (no
-/// bits), matching tss2-esys for a plain session. Dialect: 0x01, matching
-/// the platform's working tss2 stack (its low-order bit numbering is
-/// shifted, as with the other TPMA fields). The same byte goes into the
-/// request HMAC.
-fn session_attrs(dialect: bool) -> u8 {
-    if dialect {
-        0x01
-    } else {
-        SESSION_ATTRS
-    }
-}
-
-const SESSION_ATTRS: u8 = 0x00;
+pub const TPM_SE_TRIAL: u8 = 0x03;
+/// sessionAttributes for the per-command session area: 0x01 =
+/// TPMA_SESSION_continueSession (bit 0), per spec `TpmTypes.h`. The firmware
+/// accepts this byte (verified against captured working traffic).
+const SESSION_ATTRS: u8 = 0x01;
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -140,32 +133,20 @@ impl Tpm {
             Some(n) => n.to_vec(),
             None => self.get_random(32)?,
         };
-        // The internal `TPM_SE_*` values are the platform dialect's
-        // numbering (HMAC=0x00, policy=0x01, trial=0x02). The standard
-        // spec inserts TPM_SE_PASSWORD=0x00, shifting HMAC=0x01,
-        // policy=0x02, trial=0x03.
-        let wire_type = if self.dialect { session_type } else { session_type + 1 };
+        // TPM_SE (spec TpmTypes.h): HMAC=0x00, POLICY=0x01, TRIAL=0x03. The
+        // wire byte is the session type itself (no PASSWORD type in spec).
+        let wire_type = session_type;
         let mut cmd = Command::new(cc::START_AUTH_SESSION, st::NO_SESSIONS);
         cmd.push_u32(auth_handle); // tpmKey (salt key; TPM_RH_NULL = unsalted)
         cmd.push_u32(0x4000_0007); // bind = TPM_RH_NULL (unbound)
         cmd.push_u16(nonce_caller.len() as u16);
         cmd.push_bytes(&nonce_caller); // nonceCaller
-        if self.dialect {
-            // Dialect tail: keyBits (0) | sessionType | symmetric alg | authHash.
-            cmd.push_u16(0); // keyBits
-            cmd.push_u8(wire_type); // sessionType
-            cmd.push_u16(alg::NULL); // symmetric.algorithm = TPM_ALG_NULL
-            cmd.push_u16(alg::SHA256); // authHash
-        } else {
-            // Standard TCG order (verified against tpm2-tss
-            // Tss2_Sys_StartAuthSession_Prepare): tpmKey | bind | nonceCaller
-            // | encryptedSalt | sessionType | symmetric | authHash.
-            // Unsalted session: encryptedSalt is an empty TPM2B.
-            cmd.push_u16(0); // encryptedSalt (size 0)
-            cmd.push_u8(wire_type); // sessionType
-            cmd.push_u16(alg::NULL); // symmetric.algorithm = TPM_ALG_NULL
-            cmd.push_u16(alg::SHA256); // authHash
-        }
+        // Unsalted session: encryptedSalt is an empty TPM2B (size 0), then
+        // sessionType, symmetric algorithm, authHash.
+        cmd.push_u16(0); // encryptedSalt (size 0)
+        cmd.push_u8(wire_type); // sessionType
+        cmd.push_u16(alg::NULL); // symmetric.algorithm = TPM_ALG_NULL
+        cmd.push_u16(alg::SHA256); // authHash
 
         let cmd = cmd.encode();
         eprintln!("[session] SAS cmd ({}B): {}", cmd.len(), hex(&cmd));
@@ -218,17 +199,15 @@ impl Tpm {
         in_sensitive: &[u8],
         in_public: &[u8],
     ) -> Result<(u32, Vec<u8>)> {
-        // The dialect renumbers the command code (0x0135 -> 0x0131); the
-        // cpHash must use the wire code.
-        let code = self.wire_cc(cc::CREATE_PRIMARY) as u32;
-        let attrs = session_attrs(self.dialect);
+        // CreatePrimary command code (spec TpmTypes.h: 0x0131); the cpHash
+        // uses the wire code.
+        let code = cc::CREATE_PRIMARY as u32;
+        let attrs = SESSION_ATTRS;
         let mut params = Vec::new();
-        // inSensitive is a TPMS_SENSITIVE_CREATE (userAuth TPM2B, data
-        // TPM2B). The dialect wraps it in a u16 size prefix (verified
-        // against working esys traffic).
-        if self.dialect {
-            params.extend_from_slice(&(in_sensitive.len() as u16).to_be_bytes());
-        }
+        // inSensitive is a TPM2B_SENSITIVE_CREATE (userAuth TPM2B, data
+        // TPM2B): the u16 size prefix is part of the TPM2B envelope (spec
+        // CreatePrimary_fp.h).
+        params.extend_from_slice(&(in_sensitive.len() as u16).to_be_bytes());
         params.extend_from_slice(in_sensitive);
         params.extend_from_slice(&(in_public.len() as u16).to_be_bytes());
         params.extend_from_slice(in_public);
@@ -263,8 +242,8 @@ impl Tpm {
         };
 
         // Session area: sessionHandle | nonceCaller TPM2B | attributes |
-        // hmac TPM2B, placed between the handles and the parameters. The
-        // dialect prefixes the area with its u32 size.
+        // hmac TPM2B, preceded by its u32 authSize (ExecCommand.c), placed
+        // between the handles and the parameters.
         let mut sess_area = Vec::new();
         sess_area.extend_from_slice(&session.handle.to_be_bytes());
         sess_area.extend_from_slice(&(session.nonce_caller.len() as u16).to_be_bytes());
@@ -282,11 +261,9 @@ impl Tpm {
         let mut body = Vec::new();
         // handles section: primaryHandle (the hierarchy being authorized).
         body.extend_from_slice(&auth_handle.to_be_bytes());
-        // The dialect prefixes the session area with a u32 size; the
-        // standard layout has no such prefix (sessions are self-delimiting).
-        if self.dialect {
-            body.extend_from_slice(&(sess_area.len() as u32).to_be_bytes());
-        }
+        // u32 authSize for the session area (standard: ExecCommand.c
+        // unmarshals it as UINT32 when tag == TPM_ST_SESSIONS).
+        body.extend_from_slice(&(sess_area.len() as u32).to_be_bytes());
         body.extend_from_slice(&sess_area);
         body.extend_from_slice(&params);
 
@@ -331,17 +308,12 @@ impl Tpm {
         cp.extend_from_slice(params);
         let cp_hash = Sha256::digest(&cp);
 
-        // Dialect: the command's session area must carry a FRESH caller
-        // nonce. The dialect tracks used nonces (replay protection,
-        // observed RC 0x04d6); reusing the SAS request's nonce in the
-        // command area is rejected with 0x014c. The platform's own
-        // tpm2-tools generates a new nonce per command (captured: SAS
-        // nonce and command-area nonce always differ).
-        let area_nonce = if self.dialect {
-            self.get_random(32)?
-        } else {
-            session.nonce_caller.clone()
-        };
+        // The command's session area must carry a FRESH caller nonce: the
+        // firmware tracks used nonces (replay protection, observed RC
+        // 0x0184 / 0x04d6) and reusing the SAS request's nonce in the
+        // command area is rejected. Supplying a fresh nonce per command is
+        // spec-legal (nonceCaller is caller-chosen).
+        let area_nonce = self.get_random(32)?;
         let req_hmac = if session.session_type == TPM_SE_HMAC {
             // Unbound session: sessionKey is empty, so the HMAC key is just
             // the auth value (empty for an empty-auth hierarchy).
@@ -349,20 +321,20 @@ impl Tpm {
             msg.extend_from_slice(&cp_hash);
             msg.extend_from_slice(&area_nonce);
             msg.extend_from_slice(&session.nonce_tpm);
-            msg.push(session_attrs(self.dialect));
+            msg.push(SESSION_ATTRS);
             Some(hmac_sha256(auth_value, &msg)?)
         } else {
             None
         };
 
         // Session area: sessionHandle | nonceCaller TPM2B | attributes |
-        // hmac TPM2B, placed after the handles and before the parameters.
-        // The dialect prefixes the area with a u32 size.
+        // hmac TPM2B, after the handles and before the parameters, preceded
+        // by its u32 authSize (ExecCommand.c).
         let mut sess_area = Vec::new();
         sess_area.extend_from_slice(&session.handle.to_be_bytes());
         sess_area.extend_from_slice(&(area_nonce.len() as u16).to_be_bytes());
         sess_area.extend_from_slice(&area_nonce);
-        sess_area.push(session_attrs(self.dialect));
+        sess_area.push(SESSION_ATTRS);
         match &req_hmac {
             Some(h) => {
                 sess_area.extend_from_slice(&(h.len() as u16).to_be_bytes());
@@ -376,11 +348,9 @@ impl Tpm {
         for h in handles {
             body.extend_from_slice(&h.to_be_bytes());
         }
-        // The dialect prefixes the session area with a u32 size; the
-        // standard layout has no such prefix (sessions are self-delimiting).
-        if self.dialect {
-            body.extend_from_slice(&(sess_area.len() as u32).to_be_bytes());
-        }
+        // u32 authSize for the session area (standard: ExecCommand.c
+        // unmarshals it as UINT32 when tag == TPM_ST_SESSIONS).
+        body.extend_from_slice(&(sess_area.len() as u32).to_be_bytes());
         body.extend_from_slice(&sess_area);
         body.extend_from_slice(params);
 

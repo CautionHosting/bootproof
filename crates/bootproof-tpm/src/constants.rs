@@ -7,7 +7,7 @@ pub mod cc {
     // Command codes (TPM_CC). Values verified against the TPM 2.0 spec Table 4.
     pub const EVICT_CONTROL: u16 = 0x0120;
     pub const PCR_ALLOCATE: u16 = 0x012B;
-    pub const CREATE_PRIMARY: u16 = 0x0135;
+    pub const CREATE_PRIMARY: u16 = 0x0131;
     pub const STARTUP: u16 = 0x0144;
     pub const CERTIFY: u16 = 0x0148;
     pub const CREATE: u16 = 0x0153;
@@ -19,19 +19,19 @@ pub mod cc {
     pub const CONTEXT_SAVE: u16 = 0x0162;
     pub const ECDH_KEYGEN: u16 = 0x0163;
     pub const FLUSH_CONTEXT: u16 = 0x0165;
-    pub const READ_PUBLIC: u16 = 0x016A;
+    pub const READ_PUBLIC: u16 = 0x0173;
     pub const START_AUTH_SESSION: u16 = 0x0176;
     pub const VERIFY_SIGNATURE: u16 = 0x0177;
     pub const ECC_PARAMETERS: u16 = 0x0178;
     pub const GET_CAPABILITY: u16 = 0x017A;
     pub const GET_RANDOM: u16 = 0x017B;
     pub const GET_TEST_RESULT: u16 = 0x017C;
-    pub const HASH: u16 = 0x0160;
+    pub const HASH: u16 = 0x017D;
     pub const PCR_READ: u16 = 0x017E;
     pub const POLICY_PCR: u16 = 0x017F;
     pub const POLICY_RESTART: u16 = 0x0180;
-    pub const PCR_EXTEND: u16 = 0x015C;
-    pub const NV_READ_PUBLIC: u16 = 0x01C9;
+    pub const PCR_EXTEND: u16 = 0x0182;
+    pub const NV_READ_PUBLIC: u16 = 0x0169;
 }
 
 pub mod alg {
@@ -71,38 +71,22 @@ pub mod st {
 }
 
 pub mod rh {
-    // Resource handle constants (TPM_RH), TCG Part 2 Table 42.
-    // Verified against the Linux kernel and captured tpm2-tools traffic.
-    pub const ENDORSEMENT: u32 = 0x4000_0001;
-    pub const OWNER: u32 = 0x4000_0002;
-    pub const LOCKOUT: u32 = 0x4000_0003;
-    pub const ENDORSEMENT_AUTH: u32 = 0x4000_0004;
-    pub const OWNER_AUTH: u32 = 0x4000_0005;
-    pub const LOCKOUT_AUTH: u32 = 0x4000_0006;
-    pub const PLATFORM: u32 = 0x4000_0007;
-    pub const PLATFORM_AUTH: u32 = 0x4000_0008;
-
-    // The "none" / null hierarchy (ephemeral keys).
-    pub const NULL: u32 = 0x0000_0001;
+    // Reserved handle constants (TPM_RH), TPM 2.0 Part 2 Table 42. Values
+    // verified against the TCG spec (microsoft/ms-tpm-20-ref
+    // `TpmTypes.h`), upstream tpm2-tss, and the live NitroTPM.
+    pub const OWNER: u32 = 0x4000_0001;
+    pub const ENDORSEMENT: u32 = 0x4000_000B;
+    pub const LOCKOUT: u32 = 0x4000_000A;
+    pub const PLATFORM: u32 = 0x4000_000C;
+    pub const PLATFORM_NV: u32 = 0x4000_000D;
+    // The null (unbound) reserved handle.
+    pub const NULL: u32 = 0x4000_0007;
 
     pub const EK_CERT_NV: u32 = 0x01C0_0002;
     pub const PLATFORM_CERT_NV: u32 = 0x01C0_000A;
 
     // First transient object handle.
     pub const TRANSIENT_FIRST: u32 = 0x8000_0000;
-}
-
-/// Standard TCG `TPM2_RH` hierarchy handles (TPM 2.0 Part 2, Section 10.2).
-/// The `rh` module above carries this platform's renumbered dialect values;
-/// the raw client uses these when `dialect` is false. Verified against
-/// upstream `tpm2-tss` (`include/tss2/tss2_tpm2_types.h`).
-pub mod rh_std {
-    pub const OWNER: u32 = 0x4000_0001;
-    pub const ENDORSEMENT: u32 = 0x4000_000B;
-    pub const PLATFORM: u32 = 0x4000_000C;
-    pub const LOCKOUT: u32 = 0x4000_000A;
-    // The null (unbound) handle: identical in both dialect and standard.
-    pub const NULL: u32 = 0x4000_0007;
 }
 
 /// Handle type prefixes (TPM_HT), the high byte of a handle identifying its
@@ -112,9 +96,9 @@ pub mod ht {
     pub const TRANSIENT: u32 = 0x8000_0000;
     pub const PERSISTENT: u32 = 0x8100_0000;
     pub const LOADED_METADATA: u32 = 0x8200_0000;
-    pub const SESSION: u32 = 0xA000_0000;
-    /// Standard TCG session handle type (0x02xxxxxx).
-    pub const SESSION_STD: u32 = 0x0200_0000;
+    /// Session handle type (TPM_HT_SESSIONS), spec Part 2 Table 22: 0x02xxxxxx.
+    /// HMAC=0x02, policy=0x03, trial=0x03.
+    pub const SESSION: u32 = 0x0200_0000;
     pub const NV_INDEX: u32 = 0xB000_0000;
     pub const PERMANENT: u32 = 0x4000_0000;
 }

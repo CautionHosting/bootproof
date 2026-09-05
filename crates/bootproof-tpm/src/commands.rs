@@ -12,7 +12,7 @@
 //! * `TPML_*` arrays carry a `u32` count.
 //! * `TPMS_PCR_SELECTION` is `{hash u16, pcrSelectSize u8, pcrSelect[size]}`.
 
-use crate::constants::{alg, cap, cc, ht, st};
+use crate::constants::{cap, cc, ht, st};
 use crate::conn::{Command, Tpm};
 use crate::error::{Error, Result};
 
@@ -245,21 +245,6 @@ impl Tpm {
         Ok(out)
     }
 
-    /// Map a spec command code to the firmware's wire code. The dialect
-    /// renumbers some commands (verified against working esys traffic):
-    /// CreatePrimary 0x0135 -> 0x0131, ReadPublic 0x016A -> 0x0173. All
-    /// other codes used by this client are unchanged.
-    pub fn wire_cc(&self, standard: u16) -> u16 {
-        if !self.dialect {
-            return standard;
-        }
-        match standard {
-            cc::CREATE_PRIMARY => 0x0131,
-            cc::READ_PUBLIC => 0x0173,
-            other => other,
-        }
-    }
-
     /// TPM2_GetCapability for a single TPM property (TPM_CAP_TPM_PROPERTIES).
     /// Returns the property value (u32).
     pub fn get_property(&mut self, tpm_pt: u32) -> Result<u32> {
@@ -269,31 +254,6 @@ impl Tpm {
         cmd.push_u32(1); // propertyLimit
         let (_rc, body) = self.call(&cmd)?;
         parse_get_capability_property(&body)
-    }
-
-    /// Detect the renumbered StageX dialect and record it. The dialect
-    /// renumbers symmetric algorithms: it advertises CFB as `0x0043`, a code
-    /// the spec does not define (spec CFB is `0x0045`). Querying
-    /// GetCapability(ALGORITHMS) for `0x0043` therefore marks the dialect:
-    /// a count > 0 means the firmware speaks it, NO_RESULT (0x0001) means a
-    /// standard TPM. Best effort: on any error the TPM is treated as standard.
-    pub fn detect_dialect(&mut self) {
-        let mut cmd = Command::new(cc::GET_CAPABILITY, st::NO_SESSIONS);
-        cmd.push_u32(cap::ALGS);
-        cmd.push_u32(alg::CFB as u32); // sub-cap: CFB id (dialect 0x0043)
-        cmd.push_u32(1); // limit: one algorithm entry
-        self.dialect = match self.call(&cmd) {
-            Ok((_rc, body)) => {
-                // body: moreData u8 | capability u32 | count u32 | payload
-                if body.len() >= 9 {
-                    u32::from_be_bytes([body[5], body[6], body[7], body[8]]) > 0
-                } else {
-                    false
-                }
-            }
-            Err(_) => false, // can't enumerate -> assume standard
-        };
-        eprintln!("[dialect] StageX={}", self.dialect);
     }
 
     /// TPM2_GetCapability(TPMI_CAP_HANDLES, htype) for one handle type.
@@ -329,18 +289,11 @@ impl Tpm {
     /// RC for the subcap), so per-type enumeration errors are tolerated.
     pub fn flush_all(&mut self) -> Result<usize> {
         let mut flushed = 0usize;
-        // The session handle type differs: 0x02xxxxxx (standard) vs the
-        // dialect's 0xA0xxxxxx.
-        let session_ht = if self.dialect {
-            ht::SESSION
-        } else {
-            ht::SESSION_STD
-        };
         for htype in [
             ht::TRANSIENT,
             ht::PERSISTENT,
             ht::LOADED_METADATA,
-            session_ht,
+            ht::SESSION,
         ] {
             let handles = match self.get_handles(htype) {
                 Ok(h) => h,

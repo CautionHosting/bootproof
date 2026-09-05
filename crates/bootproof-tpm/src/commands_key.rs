@@ -61,16 +61,16 @@ pub struct Quote {
 /// objectAttributes for an ECC P-256 signing key with empty auth and no
 /// auth policy: fixedTPM(0x2) | fixedParent(0x10) | sensitiveDataOrigin(0x20)
 /// | userWithAuth(0x40) | restricted(0x10000) | signEncrypt(0x40000).
-/// These are the standard TCG `TPMA_OBJECT` bit values (verified against
-/// upstream tpm2-tss); the platform dialect uses the same values.
+/// Standard TCG `TPMA_OBJECT` bit values (verified against upstream
+/// tpm2-tss and the TCG spec).
 const OBJ_ATTR_SIGN: u32 = 0x0005_0072;
 
 /// Build the `TPMT_PUBLIC` template for an ECC P-256 signing key (empty auth,
 /// empty unique point -- the TPM generates the key).
 ///
-/// Layout (identical in dialect and standard): type | nameAlg | attributes |
-/// policy | symmetric (NULL, 2 bytes) | scheme | hashAlg | curveID | kdf |
-/// unique. A restricted signing key requires symmetric = TPM_ALG_NULL.
+/// Layout (standard TCG): type | nameAlg | attributes | policy | symmetric
+/// (NULL, 2 bytes) | scheme | hashAlg | curveID | kdf | unique. A restricted
+/// signing key requires symmetric = TPM_ALG_NULL.
 pub fn build_ecc_sign_template() -> Vec<u8> {
     let mut b = Vec::new();
     // type
@@ -104,7 +104,7 @@ pub fn build_ecc_sign_template() -> Vec<u8> {
 /// is `userAuth (TPM2B_AUTH, size 0) || data (TPM2B_SENSITIVE_DATA, size 0)`
 /// = `0000 0000` (4 bytes). The `sensitiveType` field present in pre-1.35
 /// specs was dropped and must NOT be emitted.
-pub fn build_ecc_sign_sensitive(_dialect: bool) -> Vec<u8> {
+pub fn build_ecc_sign_sensitive() -> Vec<u8> {
     let mut b = Vec::new();
     b.extend_from_slice(&0u16.to_be_bytes()); // userAuth.size = 0
     b.extend_from_slice(&0u16.to_be_bytes()); // data.size = 0
@@ -113,9 +113,8 @@ pub fn build_ecc_sign_sensitive(_dialect: bool) -> Vec<u8> {
 
 impl Tpm {
     /// TPM2_CreatePrimary: create an ECC P-256 signing key in the owner
-    /// hierarchy (0x40000001 is the standard OWNER handle; on the dialect it
-    /// is the endorsement hierarchy) with empty auth / no policy. Returns the
-    /// transient key.
+    /// hierarchy (0x40000001 = TPM_RH_OWNER, spec Part 2 Table 42) with empty
+    /// auth / no policy. Returns the transient key.
     ///
     /// The firmware requires an authorization session for CreatePrimary even
     /// when the hierarchy carries no auth, so this goes through the session
@@ -139,7 +138,7 @@ impl Tpm {
         session_type: u8,
     ) -> Result<Key> {
         let session = self.start_auth_session(0x4000_0007, session_type)?;
-        let sensitive = build_ecc_sign_sensitive(self.dialect);
+        let sensitive = build_ecc_sign_sensitive();
         let public = build_ecc_sign_template();
         let (rc, body) =
             self.call_create_primary_with_session(hierarchy, &session, &sensitive, &public)?;
@@ -174,14 +173,12 @@ impl Tpm {
     /// given hierarchy, returning the raw response code (even on failure). Used
     /// to probe which hierarchies a TPM accepts.
     pub fn create_primary_rc(&mut self, hierarchy: u32) -> Result<u32> {
-        let sensitive = build_ecc_sign_sensitive(self.dialect);
+        let sensitive = build_ecc_sign_sensitive();
         let public = build_ecc_sign_template();
-        let mut cmd = Command::new(self.wire_cc(cc::CREATE_PRIMARY), st::NO_SESSIONS);
+        let mut cmd = Command::new(cc::CREATE_PRIMARY, st::NO_SESSIONS);
         cmd.push_u32(hierarchy);
-        if self.dialect {
-            cmd.push_u16(sensitive.len() as u16);
-        }
-        cmd.push_bytes(&sensitive); // inSensitive: the dialect wraps it in a size
+        cmd.push_u16(sensitive.len() as u16); // inSensitive: TPM2B size prefix
+        cmd.push_bytes(&sensitive);
         cmd.push_u16(public.len() as u16);
         cmd.push_bytes(&public);
         cmd.push_u16(0); // outsideInfo (empty)
@@ -202,12 +199,10 @@ impl Tpm {
         in_sensitive: &[u8],
         in_public: &[u8],
     ) -> Result<u32> {
-        let mut cmd = Command::new(self.wire_cc(cc::CREATE_PRIMARY), st::NO_SESSIONS);
+        let mut cmd = Command::new(cc::CREATE_PRIMARY, st::NO_SESSIONS);
         cmd.push_u32(hierarchy);
-        if self.dialect {
-            cmd.push_u16(in_sensitive.len() as u16);
-        }
-        cmd.push_bytes(in_sensitive); // inSensitive: the dialect wraps it in a size
+        cmd.push_u16(in_sensitive.len() as u16); // inSensitive: TPM2B size
+        cmd.push_bytes(in_sensitive);
         cmd.push_u16(in_public.len() as u16);
         cmd.push_bytes(in_public);
         cmd.push_u16(0); // outsideInfo (empty)
@@ -221,7 +216,7 @@ impl Tpm {
 
     /// TPM2_ReadPublic: read a key's public area and name.
     pub fn read_public(&mut self, handle: u32) -> Result<Key> {
-        let mut cmd = Command::new(self.wire_cc(cc::READ_PUBLIC), st::NO_SESSIONS);
+        let mut cmd = Command::new(cc::READ_PUBLIC, st::NO_SESSIONS);
         cmd.push_u32(handle);
         let (_rc, body) = self.call(&cmd)?;
         parse_read_public(&body, handle)
@@ -301,9 +296,11 @@ impl Tpm {
 
     /// TPM2_Sign: sign a SHA256 digest with an ECDSA key.
     ///
-    /// This platform's firmware requires both an authorization session and a
-    /// ticket (from TPM2_Hash over the signed data, in the OWNER hierarchy)
-    /// in the validation field. Returns the (h, t) signature components.
+    /// The key is restricted, so per spec (TPM 2.0 Part 2, 11.3.10) the
+    /// validation field carries a creation ticket (from TPM2_Hash over the
+    /// signed data, in the OWNER hierarchy) in its TPMT_TK validation field,
+    /// plus an authorization session. Returns the (h, t) signature
+    /// components.
     pub fn sign(&mut self, key: &Key, data: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
         let (digest, ticket) = self.hash(data, 0x4000_0001)?;
         let mut params = Vec::new();
@@ -313,13 +310,8 @@ impl Tpm {
         // inScheme: TPMT_SIG_SCHEME { scheme = ECDSA, hashAlg = SHA256 }
         params.extend_from_slice(&alg::ECDSA.to_be_bytes());
         params.extend_from_slice(&alg::SHA256.to_be_bytes());
-        // validation: the raw creation ticket from TPM2_Hash (dialect), or
-        // an empty TPM2B_DATA (standard).
-        if self.dialect {
-            params.extend_from_slice(&ticket);
-        } else {
-            params.extend_from_slice(&0u16.to_be_bytes());
-        }
+        // validation: the creation ticket from TPM2_Hash (restricted key).
+        params.extend_from_slice(&ticket);
 
         let session = self.start_auth_session(0x4000_0007, crate::session::TPM_SE_HMAC)?;
         let (rc, body) =
@@ -334,17 +326,20 @@ impl Tpm {
 
 /// Parse a CreatePrimary response body.
 ///
-/// Layout is wire-offset parsed (no struct casts). This platform's firmware
-/// inserts an extra 4-byte field after the output handle (observed
-/// 0x00000121), then emits, in order: outPublic (u16-size TPM2B), a
-/// creationPCR+creationHash blob (u16 size), a 32-byte blob (u16 size), a
-/// creation ticket (tag u16 | hierarchy u32 | digest TPM2B), and finally the
-/// name (u16-size TPM2B starting with the nameAlg). The name is located by
-/// walking the size-prefixed fields after outPublic.
+/// Standard spec layout (CreatePrimary_fp.h): `objectHandle | outPublic
+/// TPM2B_PUBLIC | creationData | creationHash | creationTicket | name`.
+/// This firmware's response inserts an extra 4-byte field after the output
+/// handle (observed 0x00000121), so the outPublic size prefix sits at offset
+/// 8 here instead of 4. The parser locates outPublic by scanning offset 8
+/// (this firmware) and 4 (spec) for a u16-size TPM2B whose content starts
+/// with TPM_ALG_ECC (0x0023). The Name is nameAlg || SHA256(publicArea),
+/// where publicArea excludes the TPM2B size prefix (verified: the
+/// firmware's own ReadPublic name matches this exactly).
 pub fn parse_create_primary(body: &[u8]) -> Result<Key> {
     let handle = read_u32(body, 0)?;
     // Find the public area: a u16-size TPM2B whose content starts with
-    // TPM_ALG_ECC (0x0023), at offset 8 (this dialect) or 4 (standard).
+    // TPM_ALG_ECC (0x0023), at offset 8 (this firmware's response, which
+    // inserts an extra u32 after the handle) or 4 (standard spec layout).
     let pub_off = [8usize, 4]
         .iter()
         .copied()
@@ -358,10 +353,10 @@ pub fn parse_create_primary(body: &[u8]) -> Result<Key> {
         .ok_or_else(|| Error::Malformed("CreatePrimary: public area not found".into()))?;
     let (_psize, public, mut o) = read_tpm2b(body, pub_off)?;
 
-    // Dialect response: handle | u32 | public | creationData | creationHash
-    // | ticket | extra | name. The Name is nameAlg || SHA256(publicArea),
-    // where publicArea excludes the TPM2B size prefix (verified: the
-    // firmware's own ReadPublic name matches this exactly).
+    // This firmware's response: handle | extra u32 | public | creationData
+    // | creationHash | ticket | extra | name. The Name is nameAlg ||
+    // SHA256(publicArea), where publicArea excludes the TPM2B size prefix
+    // (verified: the firmware's own ReadPublic name matches this exactly).
     if pub_off == 8 {
         if public.len() < 4 {
             return Err(Error::Malformed(
@@ -436,9 +431,9 @@ pub fn parse_read_public(body: &[u8], handle: u32) -> Result<Key> {
 /// Two layouts are handled:
 /// - standard: `TPM2B_ATTEST { u16 size, TPMS_ATTEST }` at offset 0, then
 ///   `{scheme u16, hashAlg u16, h TPM2B, t TPM2B}`.
-/// - this platform's dialect: a 6-byte prefix (`0000 | u16 | u16`, the last
-///   u16 is the attest length), then the TPMS_ATTEST, then the same
-///   signature block, followed by trailing bytes this client does not use.
+/// - this firmware: a 6-byte prefix (`0000 | u16 | u16`, the last u16 is the
+///   attest length) before the TPMS_ATTEST, then the same signature block,
+///   followed by trailing bytes this client does not use.
 /// The layout is detected by locating the TPM_MG_ATTEST magic (0xFF544347).
 pub fn parse_quote(body: &[u8]) -> Result<Quote> {
     let magic = [0xFF, 0x54, 0x43, 0x47];

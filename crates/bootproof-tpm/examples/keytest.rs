@@ -296,7 +296,7 @@ fn main() -> Result<()> {
             let rc3 = hex_send(&mut tpm, "80010000000c0000017b0020");
             eprintln!("[x] GetRandom rc={rc3:?}");
             let session = tpm.start_auth_session(0x4000_0007, 0x00)?;
-            let sensitive = bootproof_tpm::commands_key::build_ecc_sign_sensitive(tpm.dialect);
+            let sensitive = bootproof_tpm::commands_key::build_ecc_sign_sensitive();
             let public = bootproof_tpm::commands_key::build_ecc_sign_template();
             let (rc, _body) =
                 tpm.call_create_primary_with_session(0x4000_0001, &session, &sensitive, &public)?;
