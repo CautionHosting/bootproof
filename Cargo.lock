@@ -254,6 +254,7 @@ dependencies = [
  "clap",
  "digest",
  "ecdsa",
+ "flate2",
  "group",
  "hyper",
  "hyper-util",

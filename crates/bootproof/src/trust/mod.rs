@@ -1239,14 +1239,11 @@ fn imds_http(method: &str, path: &str, extra_header: Option<&str>) -> Option<Str
 
 /// Key kernel hardening options from /proc/config.gz (name, enabled).
 fn kernel_hardening_options() -> Option<Vec<(String, bool)>> {
-    let out = std::process::Command::new("gzip")
-        .args(["-dc", "/proc/config.gz"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).to_string();
+    use std::io::Read;
+    let file = std::fs::File::open("/proc/config.gz").ok()?;
+    let mut dec = flate2::read::GzDecoder::new(file);
+    let mut s = String::new();
+    dec.read_to_string(&mut s).ok()?;
     let wanted = [
         "CONFIG_RANDOMIZE_MEMORY",
         "CONFIG_RANDOMIZE_BASE",

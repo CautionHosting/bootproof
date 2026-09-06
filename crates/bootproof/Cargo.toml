@@ -49,3 +49,6 @@ time = "0.3"
 
 # verify client
 ureq = { version = "2", features = ["tls"] }
+
+# /proc/config.gz decoding (no external gzip)
+flate2 = "1"
