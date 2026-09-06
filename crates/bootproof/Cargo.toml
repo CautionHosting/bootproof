@@ -30,6 +30,11 @@ rand = "0.9"
 # OpenPGP verification in-process (replaces the gpg exec). The keyring we ship
 # is a plain OpenPGP public-key packet stream, which rPGP reads directly.
 pgp = "0.20"
+# SEV-SNP attestation in-process (replaces the snpguest exec): request a fresh
+# report from /dev/sev-guest, decode the typed report, chain the VLEK cert to
+# the pinned ASVK/ARK, and verify the report signature. crypto_nossl keeps it
+# pure Rust (p384 + sha2 + rsa + x509-cert, no OpenSSL, no snpguest).
+sev = { version = "=8.0.0", default-features = false, features = ["snp", "crypto_nossl"] }
 num-bigint = "0.4"
 num-traits = "0.2"
 p256 = "0.13"

@@ -106,6 +106,9 @@ const IIDD_DSA_CERTS: &[(&str, &str)] = &[
 use bootproof_sdk::format::VerifiableSignedAttestationFormat;
 use num_bigint::BigUint;
 use num_traits::Zero as _;
+use sev::certs::snp::{ca, Chain, Certificate, Verifiable};
+use sev::firmware::guest::{AttestationReport, Firmware};
+use sev::parser::Decoder;
 use sha2::Digest as _;
 use x509_parser::prelude::FromDer;
 
@@ -315,11 +318,12 @@ struct SnpFacts {
     version: Option<String>,
     /// TCB microcode version.
     tcb_microcode: Option<String>,
-    /// Whether `snpguest verify attestation` confirmed the report signature
-    /// against the platform-provisioned VLEK (None = not attempted).
-    vlek_verified: Option<bool>,
-    /// Whether `snpguest verify certs` confirmed VLEK cert -> ASVK -> ARK
+    /// Whether the report signature was verified against the
+    /// platform-provisioned VLEK, in-process via the sev crate
     /// (None = not attempted).
+    vlek_verified: Option<bool>,
+    /// Whether the VLEK cert -> ASVK -> ARK chain was verified in-process
+    /// via the sev crate (None = not attempted).
     amd_chain_ok: Option<bool>,
     /// CN of the platform-provisioned VLEK certificate (if it's a cert).
     vlek_cert_cn: Option<String>,
@@ -606,7 +610,17 @@ fn collect_provenance() -> ProvenanceFacts {
     }
 }
 
-/// Fetch the SEV-SNP attestation report and parse `snpguest display report`.
+/// Fetch the SEV-SNP attestation report and verify it in-process (sev crate).
+///
+/// Requests a FRESH report directly from `/dev/sev-guest`: the random
+/// 64-byte nonce we send is echoed into report_data and covered by the
+/// firmware's report signature; it is the binding nonce for the TPM
+/// document. A stale report would defeat the time-binding. The typed report
+/// is then anchored to AMD's root of trust: the platform-provisioned VLEK
+/// certificate (from the report's certificate table) chains to the ASVK
+/// (SEV-VLEK-Milan) and ARK (ARK-Milan) pinned at build time, and the report
+/// signature is verified against that VLEK. All pure Rust (sev
+/// crypto_nossl): no snpguest, no OpenSSL, no temp files.
 fn collect_snp() -> SnpFacts {
     let mut f = SnpFacts {
         present: Path::new("/dev/sev-guest").exists(),
@@ -616,98 +630,90 @@ fn collect_snp() -> SnpFacts {
         return f;
     }
 
-    let report = Path::new("/tmp/snp_report.bin");
-    // Always request a FRESH report: its random report_data (64 bytes,
-    // covered by the report signature) is the binding nonce for the TPM
-    // document. A stale report would defeat the time-binding.
-    let fresh = Path::new("/tmp/snp_report_fresh.bin");
-    let req = Path::new("/tmp/snp_req_fresh.bin");
-    // snpguest -r generates random report_data and writes it back into the
-    // request file; remove any stale files so the randomness is genuinely
-    // fresh for this run.
-    let _ = std::fs::remove_file(fresh);
-    let _ = std::fs::remove_file(req);
-    let got_fresh = std::process::Command::new("snpguest")
-        .args(["report", "/tmp/snp_report_fresh.bin", "/tmp/snp_req_fresh.bin", "-r"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-        && fresh.exists()
-        && req.exists();
-    let report_path = if got_fresh { fresh } else { report };
-    if !report_path.exists() {
-        return f;
-    }
-
-    let out = match std::process::Command::new("snpguest")
-        .args(["display", "report"])
-        .arg(report_path)
-        .output()
-    {
-        Ok(o) if o.status.success() => o,
-        _ => return f,
-    };
-    let text = String::from_utf8_lossy(&out.stdout).to_string();
-    f.report = true;
-    if got_fresh {
-        // snpguest writes the 1184-byte firmware report; report_data is the
-        // 64 bytes at file offset 0x50, covered by the report signature.
-        // snpguest -r also wrote the same 64 bytes into the request file;
-        // both must agree and be non-zero (all-zero report_data means the
-        // firmware ignored the request, and the binding would be forgeable).
-        let raw = std::fs::read(report_path).unwrap_or_default();
-        let rreq = std::fs::read(req).unwrap_or_default();
-        if raw.len() >= 0x50 + 64 && rreq.len() == 64 && raw[0x50..0x50 + 64] == rreq[..] {
-            let rd = &raw[0x50..0x50 + 64];
-            if rd.iter().any(|&b| b != 0) {
-                f.report_data = Some(rd.to_vec());
-            }
+    let mut fw = match Firmware::open() {
+        Ok(fw) => fw,
+        Err(e) => {
+            tracing::warn!("sev-guest open failed: {e:?}");
+            return f;
         }
-    }
-    f.cpuid_family = field_value(&text, "CPUID Family ID");
-    f.cpuid_model = field_value(&text, "CPUID Model ID");
-    f.cpuid_stepping = field_value(&text, "CPUID Stepping");
-    f.policy = policy_hex(&text);
-    f.smt_allowed = field_bool(&text, "SMT Allowed");
-    f.debug_allowed = field_bool(&text, "Debug Allowed");
-    f.page_swap_disable = field_bool(&text, "Page Swap Disable");
-    f.tsme = field_bool(&text, "TSME Enabled");
-    f.ecc = field_bool(&text, "ECC Enabled");
-    f.vmpl = field_value(&text, "VMPL");
-    f.signing_key = field_value(&text, "signing key");
-    f.measurement = hex_block(&text, "Measurement").map(|h| h.get(..32).unwrap_or(&h).to_string());
-    f.version = field_value(&text, "Current Version");
-    f.tcb_microcode = field_value(&text, "Microcode");
+    };
 
-    // Platform-provisioned VLEK certificate + the AMD KDS chain pinned at
-    // build time. Full anchor to AMD's root of trust:
+    // Fresh nonce: 64 random bytes we choose. The firmware echoes them into
+    // report_data inside the signed report; they must match and be non-zero
+    // (an all-zero report_data means the binding would be forgeable).
+    let mut nonce = [0u8; 64];
+    rand::RngCore::fill_bytes(&mut rand::rng(), &mut nonce);
+
+    let (report_bytes, cert_table) = match fw.get_ext_report(Some(1), Some(nonce), Some(1)) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("sev-guest get_ext_report failed: {e:?}");
+            return f;
+        }
+    };
+
+    let ar = match AttestationReport::decode(&mut std::io::Cursor::new(&report_bytes), ()) {
+        Ok(ar) => ar,
+        Err(e) => {
+            tracing::warn!("sev attestation report decode failed: {e:?}");
+            return f;
+        }
+    };
+
+    f.report = true;
+    if ar.report_data == nonce && nonce.iter().any(|&b| b != 0) {
+        f.report_data = Some(nonce.to_vec());
+    }
+    f.cpuid_family = ar.cpuid_fam_id.map(|v| v.to_string());
+    f.cpuid_model = ar.cpuid_mod_id.map(|v| v.to_string());
+    f.cpuid_stepping = ar.cpuid_step.map(|v| v.to_string());
+    f.policy = Some(format!("{:x}", ar.policy.0));
+    f.smt_allowed = Some(ar.policy.smt_allowed());
+    f.debug_allowed = Some(ar.policy.debug_allowed());
+    f.page_swap_disable = Some(ar.policy.page_swap_disabled());
+    f.tsme = Some(ar.plat_info.tsme_enabled());
+    f.ecc = Some(ar.plat_info.ecc_enabled());
+    f.vmpl = Some(ar.vmpl.to_string());
+    f.signing_key = Some(match ar.key_info.signing_key() {
+        0 => "vcek".into(),
+        1 => "vlek".into(),
+        7 => "none".into(),
+        _ => "unknown".into(),
+    });
+    f.measurement = Some(hex_bytes(&ar.measurement[..16]));
+    f.version = Some(ar.current.to_string());
+    f.tcb_microcode = Some(ar.current_tcb.microcode.to_string());
+
+    // Platform-provisioned VLEK certificate (from the report's certificate
+    // table) + the AMD KDS chain pinned at build time. Full anchor to AMD's
+    // root of trust:
     //   VLEK cert (from the PSP) -> ASVK (SEV-VLEK-Milan) -> ARK (ARK-Milan, pinned)
-    // then the report signature + TCB fields are checked against that VLEK.
-    let certs_dir = PathBuf::from("/tmp/snp_certs");
-    let _ = std::fs::create_dir_all(&certs_dir);
-    let vlek_pem = certs_dir.join("vlek.pem");
-    if std::process::Command::new("snpguest")
-        .args(["certificates", "pem"])
-        .arg(&certs_dir)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-        && vlek_pem.is_file()
-    {
-        let pem = std::fs::read(&vlek_pem).unwrap_or_default();
-        if pem.starts_with(b"-----BEGIN CERTIFICATE-----") {
-            if let Some(der) = pem_to_der(&pem) {
-                f.vlek_cert_cn = cert_cn(&der);
-                f.vlek_cert_not_after = cert_not_after(&der);
+    // then the report signature is checked against that VLEK.
+    if let Some(table) = cert_table {
+        if let Some(vlek_der) = table
+            .iter()
+            .find(|c| c.cert_type == sev::firmware::host::CertType::VLEK)
+            .map(|c| c.data.clone())
+        {
+            f.vlek_cert_cn = cert_cn(&vlek_der);
+            f.vlek_cert_not_after = cert_not_after(&vlek_der);
+            if let Ok(vlek) = Certificate::from_der(&vlek_der) {
+                // Report signature: the VLEK (ECDSA P-384 / SHA-384) signed
+                // the report; what `snpguest verify attestation` used to do.
+                f.vlek_verified = Some((&vlek, &ar).verify().is_ok());
+                if let (Ok(asvk), Ok(ark)) = (
+                    Certificate::from_pem(AMD_ASVK_MILAN_PEM),
+                    Certificate::from_pem(AMD_ARK_MILAN_PEM),
+                ) {
+                    // AMD anchor: ARK-Milan self-signs, ARK signs the ASVK,
+                    // the ASVK signed this live VLEK.
+                    let chain = Chain {
+                        ca: ca::Chain { ark, ask: asvk },
+                        vek: vlek,
+                    };
+                    f.amd_chain_ok = Some(chain.verify().is_ok());
+                }
             }
-            let chain_ok = std::fs::write(certs_dir.join("asvk.pem"), AMD_ASVK_MILAN_PEM).is_ok()
-                && std::fs::write(certs_dir.join("ark.pem"), AMD_ARK_MILAN_PEM).is_ok()
-                && snpguest_exit_ok(&["verify", "certs"], &[certs_dir.clone()]);
-            f.amd_chain_ok = Some(chain_ok);
-            f.vlek_verified = Some(snpguest_exit_ok(
-                &["verify", "attestation"],
-                &[certs_dir.clone(), report_path.to_path_buf()],
-            ));
         }
     }
     f
@@ -1342,14 +1348,13 @@ fn cert_not_after(der: &[u8]) -> Option<String> {
     Some(format!("{ta}"))
 }
 
-/// Run snpguest with the given args; true on exit 0.
-fn snpguest_exit_ok(args: &[&str], paths: &[PathBuf]) -> bool {
-    let mut cmd = std::process::Command::new("snpguest");
-    cmd.args(args);
-    for p in paths {
-        cmd.arg(p);
+/// Compact lowercase hex of a byte slice (no separators).
+fn hex_bytes(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for x in b {
+        s.push_str(&format!("{x:02x}"));
     }
-    cmd.output().map(|o| o.status.success()).unwrap_or(false)
+    s
 }
 
 /// Find an AWS-region-looking token (e.g. "us-east-2") in a CN string.
@@ -1383,81 +1388,6 @@ fn is_region_token(t: &str) -> bool {
     }
     // Middle (between the first "-xx" and the trailing digit) is letters or "-".
     b[3..b.len() - 1].iter().all(|c| c.is_ascii_lowercase() || *c == b'-')
-}
-
-// ── snpguest display text parsing ─────────────────────────────────────────────
-
-/// Value of the first line whose trimmed form starts with `key`, after the colon.
-fn field_value(text: &str, key: &str) -> Option<String> {
-    for line in text.lines() {
-        let t = line.trim();
-        if let Some(v) = t.strip_prefix(key) {
-            let v = v.trim_start();
-            if let Some(v) = v.strip_prefix(':') {
-                let v = v.trim();
-                if !v.is_empty() {
-                    return Some(v.to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Boolean value of `field_value` (true/false), else None.
-fn field_bool(text: &str, key: &str) -> Option<bool> {
-    field_value(text, key).and_then(|v| match v.to_lowercase().as_str() {
-        "true" => Some(true),
-        "false" => Some(false),
-        _ => None,
-    })
-}
-
-/// The guest-policy hex from the "Guest Policy (0x...):" line.
-fn policy_hex(text: &str) -> Option<String> {
-    for line in text.lines() {
-        if line.trim().starts_with("Guest Policy") {
-            let t = line.trim();
-            let start = t.find("0x")?;
-            let rest = &t[start + 2..];
-            let end = rest
-                .find(|c: char| !c.is_ascii_hexdigit())
-                .unwrap_or(rest.len());
-            let hex = &rest[..end];
-            if !hex.is_empty() {
-                return Some(hex.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// Concatenated lowercase hex of the block of hex lines following `header:`.
-fn hex_block(text: &str, header: &str) -> Option<String> {
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines.iter().position(|l| {
-        let t = l.trim();
-        t == header || t == format!("{header}:")
-    })?;
-    let mut hex = String::new();
-    for line in &lines[start + 1..] {
-        let t = line.trim();
-        if t.is_empty() {
-            break;
-        }
-        let ok = t
-            .split_whitespace()
-            .all(|w| w.len() == 2 && w.bytes().all(|c| c.is_ascii_hexdigit()));
-        if !ok {
-            break;
-        }
-        hex.push_str(t.replace(" ", "").to_lowercase().as_str());
-    }
-    if hex.is_empty() {
-        None
-    } else {
-        Some(hex)
-    }
 }
 
 // ── build the tree ────────────────────────────────────────────────────────────
@@ -3379,51 +3309,55 @@ mod tests {
         assert_eq!(region_from_cn("aws.nitro-enclaves"), None);
     }
 
-    const SNP_DISPLAY: &str = "\
-Attestation Report:
-
-Version:                      5
-
-Guest Policy (0x2030000):
-  ABI Major:     0
-  SMT Allowed:   true
-  Debug Allowed: false
-  Page Swap Disable: true
-
-VMPL:                         1
-
-Platform Info (39):
-  TSME Enabled:              true
-  ECC Enabled:               true
-
-Key Information:
-    signing key:        vlek
-
-Measurement:
-50 7E 82 D2 7E A5 B9 51 DD 76 5A 3E B3 1B A5 F5
-82 67 3B 30 1D 69 83 DE D4 82 D3 FE B0 66 CB 68
-
-CPUID Family ID:              25
-CPUID Model ID:               1
-CPUID Stepping:               1
-
-Current Version:              1.58.1
-";
+    // Real firmware attestation report + the 64-byte nonce that produced it,
+    // captured from a live EC2 SEV-SNP guest (the same SNP_GET_EXT_REPORT ioctl
+    // `collect_snp` now issues in-process). Verifying these offline — without
+    // /dev/sev-guest — is a reproducible proof that the in-process path reads
+    // the same typed values and anchors the report to AMD's root.
+    const SNP_REPORT: &[u8] = include_bytes!("data/snp-report-fixture.bin");
+    const SNP_REQUEST: &[u8] = include_bytes!("data/snp-request-fixture.bin");
+    const SNP_VLEK: &[u8] = include_bytes!("data/snp-vlek-fixture.pem");
 
     #[test]
-    fn snpguest_field_parsing() {
-        assert_eq!(field_value(SNP_DISPLAY, "CPUID Family ID"), Some("25".into()));
-        assert_eq!(field_value(SNP_DISPLAY, "VMPL"), Some("1".into()));
-        assert_eq!(field_value(SNP_DISPLAY, "signing key"), Some("vlek".into()));
-        assert_eq!(field_value(SNP_DISPLAY, "Current Version"), Some("1.58.1".into()));
-        assert_eq!(policy_hex(SNP_DISPLAY), Some("2030000".into()));
-        assert_eq!(field_bool(SNP_DISPLAY, "TSME Enabled"), Some(true));
-        assert_eq!(field_bool(SNP_DISPLAY, "Debug Allowed"), Some(false));
-        assert_eq!(field_bool(SNP_DISPLAY, "Page Swap Disable"), Some(true));
-        assert_eq!(
-            hex_block(SNP_DISPLAY, "Measurement"),
-            Some("507e82d27ea5b951dd765a3eb31ba5f582673b301d6983ded482d3feb066cb68".into())
-        );
+    fn snp_report_fields_match_baseline() {
+        use std::io::Cursor;
+        let ar = AttestationReport::decode(&mut Cursor::new(SNP_REPORT), ()).unwrap();
+        // Typed field values, as `collect_snp` now maps them into SnpFacts.
+        assert_eq!(format!("{:x}", ar.policy.0), "2030000");
+        assert_eq!(ar.policy.smt_allowed(), true);
+        assert_eq!(ar.policy.debug_allowed(), false);
+        assert_eq!(ar.policy.page_swap_disabled(), true);
+        assert_eq!(ar.plat_info.tsme_enabled(), true);
+        assert_eq!(ar.plat_info.ecc_enabled(), true);
+        assert_eq!(ar.vmpl, 1);
+        assert_eq!(ar.key_info.signing_key(), 1, "signed with the VLEK");
+        assert_eq!(ar.cpuid_fam_id, Some(25));
+        assert_eq!(ar.cpuid_mod_id, Some(1));
+        assert_eq!(ar.cpuid_step, Some(1));
+        assert_eq!(ar.current.to_string(), "1.58.1");
+        assert_eq!(ar.current_tcb.microcode, 222);
+        // Nonce binding: the 64 random bytes we sent are echoed into the
+        // signed report_data.
+        assert_eq!(&ar.report_data[..], SNP_REQUEST, "report_data must echo the nonce");
+    }
+
+    #[test]
+    fn snp_report_anchors_to_amd_root() {
+        use std::io::Cursor;
+        let ar = AttestationReport::decode(&mut Cursor::new(SNP_REPORT), ()).unwrap();
+        let vlek = Certificate::from_pem(SNP_VLEK).unwrap();
+        // Report signature: VLEK (ECDSA P-384 / SHA-384) signed the report.
+        (&vlek, &ar).verify().expect("VLEK signed the firmware report");
+        // AMD anchor: ARK-Milan self-signs, ARK signs ASVK (SEV-VLEK-Milan),
+        // ASVK signed this live VLEK.
+        let chain = Chain {
+            ca: ca::Chain {
+                ark: Certificate::from_pem(AMD_ARK_MILAN_PEM).unwrap(),
+                ask: Certificate::from_pem(AMD_ASVK_MILAN_PEM).unwrap(),
+            },
+            vek: vlek,
+        };
+        (&chain).verify().expect("VLEK chains to the pinned ARK-Milan");
     }
 
     #[test]

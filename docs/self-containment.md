@@ -202,6 +202,48 @@ the same way. The code must treat `cert_table: None`/no-VLEK as
 stay `None`), not as a hard error. sev exposes no separate guest cert-fetch
 ioctl -- `get_ext_report` is the only path.
 
+### 4.4 Implementation (done) — findings that diverged from the recipe above
+
+- **`tcb_microcode` mapping correction:** the table above said
+  `ar.reported_tcb.microcode`. The sev crate's `Display` prints the *Current*
+  TCB before the *Reported* TCB, so the old text parser's first `Microcode:`
+  line was `ar.current_tcb.microcode`. On live Milan firmware both are 222
+  (verified against the fixture), so either choice is byte-identical — but
+  `current_tcb` is the correct match for the old behavior, and that is what is
+  implemented.
+- **Error types are Debug-only:** `sev::error::UserApiError` and
+  `AttestationReportError` derive only `Debug` (no `Display`), so the
+  `tracing::warn!` sites use `{e:?}`.
+- **No more temp files:** the old path round-tripped through
+  `/tmp/snp_report_fresh.bin`, `/tmp/snp_req_fresh.bin`, and `/tmp/snp_certs/`.
+  The in-process path holds everything in memory — `get_ext_report` returns the
+  report bytes and cert table directly.
+- **Nonce generation:** `rand::RngCore::fill_bytes(&mut rand::rng(), &mut
+  nonce)` (rand 0.9), matching the crate's existing nonce idiom. The firmware
+  echoes the 64 bytes into `ar.report_data`; the code asserts the echo matches
+  and is non-zero before publishing `report_data`.
+- **Verification (live, ground truth):** on the SEV-SNP Milan instance the
+  expert tree output is **byte-identical** (md5 `62bb5c46…`) to the pre-migration
+  (item-4) state: `SEV-SNP per-VM key + TSME (AMD-root-anchored)` verdict
+  `true`, guest policy `0x2030000`, `report signed with vlek; ECC on`,
+  `SNP firmware 1.58.1 (TCB microcode 222)`, report signature + TCB verified,
+  and the full `VLEK (CN=SEV-VLEK, valid to Mar  9 19:30:05 2027) ← ASVK
+  (SEV-VLEK-Milan) ← ARK (ARK-Milan, SHA-256 69d063b4…)` anchor.
+- **Offline fixture proof:** `data/snp-report-fixture.bin` (1184 B real
+  firmware report) + `snp-request-fixture.bin` (the 64-byte nonce) +
+  `snp-vlek-fixture.pem` (the live VLEK cert) are now shipped in the crate and
+  asserted by two tests: `snp_report_fields_match_baseline` (every typed field
+  equals the live values above, including the nonce echo) and
+  `snp_report_anchors_to_amd_root` (report signature + VLEK→ASVK→ARK chain
+  verify offline, no `/dev/sev-guest`).
+- **Deletions (as scoped):** `field_value`, `field_bool`, `policy_hex`,
+  `hex_block`, `snpguest_exit_ok`, the `SNP_DISPLAY` fixture, and
+  `snpguest_field_parsing`. `pem_to_der`/`cert_cn`/`cert_not_after` survive
+  (Nitro path + the VLEK CN/notAfter now read from the DER in the cert table).
+- **Binary size:** +0.26 MB (14.4 → 14.66 MB release musl static) for the sev
+  `crypto_nossl` stack (p384/p256/p521/cx448/rsa/dsa + x509-cert). With this
+  item, the bootproof crate has **zero** `Command::new` sites left.
+
 ## 5. OpenPGP: replace `gpg` (site 5) with the `pgp` crate (rPGP)
 
 **Library:** `pgp` (the rPGP project) 0.16–0.20. MSRV 1.85 (≤0.17) / 1.88
