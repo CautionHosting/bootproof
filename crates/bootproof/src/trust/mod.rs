@@ -1171,13 +1171,7 @@ fn collect_guest() -> GuestFacts {
                 .and_then(|v| v.split_whitespace().next())
                 .and_then(|v| v.parse().ok())
         });
-    f.sshd = Path::new("/etc/ssh/sshd_config").exists()
-        || std::process::Command::new("pgrep")
-            .arg("-x")
-            .arg("sshd")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+    f.sshd = Path::new("/etc/ssh/sshd_config").exists() || process_running("sshd");
     f.serial_console = std::fs::read_to_string("/proc/cmdline")
         .map(|c| c.contains("console=ttyS"))
         .unwrap_or(false);
@@ -1235,6 +1229,27 @@ fn imds_http(method: &str, path: &str, extra_header: Option<&str>) -> Option<Str
     } else {
         Some(body)
     }
+}
+
+/// Is a process with exactly this `/proc/[pid]/comm` currently running?
+/// In-process equivalent of `pgrep -x <name>` (no external binary).
+fn process_running(name: &str) -> bool {
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+    for entry in entries.flatten() {
+        let fname = entry.file_name();
+        let Some(s) = fname.to_str() else { continue };
+        if !s.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let comm = std::fs::read_to_string(entry.path().join("comm")).ok();
+        if comm.as_deref().map(|c| c.trim() == name).unwrap_or(false) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Key kernel hardening options from /proc/config.gz (name, enabled).
