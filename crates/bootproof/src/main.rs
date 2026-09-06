@@ -296,7 +296,7 @@ enum Command {
         /// Lookaside base URL (e.g. https://sigs.stagex.tools).
         #[arg(long)]
         lookaside: Option<String>,
-        /// PGP keyring to verify found signatures against (needs gpg).
+        /// PGP keyring to verify found signatures against (in-process, rPGP).
         #[arg(long)]
         keyring: Option<PathBuf>,
         /// Print every package line, not just a summary.
@@ -354,10 +354,14 @@ fn hex_to_bytes(s: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 fn main() -> anyhow::Result<()> {
+    // The pgp (rPGP) crate logs WARN while parsing the maintainer keyring --
+    // it skips non-critical generic subkey signatures that GnuPG tolerates.
+    // That is expected, not an error; keep the CLI output clean. Re-enable
+    // with RUST_LOG=pgp=warn if ever diagnosing a keyring.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "warn".into()),
+                .unwrap_or_else(|_| "warn,pgp=off".into()),
         )
         .init();
 

@@ -1,6 +1,6 @@
 # bootproof self-containment: killing the external-binary dependencies
 
-Status: in progress — items 1–3 done (gzip, pgrep, lsblk), items 4–6 pending
+Status: in progress — items 1–4 done (gzip, pgrep, lsblk, gpg), items 5–6 pending
 Date: 2026-09-06
 Branch: `lance/tpm2-qname` (this doc is at `534bd6c`)
 
@@ -295,6 +295,43 @@ crates (4.2 MB in the proof binary vs 940 KB for the sev proof). If binary
 size matters, `pgp = { version = "0.16", default-features = false,
 features = ["decompress", "armor"] }` plus the `std`/`rand`/`crypto-...`
 feature set used by the proof -- to be trimmed during implementation.
+
+### 5.4 Implementation (done) — findings that diverged from the recipe above
+
+- **API drift (0.20):** `PublicOrSecret::from_reader_many` returns
+  `Result<(Box<dyn Iterator<Item=Result<PublicOrSecret>>>, Option<headers>)>`,
+  and `SignedPublicKey` has **no** `verify_keys()` method. The working shape:
+  destructure the tuple, `filter_map(Result::ok)`, then check the primary with
+  `msg.verify(&k)` and iterate `k.public_subkeys` explicitly. `verify` takes
+  `&self` and is safe to call repeatedly on one parsed `Message` (the literal
+  data is already hashed by the preceding `read_to_end`).
+- **The old gpg exec was silently broken on GnuPG 2.x.** gpg 2.4.7 **cannot
+  read the shipped keyring file at all**: `--list-keys` shows 0 keys and
+  `--verify` exits 2 ("No public key"), because the file is a raw OpenPGP
+  packet stream and modern GnuPG wants kbx. After `gpg --import` into a real
+  kbx, the same file yields "Good signature". So the pre-migration
+  `verify_sig_gpg` returned `false` for a valid signature on any GnuPG 2.x
+  host. The rPGP migration removes the exec **and fixes a latent
+  provenance false-negative**.
+- **Cross-validation (ground truth, both directions):** for the pinned
+  `core-bash@sha256=5b598c14…` entry, rPGP reported `pgp=YYYNY` (5 sigs);
+  gpg (via imported kbx) reported GOOD/GOOD/GOOD/FAIL(no public key)/GOOD —
+  exact match, and the single N is a true negative (that signing key is
+  genuinely absent from the keyring). RSA and EdDSA keys both verified.
+  The verifying fingerprint for signature-1 is the pinned
+  `67553fbda46bb71abd2e0b0b8e47a1ec35a1551d`, asserted in the test.
+- **Quorum design note:** there are 8 `core-bash@sha256=…` rebuild entries,
+  each signed by a different maintainer key; the integration test must pin the
+  exact entry (readdir order is arbitrary) or it will verify against whichever
+  key happened to be first.
+- **Log noise:** pgp emits `WARN` ("ignoring unexpected signature
+  CertGeneric after Subkey packet") while parsing the keyring — benign
+  (non-critical subkey self-signatures GnuPG tolerates). The default
+  subscriber filter is now `warn,pgp=off`; a `RUST_LOG` in the environment
+  still overrides it, as intended.
+- **Binary size:** +3.4 MB (11.0 → 14.4 MB release musl static) for
+  in-process OpenPGP. Accepted: this is the price of not shipping a `gpg`
+  dependency, and the binary is already `FROM scratch`.
 
 ## 6. The trivial replacements (sites 6–8)
 

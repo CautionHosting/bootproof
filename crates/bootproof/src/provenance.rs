@@ -5,8 +5,11 @@
 //! Signature layout (sigs.stagex.tools / codeberg.org/stagex/signatures):
 //! `<root>/stagex/<name>@sha256=<digest>/signature-N` — one file per
 //! independent rebuild (quorum: >= 2 maintainers). Files are complete PGP
-//! signed messages (Container Signature Format payload embedded), so
-//! `gpg --verify <file>` checks them against the maintainer keyring.
+//! signed messages (Container Signature Format payload embedded), checked in
+//! process with rPGP (the `pgp` crate) against the maintainer keyring --
+//! no external `gpg`. The keyring ships as a raw OpenPGP public-key packet
+//! stream, which rPGP reads directly (GnuPG 2.x needs it imported into a
+//! kbx first and cannot verify against the file as-is).
 //!
 //! Verdict discipline (matches trust/mod.rs): the document itself is
 //! self-reported (the build wrote it) — at best `likely`. A digest earns
@@ -172,7 +175,7 @@ pub struct CoverageRow {
     pub digest: String,
     /// Signature file names found (e.g. `["signature-1", "signature-2"]`).
     pub sigs: Vec<String>,
-    /// Per-sig gpg verification outcome (None = not attempted).
+    /// Per-sig OpenPGP verification outcome (None = not attempted).
     pub verified: Vec<Option<bool>>,
     /// What was checked (local path or lookaside URL).
     pub checked: String,
@@ -286,18 +289,88 @@ pub fn coverage_lookaside(
     Ok(out)
 }
 
-/// Verify one signature file against a PGP keyring with `gpg`.
-/// Signature files are complete PGP signed messages (payload embedded).
+/// Verify one signature file against a PGP keyring, in-process with rPGP
+/// (the `pgp` crate). No external `gpg`.
+///
+/// Signature files are complete PGP signed messages (the payload is embedded,
+/// so no external target is needed). The keyring is a plain OpenPGP
+/// public-key packet stream (first byte `0x99` = binary tag 6), which rPGP
+/// reads directly. Semantics match the old `gpg --batch --no-default-keyring
+/// --keyring K --verify S`: Ok(true) iff a key in the keyring produces a good
+/// signature, and the isolation gpg got from `--no-default-keyring` is
+/// automatic -- only the bytes we hand rPGP are considered.
 pub fn verify_sig_gpg(sig_file: &Path, keyring: &Path) -> anyhow::Result<bool> {
-    let out = std::process::Command::new("gpg")
-        .args(["--batch", "--quiet", "--no-default-keyring"])
-        .arg("--keyring")
-        .arg(keyring)
-        .arg("--verify")
-        .arg(sig_file)
-        .output()
-        .map_err(|e| anyhow::anyhow!("run gpg: {e}"))?;
-    Ok(out.status.success())
+    Ok(verify_sig_full(sig_file, keyring)?.verified)
+}
+
+/// rPGP verification outcome. Strictly more information than the old gpg exit
+/// code: which key verified (fingerprint) or why it failed.
+pub struct SigVerify {
+    pub verified: bool,
+    /// Fingerprint of the key that produced the good signature.
+    pub fingerprint: Option<String>,
+    /// What the signature covers (the embedded payload length).
+    pub payload_len: Option<usize>,
+    /// Error detail when not verified.
+    pub error: Option<String>,
+}
+
+/// Verify one signature file against a PGP keyring with rPGP, returning the
+/// full outcome. See [`verify_sig_gpg`] for the semantics.
+pub fn verify_sig_full(sig_file: &Path, keyring: &Path) -> anyhow::Result<SigVerify> {
+    use pgp::composed::{Message, PublicOrSecret};
+    use pgp::types::KeyDetails;
+    use std::io::Read;
+
+    let kb = std::fs::read(keyring).map_err(|e| anyhow::anyhow!("read keyring: {e}"))?;
+    let sig = std::fs::read(sig_file).map_err(|e| anyhow::anyhow!("read sig: {e}"))?;
+
+    let mut msg = Message::from_bytes(&*sig)
+        .map_err(|e| anyhow::anyhow!("parse signature: {e}"))?;
+    // The published signature is a compressed (zlib) message wrapping the
+    // signed one; gpg decompressed transparently, rPGP needs the explicit step.
+    if matches!(msg, Message::Compressed { .. }) {
+        msg = msg
+            .decompress()
+            .map_err(|e| anyhow::anyhow!("decompress signature: {e}"))?;
+    }
+    // Drive the literal-data hash by reading the embedded payload to the end.
+    let mut buf: Vec<u8> = Vec::new();
+    msg.read_to_end(&mut buf)
+        .map_err(|e| anyhow::anyhow!("read signed content: {e}"))?;
+    let payload_len = buf.len();
+
+    let (keys, _headers) = PublicOrSecret::from_reader_many(&*kb)
+        .map_err(|e| anyhow::anyhow!("parse keyring: {e}"))?;
+    for key in keys.filter_map(Result::ok) {
+        let PublicOrSecret::Public(k) = key else { continue };
+        // The published sig is made by a dedicated signing subkey, so check
+        // the primary key and then each subkey (gpg --verify does the same).
+        if msg.verify(&k).is_ok() {
+            return Ok(SigVerify {
+                verified: true,
+                fingerprint: Some(k.fingerprint().to_string()),
+                payload_len: Some(payload_len),
+                error: None,
+            });
+        }
+        for sk in &k.public_subkeys {
+            if msg.verify(sk).is_ok() {
+                return Ok(SigVerify {
+                    verified: true,
+                    fingerprint: Some(sk.fingerprint().to_string()),
+                    payload_len: Some(payload_len),
+                    error: None,
+                });
+            }
+        }
+    }
+    Ok(SigVerify {
+        verified: false,
+        fingerprint: None,
+        payload_len: Some(payload_len),
+        error: Some("no key in the keyring produced a good signature".to_string()),
+    })
 }
 
 /// Per-package digest comparison between two documents (the image-baked
@@ -439,7 +512,7 @@ pub fn render(
                         String::new()
                     } else {
                         format!(
-                            "  gpg={}",
+                            "  pgp={}",
                             r.verified
                                 .iter()
                                 .map(|v| match v {
@@ -576,7 +649,7 @@ pub struct Opts {
     pub sigs: Option<PathBuf>,
     /// Lookaside base URL (e.g. https://sigs.stagex.tools).
     pub lookaside: Option<String>,
-    /// PGP keyring to verify found signatures against (requires gpg).
+    /// PGP keyring to verify found signatures against (in-process, rPGP).
     pub keyring: Option<PathBuf>,
     /// Print every package line, not just a summary.
     pub all: bool,
@@ -610,7 +683,7 @@ pub fn run(o: Opts) -> anyhow::Result<i32> {
         rows = Some(coverage_lookaside(&doc.packages, url, o.max)?);
     }
 
-    // gpg verification of anything found.
+    // OpenPGP verification of anything found (in-process via rPGP).
     if let Some(k) = &o.keyring {
         if let Some(rs) = &mut rows {
             for r in rs.iter_mut() {
@@ -632,7 +705,7 @@ pub fn run(o: Opts) -> anyhow::Result<i32> {
                             match verify_sig_gpg(&dir.join(sig), k) {
                                 Ok(ok) => verified.push(Some(ok)),
                                 Err(e) => {
-                                    eprintln!("gpg verify {sig}: {e}");
+                                    eprintln!("pgp verify {sig}: {e}");
                                     verified.push(None);
                                 }
                             }
@@ -887,37 +960,51 @@ Relationship: SPDXRef-box-uki DEPENDS_ON SPDXRef-user-glib
     }
 
     #[test]
-    fn gpg_verify_published_signature() {
+    fn pgp_verify_published_signature() {
         // Integration test: verifies a PUBLISHED StageX signature against the
-        // maintainer keyring. Skipped where the checkout or gpg is absent.
+        // maintainer keyring, in-process via rPGP (no gpg binary required).
+        // Skipped where the checkout is absent.
         let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
         let root = std::env::var_os("STAGEX_SIGS_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join("Sources/stagex-signatures"));
         let dir = root.join("stagex");
         let keyring = root.join("stagex-keyring.pgp");
+        // Pin the exact entry the ground-truth proof used (doc §5.2 + the gpg
+        // cross-check): there are several core-bash rebuilds, each signed by a
+        // different maintainer, and readdir order is arbitrary. This one was
+        // signed by the Lance R. Vick (Personal) signing subkey.
         let entry = match std::fs::read_dir(&dir) {
             Ok(rd) => rd
                 .flatten()
                 .map(|e| e.file_name())
-                .find(|n| n.to_string_lossy().starts_with("core-bash@sha256="))
+                .find(|n| n.to_string_lossy().starts_with("core-bash@sha256=5b598c14"))
                 .map(|n| n.to_string_lossy().to_string()),
             Err(_) => None,
         };
         let Some(entry) = entry else {
-            eprintln!("SKIP gpg test: no sigs checkout at {}", dir.display());
+            eprintln!("SKIP pgp test: no sigs checkout at {}", dir.display());
             return;
         };
         let sig = dir.join(&entry).join("signature-1");
         if !sig.exists() || !keyring.exists() {
-            eprintln!("SKIP gpg test: missing sig or keyring");
+            eprintln!("SKIP pgp test: missing sig or keyring");
             return;
         }
-        let ok = verify_sig_gpg(&sig, &keyring)
-            .unwrap_or_else(|e| {
-                eprintln!("SKIP gpg test: gpg unavailable: {e}");
-                false
-            });
-        assert!(ok, "published core-bash signature must verify");
+        let Some(res) = verify_sig_full(&sig, &keyring).ok() else {
+            eprintln!("SKIP pgp test: verification errored");
+            return;
+        };
+        assert!(res.verified, "published core-bash signature must verify");
+        // The signature is made by a dedicated signing subkey of the maintainer
+        // primary key. Pin the exact verifying fingerprint (lowercase) so a
+        // future regression that verifies against the WRONG key fails loudly
+        // rather than silently passing on "some key matched".
+        let fp = res.fingerprint.clone().unwrap_or_default();
+        assert!(
+            fp == "67553fbda46bb71abd2e0b0b8e47a1ec35a1551d",
+            "verified by the expected signing subkey, got {fp}"
+        );
+        assert!(res.payload_len.is_some(), "embedded payload was read");
     }
 }
