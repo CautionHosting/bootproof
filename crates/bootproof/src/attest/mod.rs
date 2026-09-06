@@ -90,26 +90,42 @@ impl Identity {
                 };
                 (secret, cert_der)
             }
-            None => match (read_if_exists(&key_path), read_if_exists(&cert_path)) {
-                (Some(k), Some(c)) => {
-                    let pem = std::str::from_utf8(&k)
-                        .map_err(|_| anyhow::anyhow!("identity.pk8 is not PEM text"))?;
-                    let der = pkcs8_der_from_pem(pem)?;
-                    (scalar_from_pkcs8(&der)?, c)
-                }
-                _ => {
-                    let mut b = [0u8; 48];
-                    rand::RngCore::fill_bytes(&mut rand::rng(), &mut b);
-                    let sk = p384::SecretKey::from_slice(&b)
-                        .map_err(|e| anyhow::anyhow!("generated scalar rejected: {e}"))?;
-                    let secret = sk.to_bytes().to_vec().try_into().unwrap();
-                    let cert_der = make_cert(&secret, node_id)?;
-                    std::fs::create_dir_all(state)?;
-                    std::fs::write(&key_path, pkcs8_pem(&secret)?)?;
-                    std::fs::write(&cert_path, &cert_der)?;
-                    (secret, cert_der)
-                }
-            },
+            None => {
+                let (k, c) = (read_if_exists(&key_path), read_if_exists(&cert_path));
+                // Load the stored identity only when both files are present
+                // and parse cleanly. A file that exists but is truncated or
+                // corrupted — e.g. a hard reset interrupted the write — is
+                // treated as absent and the identity is regenerated instead
+                // of erroring, which would crash-loop under restart="always".
+                // A regenerated identity has a fresh SPKI pin (the pin must
+                // be re-established).
+                let stored = match (k, c) {
+                    (Some(k), Some(c)) if !c.is_empty() => {
+                        std::str::from_utf8(&k)
+                            .ok()
+                            .and_then(|pem| pkcs8_der_from_pem(pem).ok())
+                            .and_then(|der| scalar_from_pkcs8(&der).ok())
+                            .map(|s| (s, c))
+                    }
+                    _ => None,
+                };
+                let (secret, cert_der) = match stored {
+                    Some((s, c)) => (s, c),
+                    None => {
+                        let mut b = [0u8; 48];
+                        rand::RngCore::fill_bytes(&mut rand::rng(), &mut b);
+                        let sk = p384::SecretKey::from_slice(&b)
+                            .map_err(|e| anyhow::anyhow!("generated scalar rejected: {e}"))?;
+                        let secret = sk.to_bytes().to_vec().try_into().unwrap();
+                        let cert_der = make_cert(&secret, node_id)?;
+                        std::fs::create_dir_all(state)?;
+                        std::fs::write(&key_path, pkcs8_pem(&secret)?)?;
+                        std::fs::write(&cert_path, &cert_der)?;
+                        (secret, cert_der)
+                    }
+                };
+                (secret, cert_der)
+            }
         };
 
         Ok(Self {
