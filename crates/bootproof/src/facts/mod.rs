@@ -133,30 +133,140 @@ fn kernel_release() -> Option<String> {
     }
 }
 
-/// Block-device / volume layout. Prefers `lsblk`; falls back to
-/// /proc/partitions if lsblk is unavailable or fails.
+/// Block-device / volume layout, built entirely in-process from sysfs +
+/// /proc/self/mounts (no external lsblk).
+///
+/// One line per block device, in (major, minor) order:
+/// `NAME  SIZE(bytes)  TYPE  FSTYPE  MOUNTPOINT`.
+///
+/// - NAME comes from the kernel's canonical block name. SIZE comes from
+///   /proc/partitions (1024-byte blocks), which covers whole disks and
+///   partitions uniformly.
+/// - TYPE is grounded, not inferred from a superblock probe: `part` for a
+///   partition (a device with no sysfs `range` attribute), `crypt` for a
+///   dm-crypt target (dm/uuid `CRYPT-*`), else `disk`.
+/// - FSTYPE/MOUNTPOINT come from /proc/self/mounts. The mount source may be a
+///   path (e.g. `/dev/mapper/home`), which is canonicalized to a canonical
+///   block name before matching. Only devices actually mounted report a
+///   filesystem type; we do not probe superblocks of unmounted devices.
 fn disk_summary() -> Vec<String> {
-    if let Ok(out) = std::process::Command::new("lsblk")
-        .args(["-bno", "NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT"])
-        .output()
-    {
-        if out.status.success() {
-            let lines: Vec<String> = String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .skip(1)
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(str::to_string)
-                .collect();
-            if !lines.is_empty() {
-                return lines;
+    let devdir = std::path::Path::new("/sys/dev/block");
+    let entries: Vec<std::path::PathBuf> = match devdir.read_dir() {
+        Ok(rd) => rd.flatten().map(|e| e.path()).collect(),
+        // /sys/dev/block unavailable (unusual container): fall back to the
+        // kernel's raw partition table, as before.
+        Err(_) => {
+            return match std::fs::read_to_string("/proc/partitions") {
+                Ok(s) => s.lines().skip(2).map(str::to_string).collect(),
+                Err(_) => Vec::new(),
+            };
+        }
+    };
+
+    // (major, minor) -> size in bytes, from the kernel's partition table.
+    // /proc/partitions gives 1024-byte block counts for every device, whole
+    // disk and partition alike, which is the uniform authoritative source.
+    let mut size_of: std::collections::HashMap<(u32, u32), u64> =
+        std::collections::HashMap::new();
+    if let Ok(p) = std::fs::read_to_string("/proc/partitions") {
+        for line in p.lines().skip(1) {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() >= 3 {
+                if let (Ok(m), Ok(mi), Ok(b)) =
+                    (f[0].parse(), f[1].parse(), f[2].parse::<u64>())
+                {
+                    size_of.insert((m, mi), b * 1024);
+                }
             }
         }
     }
-    match std::fs::read_to_string("/proc/partitions") {
-        Ok(s) => s.lines().skip(2).map(str::to_string).collect(),
-        Err(_) => Vec::new(),
+
+    // (major, minor) -> canonical block name. RAM (ram*) and loopback (loop*)
+    // devices are excluded: the storage summary is about block storage, and
+    // the tree's real_storage_lines() guard assumes they are not listed.
+    let mut keyed: Vec<(u32, u32, String)> = Vec::new();
+    for p in &entries {
+        let dev = match p.file_name().and_then(|x| x.to_str()) {
+            Some(d) => d.to_string(),
+            None => continue,
+        };
+        let Ok(link) = std::fs::read_link(p) else { continue };
+        let name = match link.file_name().and_then(|x| x.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        if name.starts_with("ram") || name.starts_with("loop") {
+            continue;
+        }
+        let (major, minor): (u32, u32) = match dev.split_once(':') {
+            Some((a, b)) => match (a.parse(), b.parse()) {
+                (Ok(m), Ok(n)) => (m, n),
+                _ => continue,
+            },
+            None => continue,
+        };
+        keyed.push((major, minor, name));
     }
+    keyed.sort_by_key(|(maj, min, _)| (*maj, *min));
+
+    // canonical block name -> (major, minor), for resolving mount paths.
+    let mut name_to_key: std::collections::HashMap<String, (u32, u32)> =
+        std::collections::HashMap::new();
+    for (major, minor, name) in &keyed {
+        name_to_key.insert(name.clone(), (*major, *minor));
+    }
+
+    // (major, minor) -> (fstype, mountpoint) from the kernel's mount table.
+    let mut mounts: std::collections::HashMap<(u32, u32), (String, String)> =
+        std::collections::HashMap::new();
+    if let Ok(m) = std::fs::read_to_string("/proc/self/mounts") {
+        for line in m.lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() < 3 {
+                continue;
+            }
+            // The device field is a path (e.g. /dev/mapper/home, /dev/nvme0n1p1).
+            // Canonicalize it to resolve symlinks down to a canonical block name.
+            let dev = f[0];
+            if !dev.starts_with('/') {
+                continue;
+            }
+            let Ok(resolved) = std::fs::canonicalize(dev) else { continue };
+            let Some(name) = resolved.file_name().and_then(|x| x.to_str()) else {
+                continue;
+            };
+            if let Some(&k) = name_to_key.get(name) {
+                mounts.insert(k, (f[2].to_string(), f[1].to_string()));
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for (major, minor, name) in &keyed {
+        let bytes = size_of.get(&(*major, *minor)).copied().unwrap_or(0);
+
+        // Whole-disk vs partition: the kernel exposes the `range` attribute
+        // only on whole disks (e.g. nvme0n1/range = "0"); partitions have no
+        // range file. This is authoritative and avoids any name guessing.
+        let is_part = !std::path::PathBuf::from(format!("/sys/block/{name}/range")).exists();
+
+        let crypt = name.starts_with("dm-")
+            && std::fs::read_to_string(format!("/sys/block/{name}/dm/uuid"))
+                .map(|u| u.trim().starts_with("CRYPT-"))
+                .unwrap_or(false);
+
+        let typ = if crypt { "crypt" } else if is_part { "part" } else { "disk" };
+
+        let (fstype, mp) = mounts
+            .get(&(*major, *minor))
+            .cloned()
+            .unwrap_or_default();
+
+        out.push(
+            format!("{name:<16} {bytes:>18}  {typ:<4}  {fstype:<11}  {mp}").trim_end().to_string(),
+        );
+    }
+    out
 }
 
 /// TPM vendor + firmware version via get_property.

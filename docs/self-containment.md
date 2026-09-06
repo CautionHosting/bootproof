@@ -1,6 +1,6 @@
 # bootproof self-containment: killing the external-binary dependencies
 
-Status: research complete, implementation pending
+Status: in progress — items 1–3 done (gzip, pgrep, lsblk), items 4–6 pending
 Date: 2026-09-06
 Branch: `lance/tpm2-qname` (this doc is at `534bd6c`)
 
@@ -317,6 +317,21 @@ In-process equivalent, no exec:
   everything mounted, which is everything that matters on a StageX guest.
   The `lsblk`-broken-on-Milan (missing `libncursesw`) note in
   `docs/trust-tree.md:40–44` goes away entirely.
+
+Implementation (done): two findings diverged from the plan above.
+- **SIZE**: `/sys/block/<name>/size` does not exist for partitions on the
+  Milan guest (only under the parent, `/sys/block/nvme0n1/nvme0n1p1/size`).
+  The uniform source is `/proc/partitions` (1024-byte block counts), which
+  matches `lsblk -b` byte-for-byte for every device, disk and partition.
+- **FSTYPE/MOUNTPOINT**: the mount source in `/proc/self/mounts` is a *path*
+  (e.g. `/dev/mapper/home` for the LUKS home volume), not a device number.
+  It is canonicalized (symlinks resolved) to a canonical block name before
+  matching, which restores the `/home` mountpoint + its `ext4` fstype.
+- **Intentional diff**: the baseline carried `vfat` (nvme0n1p1) and
+  `crypto_LUKS` (nvme1n1) tokens from libblkid superblock-probing *unmounted*
+  devices. This replacement reports fstype only for devices actually mounted,
+  so those two tokens are dropped. That is the honest, grounded behavior
+  recommended above, not a regression.
 
 ### 6.2 `pgrep` → `/proc` scan
 
