@@ -482,16 +482,22 @@ SEV-SNP/OpenPGP/disk/host facts to work. The tool degrades from "silently
 
 ## 11. Implementation plan (per-item, each independently shippable)
 
-1. **flate2** (1 line + 1 function) → drop `gzip` exec.
-2. **pgrep → /proc** (1 function) → drop `pgrep` exec.
-3. **lsblk → sysfs + mounts** (1 function + fallbacks) → drop `lsblk` exec.
-4. **rPGP** in `provenance.rs` (replace `verify_sig_gpg` internals; keep the function signature, gain the fingerprint return) → drop `gpg` exec.
-5. **sev** in `trust/mod.rs`: `Firmware::open` + `get_ext_report` for fetch + VLEK; `AttestationReport::decode` for facts; `Chain` from pinned PEMs for `amd_chain_ok`/`vlek_verified`; delete the text-parser section (4.3 deletion scope). → drop all four `snpguest` execs.
+Status (2026-09-06): items 1–5 **done** (each verified on the live SEV-SNP
+instance and committed: gzip, pgrep, lsblk, rPGP, sev). Item 6 (help text /
+docs) in progress. Item 7 (offline regression fixtures) partially done — the
+SNP report + VLEK + request fixtures are in-tree (see §4.4); the StageX
+signature + keyring fixtures remain.
+
+1. **flate2** (1 line + 1 function) → drop `gzip` exec. ✅
+2. **pgrep → /proc** (1 function) → drop `pgrep` exec. ✅
+3. **lsblk → sysfs + mounts** (1 function + fallbacks) → drop `lsblk` exec. ✅
+4. **rPGP** in `provenance.rs` (replace `verify_sig_gpg` internals; keep the function signature, gain the fingerprint return) → drop `gpg` exec. ✅
+5. **sev** in `trust/mod.rs`: `Firmware::open` + `get_ext_report` for fetch + VLEK; `AttestationReport::decode` for facts; `Chain` from pinned PEMs for `amd_chain_ok`/`vlek_verified`; delete the text-parser section (4.3 deletion scope). → drop all four `snpguest` execs. ✅ (findings: §4.4)
 6. Update `README.md:115`, `main.rs:299` ("needs gpg" help text),
-   `docs/agent-design.md:186,192`, `docs/trust-tree.md:40–44`.
+   `docs/agent-design.md:186,192`, `docs/trust-tree.md:40–44`. ⏳
 7. Offline regression fixtures in-tree: the real SNP report + VLEK + request
    (Section 12 hashes) and the real StageX signature + keyring, so CI proves
-   both migrations without AWS or gpg.
+   both migrations without AWS or gpg. ⏳ (SNP fixtures in; StageX pending)
 
 Order 1–3 first (zero-risk, immediate), then 4, then 5 (the load-bearing one,
 last, behind the fixture tests from 7).

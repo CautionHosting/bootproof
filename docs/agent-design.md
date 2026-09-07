@@ -189,7 +189,9 @@ From the SEV-SNP ABI + kernel docs + `virtee/snpguest` / `google/go-sev-guest`:
   0x050–0x090), **covered by the AMD ECDSA P-384 signature** (covers 0x0–0x29F).
   The SNP **nonce slot**.
 - Guest request: `/dev/sev-guest` → `SNP_GET_REPORT` ioctl → firmware
-  `MSG_REPORT_REQ` (VMPCK-protected). Tooling: `snpguest report <out> <64B>`.
+  `MSG_REPORT_REQ` (VMPCK-protected). (Upstream tooling does this as
+  `snpguest report <out> <64B>`; bootproof issues the ioctl in-process via
+  the sev crate.)
 - Report: `MEASUREMENT` (SHA-384 launch digest: kernel, cmdline, initrd,
   OVMF), `GUEST_SVN`, `POLICY`, `FAMILY_ID`, `IMAGE_ID`, `PLATFORM_INFO`,
   `HOST_DATA`, `REPORT_DATA`, `ID_KEY_DIGEST`, `LAUNCH/CURRENT/REPORTED_TCB`,

@@ -283,7 +283,7 @@ struct NitroFacts {
     user_data: Option<Vec<u8>>,
 }
 
-/// SEV-SNP attestation-report evidence (from `snpguest display report`).
+/// SEV-SNP attestation-report evidence (in-process via the sev crate).
 #[derive(Debug, Clone, Default)]
 struct SnpFacts {
     /// Whether `/dev/sev-guest` is present.

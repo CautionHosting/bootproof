@@ -42,7 +42,7 @@ pub struct Facts {
     /// Kernel release string (from `/proc/sys/kernel/osrelease`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kernel: Option<String>,
-    /// Block-device / volume layout (lsblk summary lines).
+    /// Block-device / volume layout (summary lines, from sysfs + mounts).
     #[serde(default)]
     pub disks: Vec<String>,
     /// TPM identifying properties (if a TPM was available).

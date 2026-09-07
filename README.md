@@ -112,7 +112,7 @@ and renders a Provenance branch; the deep check is:
 ```
 bootproof provenance --path /provenance.spdx \
     --sigs /root/stagex-signatures \        # local checkout of codeberg.org/stagex/signatures
-    --keyring /root/stagex-signatures/stagex-keyring.pgp   # gpg-verify found signatures
+    --keyring /root/stagex-signatures/stagex-keyring.pgp   # in-process (rPGP) verification of found signatures
 
 # unsigned dev build? rebuild at the pinned commit and confirm:
 git checkout <commit> && make <target>

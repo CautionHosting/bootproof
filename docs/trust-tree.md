@@ -39,16 +39,19 @@ Final rendered verdicts on the c6a.large / StageX / us-east-2 instance:
 Implementation notes beyond the design above:
 - OS detection falls back to NAME/ID when PRETTY_NAME is absent (StageX ships
   `NAME="[Stageˣ]"`, `ID=stagex`, no PRETTY_NAME) — done in `facts/mod.rs`.
-- `lsblk` is broken on StageX (missing libncursesw); Storage falls back to
-  /proc/partitions and the tree filters out ram*/loop* devices.
+- Storage reads the block layout from `/sys/block` (+ `/proc/partitions` for
+  sizes, + `/proc/self/mounts` for mountpoints) — no `lsblk`. (lsblk is
+  broken on StageX anyway: missing libncursesw.) The tree filters out
+  ram*/loop* devices.
 - IMDS v2 is FULLY working on this instance (token + all
   `latest/meta-data/*` paths, including `placement/*`, `instance-type`,
   `iam/info` — which answers JSON, not a bare ARN). Earlier "restricted
   IMDS" notes were stale.
 - Run requires tpm-bridge up + `serve` stopped (single-connection bridge).
-- 31 unit tests across `trust/mod.rs` + `provenance.rs` (verdict display,
-  region CN parsing, snpguest text parsing, branch order, JSON roundtrip,
-  unknown degradation, 80-column wrapping, cross-attestation binding, IIDD
+- 38 unit tests across `trust/mod.rs` + `provenance.rs` + others (verdict
+  display, region CN parsing, SEV-SNP fixture report decode + field values +
+  AMD-root anchor, branch order, JSON roundtrip, unknown degradation,
+  80-column wrapping, cross-attestation binding, IIDD
   DSA verification against the pinned cert, IIDD custody upgrade,
   NSM user_data echo, provenance SPDX parse + sig coverage).
 
@@ -239,9 +242,13 @@ pinned source commit proves the digests.
   echoes caller `user_data` into the signed document; 8 KiB request limit) ->
   `parse_attestation_document` (module_id, pcrs, cert, cabundle, user_data) ->
   `Nitro::with_pcr_policy(doc, policy).verify(now, &nonce)` -> region from cert CNs.
-- `collect_snp()`: `snpguest report /tmp/snp_report.bin /tmp/snp_req.bin -r`
-  (if absent) then `snpguest display report /tmp/snp_report.bin`; parse the
-  display TEXT (not the binary) for CPUID/policy/TSME/VMPL/measurement/TCB.
+- `collect_snp()`: in-process SEV-SNP attestation (sev crate, `crypto_nossl`).
+  Opens `/dev/sev-guest`, issues SNP_GET_EXT_REPORT with a fresh in-process
+  64-byte nonce (the cross-attestation binding nonce), decodes the typed
+  `AttestationReport` for CPUID/policy/TSME/VMPL/measurement/TCB, and pulls
+  the VLEK X.509 cert from the report's certificate table. Then verifies the
+  report signature (ECDSA P-384/SHA-384) and the VLEK → ASVK (SEV-VLEK-Milan)
+  → ARK (ARK-Milan, pinned) chain in-process. No snpguest, no temp files.
 - `collect_imds()`: raw-socket HTTP (IMDSv2). PUT
   `http://169.254.169.254/latest/api/token` (ttl 60) -> token; then GET
   `latest/meta-data/placement/region`,
@@ -316,10 +323,10 @@ anchored to a pinned root:
    TPM fact: full CN chain leaf→…→pinned root + root SHA-256.
 2. **AMD SEV-SNP full chain to the AMD root** — the missing piece that
    turned the four SNP facts from `likely` to `true`:
-   - `snpguest certificates pem <dir>` requests the **extended report** from
-     the AMD PSP, which on this platform returns the **VLEK X.509
-     certificate** (CN=SEV-VLEK, ECDSA P-384, per-TCB, ~1-year validity) —
-     named `vlek.pem` (it's a cert, not just a key).
+   - The extended-report request (issued in-process via the sev crate on
+     `/dev/sev-guest`) returns the **VLEK X.509 certificate** (CN=SEV-VLEK,
+     ECDSA P-384, per-TCB, ~1-year validity) in the report's **certificate
+     table** (it's a cert, not just a key).
    - The KDS **does NOT serve per-TCB VLEK leaf certs** (`/vlek/v1/{prod}/cert`
      404s for Milan and Genoa; only VCEK has a `/cert` endpoint). The VLEK
      leaf comes from the platform; the **root of trust** comes from KDS:
@@ -327,25 +334,23 @@ anchored to a pinned root:
      `kdsintf.amd.com`, no hyphen) → ASVK (CN=SEV-VLEK-Milan) + ARK
      (CN=ARK-Milan, self-signed). These are pinned in the binary at build
      time (`src/trust/data/`, provenance in data/README.md).
-   - Runtime verification (shells out to snpguest, which does the crypto):
-     `snpguest verify certs <dir>` → "ARK self-signed / ASVK signed by ARK /
-     VLEK signed by ASVK"; `snpguest verify attestation <dir> <report>` →
-     "VEK signed the Attestation Report" + TCB field matches (bl/tee/snp/
-     ucode).
+   - Runtime verification is in-process (sev crate, `crypto_nossl`):
+     `(&chain).verify()` → "ARK self-signed / ASVK signed by ARK / VLEK signed
+     by ASVK"; `(&vlek, &report).verify()` → the VLEK (ECDSA P-384/SHA-384
+     over `report[..0x2a0]`) signed the report, plus the TCB field matches
+     (bl/tee/snp/ucode).
    - KDS is unreachable from the guest (no outbound DNS); that's fine — only
      the per-build pin fetch needs it.
 3. **NOT available here:** VCEK (chip ID fully masked in the report by
    platform policy; KDS `/vcek/v1/.../cert` needs the unmasked HWID —
    dedicated-host path only). TCG EK-list/EKCA for the NitroTPM — the
    pinned AWS Nitro root is the equivalent.
-4. **Cross-attestation binding nonce** — snpguest does not randomize
-   report_data on its own; `snpguest report <rep> <req> -r` generates random
-   report_data AND writes it back into the request file (a stale
-   all-zero request file yields an all-zero report_data, which the
-   collector detects and treats as not-fresh). The collector removes both
-   files first, runs `-r`, reads report_data from the report (1184-byte
-   firmware report; report_data at file offset 0x50) and cross-checks it
-   against the request file; first 32 bytes → TPM document nonce.
+4. **Cross-attestation binding nonce** — the collector generates the 64-byte
+   nonce in-process and passes it to the extended-report request; the firmware
+   echoes it into `report_data` inside the signed report (covered by the VLEK
+   signature). The collector asserts the echo matches the nonce we sent and is
+   non-zero (an all-zero report_data means the binding would be forgeable).
+   First 32 bytes → TPM document nonce.
 5. **Signed IIDD (per-region AWS DSA certs pinned)** — proves AWS account,
    instance type, region, instance id:
    - IMDS `latest/dynamic/instance-identity/pkcs7` is a PKCS#7 (BER,
@@ -407,7 +412,7 @@ anchored to a pinned root:
 - SEV-SNP: CPUID Family 25/Model 1/Step 1, policy 0x2030000 (SMT on, Debug off,
   Page-Swap-Disable on), TSME on, ECC on, VMPL=1, vlek, version 1.58.1.
   TCB: bl=4 tee=0 snp=29 ucode=222. Chip ID fully masked (all zeros).
-  Platform serves the VLEK X.509 cert via `snpguest certificates pem` (CN=
+  Platform serves the VLEK X.509 cert in the report's certificate table (CN=
   SEV-VLEK, issuer SEV-VLEK-Milan, ECDSA P-384, valid to 2027-03-09).
 - NIC: eth0 ena, vendor 0x1d0f (Amazon), device 0xec20. No IOMMU to guest.
 - MemTotal ~3.5GB. CPU flags: smep,smap,ibpb,stibp,pdpe1gb,rdrand,rdseed.
