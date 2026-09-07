@@ -291,7 +291,9 @@ impl Verifier for Tpm2Verifier {
     }
 
     fn facts(&self, v: &Verified) -> Vec<Fact> {
-        let Verified::Tpm2(v) = v;
+        let Verified::Tpm2(v) = v else {
+            unreachable!("tpm2 facts called with a non-tpm2 Verified")
+        };
         let mut facts = Vec::new();
 
         facts.push(Fact {
@@ -375,12 +377,11 @@ impl Verifier for Tpm2Verifier {
             anchors: vec!["tpm2".into()],
             status: Status::NotProven,
         });
-        facts.push(Fact {
-            name: "memory_encryption".into(),
-            value: "no SEV-SNP channel on this node".into(),
-            anchors: vec![],
-            status: Status::NotProven,
-        });
+        // NOTE: the `memory_encryption` fact is owned by the snp channel
+        // (verify::snp::SnpVerifier): proven from a verified SEV-SNP report,
+        // NOT PROVEN with a reason when the channel is present but failing,
+        // or NOT PROVEN "absent" when the node does not serve snp at all.
+        // The tpm2 channel never claims it.
         facts.push(Fact {
             name: "enc_key".into(),
             value: "ECDH encrypt-to-machine (later phase)".into(),

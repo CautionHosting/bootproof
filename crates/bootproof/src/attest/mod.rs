@@ -28,6 +28,7 @@ use crate::channel::{Channel, Collected};
 use crate::spki::pin_of_cert;
 use crate::wire::{B64, Bundle, Info, BUNDLE_V};
 
+pub mod snp;
 pub mod tpm2;
 
 pub const DEFAULT_LISTEN: &str = "0.0.0.0:443";
@@ -259,10 +260,19 @@ async fn health() -> &'static str {
 }
 
 async fn info(State(app): State<Arc<App>>) -> Json<Info> {
+    // Report the channels this node actually serves: a channel that is
+    // registered but whose hardware is absent (e.g. snp on a non-SNP host)
+    // is filtered out so the advertised set matches the Bundle.
+    let channels: Vec<String> = app
+        .channels
+        .iter()
+        .filter(|c| c.detect())
+        .map(|c| c.name().to_string())
+        .collect();
     Json(Info {
         node_id: app.node_id.clone(),
         platform: app.platform.clone(),
-        channels: app.channels.iter().map(|c| c.name().to_string()).collect(),
+        channels,
         daemon_pubkey: app.identity.pin(),
         metadata: app.metadata.clone(),
     })
@@ -297,7 +307,11 @@ async fn attestation(
     };
 
     // Collect the non-tpm2 channels first, then the tpm2 channel last so it
-    // can fold the other docs into the slot link before quoting.
+    // can fold the other docs into the slot link before quoting. Non-tpm2
+    // channels are best-effort: a channel whose hardware is absent (or whose
+    // firmware request fails) is skipped with a warning so the Bundle degrades
+    // to the channels actually present (tpm2-only on a non-SNP host) instead
+    // of failing the request. The tpm2 channel is the mandatory core.
     let channels = app.channels.clone();
     let collected: Vec<Collected> = tokio::task::spawn_blocking(move || -> Result<Vec<Collected>, String> {
         let mut docs: Vec<Vec<u8>> = Vec::new();
@@ -306,9 +320,19 @@ async fn attestation(
             if c.name() == "tpm2" {
                 continue;
             }
-            let col = c.collect(&nonce, &docs)?;
-            docs.push(col.evidence.doc.0.clone());
-            out.push(col);
+            if !c.detect() {
+                info!(channel = c.name(), "channel inactive (hardware absent); degrading");
+                continue;
+            }
+            match c.collect(&nonce, &docs) {
+                Ok(col) => {
+                    docs.push(col.evidence.doc.0.clone());
+                    out.push(col);
+                }
+                Err(e) => {
+                    warn!(channel = c.name(), %e, "channel collect failed; degrading");
+                }
+            }
         }
         for c in channels.iter() {
             if c.name() != "tpm2" {
@@ -390,6 +414,15 @@ pub async fn run(opts: Opts) -> anyhow::Result<()> {
                 warn!("no TPM device found; the tpm2 channel is inactive");
             }
         }
+    }
+    // The snp channel is per-challenge in-process (SNP_GET_EXT_REPORT against
+    // /dev/sev-guest). Register it only when the device is present; on a
+    // non-SNP host the node serves tpm2-only and degrades gracefully.
+    if crate::snp::device_present() {
+        channels.push(Box::new(snp::Snp::new()));
+        info!("channel snp active (/dev/sev-guest)");
+    } else {
+        info!("no /dev/sev-guest; the snp channel is inactive");
     }
     let channels = Arc::new(channels);
 

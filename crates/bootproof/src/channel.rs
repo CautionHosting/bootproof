@@ -33,6 +33,7 @@ pub struct Collected {
 /// verified data the `facts()` renderer consumes.
 pub enum Verified {
     Tpm2(Tpm2Verified),
+    Snp(SnpVerified),
 }
 
 /// Verified tpm2 channel data.
@@ -54,6 +55,28 @@ pub struct Tpm2Verified {
     pub ek_cert: Option<Vec<u8>>,
 }
 
+/// Verified snp channel data: a SEV-SNP firmware attestation report that
+/// decoded, whose VLEK signature and VLEK -> ASVK -> ARK chain verified
+/// against the build-pinned roots, whose policy/VMPL met the
+/// memory-encryption requirements, and whose report_data echoed the
+/// challenge nonce.
+#[derive(Debug)]
+pub struct SnpVerified {
+    /// The raw v5 report bytes (1184).
+    pub report_bytes: Vec<u8>,
+    /// Guest policy (raw u64), e.g. 0x2030000 (debug-disabled baseline).
+    pub policy: u64,
+    /// The VMPL the guest runs at (the verifier's required VMPL).
+    pub vmpl: u32,
+    /// The 64-byte report_data (its front 32 bytes must echo the challenge
+    /// nonce; the back 32 are integrity-covered by the VLEK signature).
+    pub report_data: [u8; 64],
+    /// TSME (total memory encryption) enabled per platform info.
+    pub tsme: bool,
+    /// The SNP firmware current version string (e.g. "1.58.1").
+    pub version: String,
+}
+
 /// Verify-side: a channel verifier checks evidence offline.
 pub trait Verifier {
     /// Channel name this verifier handles.
@@ -71,4 +94,15 @@ pub trait Verifier {
 
     /// Derive the facts for a verified channel.
     fn facts(&self, v: &Verified) -> Vec<Fact>;
+
+    /// A fact this channel OWNS when its evidence is present but FAILED
+    /// verification: rendered as NOT PROVEN with the reason. A channel with
+    /// no fact it owns returns `None` (the tpm2 channel: every fact it
+    /// emits comes from a verified quote). Honest degradation: a present
+    /// but failing channel is never silently dropped.
+    fn failed_fact(&self, ev: &Evidence, reason: &str) -> Option<Fact> {
+        let _ = ev;
+        let _ = reason;
+        None
+    }
 }

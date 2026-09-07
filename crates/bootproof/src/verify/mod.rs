@@ -24,6 +24,7 @@ use crate::spki::spki_pin;
 use crate::verify::tpm2::Tpm2Verifier;
 use crate::wire::{Bundle, Fact, Status};
 
+pub mod snp;
 pub mod tpm2;
 
 pub struct Opts {
@@ -342,6 +343,7 @@ pub fn run(opts: Opts) -> anyhow::Result<i32> {
     for ev in &bundle.evidence {
         let verifier: &dyn Verifier = match ev.channel.as_str() {
             "tpm2" => &Tpm2Verifier,
+            "snp" => &crate::verify::snp::SnpVerifier,
             other => {
                 errors.push(format!("no verifier for channel {other}"));
                 continue;
@@ -349,8 +351,32 @@ pub fn run(opts: Opts) -> anyhow::Result<i32> {
         };
         match verifier.verify(ev, &nonce, &bundle) {
             Ok(v) => all_facts.extend(verifier.facts(&v)),
-            Err(e) => errors.push(format!("{}: {e}", ev.channel)),
+            // A present-but-failing channel is NOT PROVEN with the reason,
+            // never silently dropped: the channel reports the fact it owns
+            // (snp: memory_encryption), and the error is recorded too.
+            Err(e) => {
+                errors.push(format!("{}: {e}", ev.channel));
+                if let Some(f) = verifier.failed_fact(ev, &e) {
+                    all_facts.push(f);
+                }
+            }
         }
+    }
+
+    // `memory_encryption` is always reported, never silently dropped: the
+    // snp channel proves it (or reports it NOT PROVEN with a reason when
+    // present but failing); a node that does not serve the snp channel at
+    // all gets an honest NOT PROVEN "absent" fact.
+    let has_snp = bundle.evidence.iter().any(|ev| ev.channel == "snp");
+    if !has_snp {
+        all_facts.push(Fact {
+            name: "memory_encryption".into(),
+            value: "not proven: the node does not serve a SEV-SNP channel \
+                     (no /dev/sev-guest at the node)"
+                .into(),
+            anchors: vec![],
+            status: Status::NotProven,
+        });
     }
 
     // --- Pin ------------------------------------------------------------

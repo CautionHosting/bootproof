@@ -54,9 +54,9 @@ use bootproof_sdk::format::nitro::Nitro;
 
 // AMD KDS chain for Milan VLEK, pinned at build time (fetched from
 // https://kdsintf.amd.com/vlek/v1/Milan/cert_chain on 2026-08-26; see
-// data/README.md for provenance + fingerprints).
-const AMD_ASVK_MILAN_PEM: &[u8] = include_bytes!("data/asvk-sev-vlek-milan.pem");
-const AMD_ARK_MILAN_PEM: &[u8] = include_bytes!("data/ark-milan.pem");
+// data/README.md for provenance + fingerprints). The shared `crate::snp`
+// module carries the canonical copy; the trust tree uses it too.
+use crate::snp::{AMD_ASVK_MILAN_PEM, AMD_ARK_MILAN_PEM};
 
 // AWS instance-identity-document DSA signing certificates, one per region,
 // pinned at build time. AWS publishes these per region at

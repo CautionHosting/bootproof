@@ -6,6 +6,7 @@ pub mod facts;
 pub mod format;
 pub mod provenance;
 pub mod serve;
+pub mod snp;
 pub mod spki;
 pub mod trust;
 pub mod verify;
