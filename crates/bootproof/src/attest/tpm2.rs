@@ -3,8 +3,11 @@
 //! moment.
 //!
 //! Per-request flow (stateless; all keys are primary keys, no NV writes):
-//! 1. Extend PCR22 (the slot link PCR) with `SHA256(concat(other docs))`.
-//! 2. Read the attested PCRs (now including the extended PCR22).
+//! 1. Fold the slot link: `PCR_Reset(22)` then `PCR_Extend(22, H(concat
+//!    other docs))` (only when other channels exist and PCR22 is exposed).
+//!    On refusal the node degrades: PCR22 is dropped from the quote and the
+//!    verifier reports the honest "no slot PCR on this TPM" boundary.
+//! 2. Read the attested PCRs (including the folded PCR22 when it ran).
 //! 3. Create the state-bound `sign` key: `PolicyPCR` over the attested set,
 //!    then `CreatePrimary` authorized by that policy.
 //! 4. Create the AK (signing, auth-only) and produce a Quote over the
@@ -109,7 +112,7 @@ impl Channel for Tpm2 {
             .selection
             .map(|s| s.indices())
             .unwrap_or_default();
-        let indices: Vec<u8> = attested_pcrs()
+        let mut indices: Vec<u8> = attested_pcrs()
             .iter()
             .cloned()
             .filter(|i| available.contains(i))
@@ -117,22 +120,43 @@ impl Channel for Tpm2 {
         if indices.is_empty() {
             return Err("TPM exposes none of the attested PCRs".to_string());
         }
-        let sel = PcrSelection::new(alg::SHA256, &indices);
 
-        // 2. Slot link: bind the other channels to this TPM at this moment.
-        //    Only meaningful when there are other channels and the TPM has a
-        //    slot PCR. Some firmware (e.g. AWS NitroTPM) also refuses to let a
-        //    caller extend the measured PCRs, so we never touch PCR22 unless we
-        //    have something real to bind and a PCR to bind it in.
+        // 2. Slot link: fold the other channels' docs into PCR22 so the value
+        //    is deterministic and the verifier can recompute it. Reset PCR22
+        //    to zero first, then extend with H(docs), so the attested value is
+        //    H(0^32 || H(docs)) regardless of what PCR22 held before. Only
+        //    attempt when there are other docs and the TPM exposes PCR22. If
+        //    the reset or extend is refused (a locality-3-locked PCR22 on a
+        //    virtual TPM, or a firmware that won't let us write the slot PCR),
+        //    degrade: drop PCR22 from the quote so the verifier reports the
+        //    honest "not present on this TPM" boundary instead of a value we
+        //    did not set.
+        let mut slot_folded = false;
         if !other_docs.is_empty() && available.contains(&SLOT_PCR) {
             let mut concat = Vec::new();
             for d in other_docs {
                 concat.extend_from_slice(d);
             }
             let slot_digest = Sha256::digest(&concat);
-            tpm.pcr_extend(SLOT_PCR as u32, &slot_digest)
-                .map_err(|e| format!("PCR_Extend({SLOT_PCR}): {e}"))?;
+            match tpm
+                .pcr_reset(SLOT_PCR as u32)
+                .and_then(|()| tpm.pcr_extend(SLOT_PCR as u32, &slot_digest))
+            {
+                Ok(()) => slot_folded = true,
+                Err(e) => {
+                    eprintln!(
+                        "[attest] slot link PCR{SLOT_PCR} not writable ({e}); omitting it from the quote"
+                    );
+                }
+            }
         }
+        if !slot_folded {
+            // PCR22 must not be in the quote: we did not establish a known
+            // value, so attesting it would hand the verifier a number that is
+            // neither our fold nor a measured boot state.
+            indices.retain(|i| *i != SLOT_PCR);
+        }
+        let sel = PcrSelection::new(alg::SHA256, &indices);
 
         // 3. Read the attested PCRs (post-extend).
         let read = tpm

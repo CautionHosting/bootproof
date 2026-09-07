@@ -24,7 +24,7 @@ use sha2::Sha256;
 use bootproof_tpm::commands_policy::{policy_pcr_auth_policy, parse_public_area};
 use bootproof_tpm::{PcrSelection, constants::alg};
 
-use crate::channel::{Tpm2Verified, Verified, Verifier};
+use crate::channel::{SlotLink, Tpm2Verified, Verified, Verifier};
 use crate::wire::{Bundle, Evidence, Fact, Status};
 
 const ATTEST_MAGIC: u32 = 0xFF54_4347;
@@ -117,6 +117,40 @@ fn qualified_name(name: &[u8], parent: u32) -> Vec<u8> {
     h.update(name);
     out.extend_from_slice(&h.finalize());
     out
+}
+
+/// The slot-link decision, factored out as a pure function of the
+/// attested PCR22 (if any) and the other channels' docs, so it can be
+/// unit-tested against synthetic values without a TPM.
+///
+/// The node folds only when it actually can (other docs exist, and
+/// PCR_Reset + PCR_Extend both succeed), and it includes the slot PCR in
+/// the quote only after a successful fold. So the expected value is
+/// deterministic: the node reset PCR22 to zero, then extended it with
+/// H(concat other docs), i.e. PCR22 == H(0^32 || H(docs)).
+///
+/// - `slot_actual == None`            -> `NoSlotPcr` (fold not available)
+/// - `slot_actual == H(0^32 || H(d))` -> `Proven`
+/// - anything else                    -> `Mismatched`
+pub fn slot_link_decision(slot_actual: Option<&[u8]>, other_docs: &[Vec<u8>]) -> SlotLink {
+    let slot = match slot_actual {
+        None => return SlotLink::NoSlotPcr,
+        Some(d) => d,
+    };
+    let mut concat = Vec::new();
+    for d in other_docs {
+        concat.extend_from_slice(d);
+    }
+    let h_docs = Sha256::digest(&concat);
+    let mut m = Sha256::new();
+    m.update([0u8; 32]); // the PCR pre-state after TPM2_PCR_Reset
+    m.update(h_docs);
+    let expected = m.finalize();
+    if slot == expected.as_slice() {
+        SlotLink::Proven
+    } else {
+        SlotLink::Mismatched
+    }
 }
 
 pub struct Tpm2Verifier;
@@ -229,26 +263,25 @@ impl Verifier for Tpm2Verifier {
             return Err("per-PCR digests do not hash to the quote pcrDigest".into());
         }
 
-        // 6. Slot link: PCR22 == SHA256(concat of other channels' docs), but
-        //    only when other channels exist and this TPM has a slot PCR.
-        let has_other = bundle.evidence.iter().any(|e| e.channel != "tpm2");
-        let slot_expected = {
-            let mut other = Vec::new();
-            for e in &bundle.evidence {
-                if e.channel != "tpm2" {
-                    other.extend_from_slice(&e.doc.0);
-                }
-            }
-            Sha256::digest(&other).to_vec()
-        };
+        // 6. Slot link: the node resets PCR22 to zero and (when other
+        //    channels exist) extends it with H(other docs), so the expected
+        //    value is deterministic: H(0^32 || H(docs)), or all-zero when
+        //    there was nothing to fold. A PCR22 that is not in the quote
+        //    means the node's TPM has no usable slot PCR (AWS NitroTPM
+        //    exposes only PCRs 0-9; a virtual TPM may lock PCR22 behind
+        //    locality 3) -- an honest hardware boundary, not an integrity
+        //    failure.
+        let other_docs: Vec<Vec<u8>> = bundle
+            .evidence
+            .iter()
+            .filter(|e| e.channel != "tpm2")
+            .map(|e| e.doc.0.clone())
+            .collect();
         let slot_actual = per_pcr
             .iter()
             .find(|(i, _)| *i == crate::attest::tpm2::SLOT_PCR)
-            .map(|(_, d)| d.clone());
-        let slot_link = match slot_actual {
-            Some(actual) if has_other => actual == slot_expected,
-            _ => false, // no other channels to bind, or no slot PCR on this TPM
-        };
+            .map(|(_, d)| d.as_slice());
+        let slot_link = slot_link_decision(slot_actual, &other_docs);
 
         // 7. Sign key policy == the attested state. The quote echoes the
         // selection the TPM used; recompute the expected authPolicy from
@@ -320,16 +353,24 @@ impl Verifier for Tpm2Verifier {
 
         facts.push(Fact {
             name: "slot_link".into(),
-            value: if v.slot_link {
-                format!("PCR{} binds the other channels' docs", crate::attest::tpm2::SLOT_PCR)
-            } else {
-                "PCR22 does not match the other channels' docs".into()
+            value: match v.slot_link {
+                SlotLink::Proven => format!(
+                    "PCR{} binds the other channels' docs",
+                    crate::attest::tpm2::SLOT_PCR
+                ),
+                SlotLink::Mismatched => format!(
+                    "PCR{} does not match the other channels' docs",
+                    crate::attest::tpm2::SLOT_PCR
+                ),
+                SlotLink::NoSlotPcr => format!(
+                    "PCR{} not present on this TPM; cross-channel fold not available",
+                    crate::attest::tpm2::SLOT_PCR
+                ),
             },
             anchors: vec!["tpm2".into()],
-            status: if v.slot_link {
-                Status::Proven
-            } else {
-                Status::NotProven
+            status: match v.slot_link {
+                SlotLink::Proven => Status::Proven,
+                _ => Status::NotProven,
             },
         });
 
@@ -394,4 +435,54 @@ impl Verifier for Tpm2Verifier {
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::channel::SlotLink;
+    use sha2::Sha256;
+
+    /// The node's expected PCR22 value: reset to zero, then extend with
+    /// H(concat other docs) -> H(0^32 || H(docs)).
+    fn expected_fold(other_docs: &[Vec<u8>]) -> Vec<u8> {
+        let mut concat = Vec::new();
+        for d in other_docs {
+            concat.extend_from_slice(d);
+        }
+        let h_docs = Sha256::digest(&concat);
+        let mut m = Sha256::new();
+        m.update([0u8; 32]);
+        m.update(h_docs);
+        m.finalize().to_vec()
+    }
+
+    #[test]
+    fn slot_link_proven_when_fold_matches() {
+        let docs = vec![vec![0x01, 0x02, 0x03], vec![0xAA, 0xBB]];
+        let expected = expected_fold(&docs);
+        assert_eq!(slot_link_decision(Some(&expected), &docs), SlotLink::Proven);
+    }
+
+    #[test]
+    fn slot_link_proven_with_empty_docs() {
+        // No other docs: the node folded H(empty) from a zeroed PCR.
+        let expected = expected_fold(&[]);
+        assert_eq!(slot_link_decision(Some(&expected), &[]), SlotLink::Proven);
+    }
+
+    #[test]
+    fn slot_link_mismatched_on_wrong_value() {
+        let docs = vec![vec![0x01, 0x02, 0x03]];
+        let wrong = vec![0xDE; 32];
+        assert_ne!(wrong, expected_fold(&docs));
+        assert_eq!(slot_link_decision(Some(&wrong), &docs), SlotLink::Mismatched);
+    }
+
+    #[test]
+    fn slot_link_absent_when_pcr22_not_in_quote() {
+        let docs = vec![vec![0x01, 0x02, 0x03]];
+        assert_eq!(slot_link_decision(None, &docs), SlotLink::NoSlotPcr);
+        assert_eq!(slot_link_decision(None, &[]), SlotLink::NoSlotPcr);
+    }
 }

@@ -36,6 +36,26 @@ pub enum Verified {
     Snp(SnpVerified),
 }
 
+/// The slot-link (PCR22) check, as an honest 3-state. The node folds the
+/// other channels' docs into PCR22 (reset to zero, then extend with
+/// H(other docs)) before quoting; the verifier recomputes the expected
+/// value from the other evidence and compares. "Absent" is NOT an integrity
+/// failure -- a TPM that has no usable resettable slot PCR (AWS NitroTPM
+/// only exposes PCRs 0-9; a locality-3-locked PCR22 on a virtual TPM)
+/// simply cannot carry the fold, so the node omits it from the quote and
+/// the verifier reports the honest hardware boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotLink {
+    /// PCR22 == H(0 || H(other docs)): the fold ran and matched. Proven.
+    Proven,
+    /// PCR22 is in the quote but != H(0 || H(other docs)): the node folded,
+    /// the value disagrees. A real integrity failure.
+    Mismatched,
+    /// PCR22 is not in the quote: the node's TPM has no usable slot PCR, so
+    /// the cross-channel fold is not available on this hardware. NotProven.
+    NoSlotPcr,
+}
+
 /// Verified tpm2 channel data.
 pub struct Tpm2Verified {
     /// The attested per-PCR digests (index -> digest), in ascending order,
@@ -49,8 +69,9 @@ pub struct Tpm2Verified {
     pub sign_policy: Option<Vec<u8>>,
     /// PCR indices the sign key policy binds.
     pub sign_pcrs: Option<Vec<u8>>,
-    /// Whether the slot-link (PCR22 == H(other channel docs)) checked out.
-    pub slot_link: bool,
+    /// The slot-link (PCR22) cross-channel check: Proven, Mismatched, or
+    /// NoSlotPcr (the TPM has no usable slot PCR and the fold is unavailable).
+    pub slot_link: SlotLink,
     /// EK certificate bytes, if the node bundled one.
     pub ek_cert: Option<Vec<u8>>,
 }

@@ -267,6 +267,16 @@ impl Tpm {
         Ok(())
     }
 
+    /// TPM2_PCR_Reset: reset a PCR to zero (no auth session). Spec: only
+    /// resettable PCRs (typically 17-22) accept this; a non-resettable PCR
+    /// returns TPM_RC_PCR_WRITABLE, which `call` surfaces as an error.
+    pub fn pcr_reset(&mut self, pcr: u32) -> Result<()> {
+        let mut cmd = Command::new(cc::PCR_RESET, st::NO_SESSIONS);
+        cmd.push_u32(pcr);
+        let (_rc, _body) = self.call(&cmd)?;
+        Ok(())
+    }
+
     /// TPM2_Hash: SHA256-hash `data` in `hierarchy`. Returns (digest,
     /// ticket) where ticket is the raw TPMT_TK (tag u16 | hierarchy u32 |
     /// digest TPM2B) that this platform's Sign command requires in its

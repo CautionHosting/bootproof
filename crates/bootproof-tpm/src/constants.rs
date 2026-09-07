@@ -31,6 +31,7 @@ pub mod cc {
     pub const POLICY_PCR: u16 = 0x017F;
     pub const POLICY_RESTART: u16 = 0x0180;
     pub const PCR_EXTEND: u16 = 0x0182;
+    pub const PCR_RESET: u16 = 0x0183;
     pub const NV_READ_PUBLIC: u16 = 0x0169;
 }
 
