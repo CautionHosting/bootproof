@@ -282,6 +282,17 @@ impl Verifier for Tpm2Verifier {
             .find(|(i, _)| *i == crate::attest::tpm2::SLOT_PCR)
             .map(|(_, d)| d.as_slice());
         let slot_link = slot_link_decision(slot_actual, &other_docs);
+        // A mismatch is a real integrity failure: the quote bound a PCR22
+        // that is neither the node's fold nor a measured boot state. Fail the
+        // channel loudly (this is also the documented tpm2 contract: every
+        // fact it emits comes from a fully verified quote).
+        if matches!(slot_link, SlotLink::Mismatched) {
+            return Err(format!(
+                "PCR{} in the quote does not match the cross-channel fold \
+                 (H(0 || H(other docs))); integrity failure",
+                crate::attest::tpm2::SLOT_PCR
+            ));
+        }
 
         // 7. Sign key policy == the attested state. The quote echoes the
         // selection the TPM used; recompute the expected authPolicy from
