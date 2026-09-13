@@ -125,31 +125,32 @@ fn verify_cert_and_bundle_with_root(
 // TODO: error handling
 fn asn1_encode_int(value: &[u8]) -> Vec<u8> {
     let mut result = vec![0x02];
+    let first_nonzero_index = value.iter().copied().position(|b| b != 0);
 
-    if value.first().is_some_and(|v| v & 0x80 != 0) {
-        // highest bit set, which would be interpreted as a negative integer
-        // encode length as u8 followed by a 0x00
-        let len = value.len().checked_add(1).expect("value.len() + 1 overflow");
-        let encoded_len = u8::try_from(len).expect("padded value.len() < u8::MAX");
-        result.push(encoded_len);
-        // push a zero byte so it's unsigned
-        result.push(0x00);
-        result.extend_from_slice(value);
-    } else {
-        // highest bit is not set, we can encode once we find the first nonzero byte
-        let first_nonzero_index = value.iter().copied().position(|b| b != 0);
-
-        if let Some(start) = first_nonzero_index {
-            // we have some acceptable value
-            let trimmed = &value[start..];
-            let len = u8::try_from(trimmed.len()).expect("value.len() < u8::MAX");
-            result.push(len);
-            result.extend_from_slice(trimmed);
+    if let Some(start) = first_nonzero_index {
+        // Raw ES384 signatures use fixed-width unsigned integers. Strip that
+        // padding before deciding whether DER needs a sign-protecting zero.
+        let trimmed = &value[start..];
+        if trimmed.first().is_some_and(|v| v & 0x80 != 0) {
+            // highest bit set, which would be interpreted as a negative integer
+            // encode length as u8 followed by a 0x00
+            let len = trimmed
+                .len()
+                .checked_add(1)
+                .expect("trimmed.len() + 1 overflow");
+            let encoded_len = u8::try_from(len).expect("padded trimmed.len() < u8::MAX");
+            result.push(encoded_len);
+            // push a zero byte so it's unsigned
+            result.push(0x00);
         } else {
-            // it's all zeroes, let's just toss a zero in there
-            result.push(1);
-            result.push(0);
+            let len = u8::try_from(trimmed.len()).expect("trimmed.len() < u8::MAX");
+            result.push(len);
         }
+        result.extend_from_slice(trimmed);
+    } else {
+        // it's all zeroes, let's just toss a zero in there
+        result.push(1);
+        result.push(0);
     }
 
     result
@@ -323,6 +324,16 @@ mod tests {
     fn it_works() {
         let nitro = Nitro::new(CBOR_DATA, PCRS.clone()).unwrap();
         nitro.verify(VALID_DURATION, &*NONCE).unwrap();
+    }
+
+    #[test]
+    fn asn1_integer_trims_unsigned_padding_before_sign_check() {
+        assert_eq!(asn1_encode_int(&[0x00, 0xd2]), vec![0x02, 0x02, 0x00, 0xd2]);
+        assert_eq!(asn1_encode_int(&[0xd2]), vec![0x02, 0x02, 0x00, 0xd2]);
+        assert_eq!(asn1_encode_int(&[0x00, 0x7f]), vec![0x02, 0x01, 0x7f]);
+        assert_eq!(asn1_encode_int(&[0x7f]), vec![0x02, 0x01, 0x7f]);
+        assert_eq!(asn1_encode_int(&[0x00, 0x00]), vec![0x02, 0x01, 0x00]);
+        assert_eq!(asn1_encode_int(&[]), vec![0x02, 0x01, 0x00]);
     }
 
     #[test]
