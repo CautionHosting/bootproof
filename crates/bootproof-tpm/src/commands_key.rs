@@ -72,6 +72,20 @@ const OBJ_ATTR_SIGN: u32 = 0x0005_0072;
 /// (NULL, 2 bytes) | scheme | hashAlg | curveID | kdf | unique. A restricted
 /// signing key requires symmetric = TPM_ALG_NULL.
 pub fn build_ecc_sign_template() -> Vec<u8> {
+    build_ecc_sign_policy_template(&[])
+}
+
+/// Like `build_ecc_sign_template` but with a non-empty `authPolicy`: the
+/// `TPM2B_DIGEST` policy digest the key requires at *usage* time (Quote,
+/// Sign). The ref model `TPM2_CreatePrimary` does NOT compute or check a
+/// policy at creation — `PublicAttributesValidation` only enforces
+/// `authPolicy.size == nameAlg digest size` (32 for SHA256). The policy
+/// session is compared against this field at usage time
+/// (`CheckPolicyAuthSession`: session `policyDigest ==` the key's `authPolicy`),
+/// so the caller bakes the digest here and reproduces the policy in a fresh
+/// policy session when using the key. `auth_policy` must be 32 bytes for a
+/// SHA256 nameAlg.
+pub fn build_ecc_sign_policy_template(auth_policy: &[u8]) -> Vec<u8> {
     let mut b = Vec::new();
     // type
     b.extend_from_slice(&alg::ECC.to_be_bytes());
@@ -79,8 +93,9 @@ pub fn build_ecc_sign_template() -> Vec<u8> {
     b.extend_from_slice(&alg::SHA256.to_be_bytes());
     // objectAttributes
     b.extend_from_slice(&OBJ_ATTR_SIGN.to_be_bytes());
-    // authPolicy: TPM2B_DIGEST (size 0)
-    b.extend_from_slice(&0u16.to_be_bytes());
+    // authPolicy: TPM2B_DIGEST
+    b.extend_from_slice(&(auth_policy.len() as u16).to_be_bytes());
+    b.extend_from_slice(auth_policy);
     // symmetric: NULL (a restricted signing key requires NULL symmetric)
     b.extend_from_slice(&alg::NULL.to_be_bytes());
     // parameters: TPMS_ALG_ECC_PARMS

@@ -26,7 +26,7 @@ use crate::commands::PcrSelection;
 use crate::constants::{alg, cc, st};
 use crate::conn::{Command, Tpm};
 use crate::error::{Error, Result};
-use crate::session::{Session, TPM_SE_POLICY};
+use crate::session::{Session, TPM_SE_HMAC, TPM_SE_POLICY};
 
 /// A parsed `TPMT_PUBLIC` (ECC object).
 #[derive(Debug, Clone)]
@@ -190,28 +190,47 @@ impl Tpm {
         }
     }
 
-    /// Create a primary ECC signing key bound to a PCR policy in the OWNER
-    /// hierarchy.
+    /// Create a primary ECC signing key in the OWNER hierarchy whose
+    /// `authPolicy` is bound to a PCR policy: the key's private operations
+    /// (Quote, Sign) are accepted only while the live PCRs still match.
     ///
-    /// Flow: policy session (PolicyPCR) -> CreatePrimary in the owner
-    /// hierarchy authorized by that session. The key's `authPolicy` is set by
-    /// the TPM to the policy digest. The session is flushed before returning.
+    /// Per the ref model the digest is NOT computed by the TPM at creation —
+    /// `TPM2_CreatePrimary` has no policy path, and `PublicAttributesValidation`
+    /// only enforces `authPolicy.size == nameAlg digest size`. So we compute the
+    /// digest offline (`policy_pcr_auth_policy`, proven == live in d3b), bake it
+    /// into the template's `authPolicy`, and authorize CreatePrimary with a plain
+    /// unbound HMAC session on the owner hierarchy. A policy session on the
+    /// hierarchy would instead be checked against the hierarchy's EMPTY
+    /// `authPolicy` (`CheckPolicyAuthSession`) and fail `TPM_RC_POLICY_FAIL`.
+    /// The policy binds at USAGE time: the caller reproduces the policy in a
+    /// fresh policy session when calling Quote/Sign.
     pub fn create_primary_sign_policy(
         &mut self,
         selections: &[PcrSelection],
         per_pcr: &[(u8, Vec<u8>)],
     ) -> Result<crate::commands_key::Key> {
         let hierarchy = crate::constants::rh::OWNER;
-        let session = self.start_policy_pcr_session(selections, per_pcr)?;
+        let digest = policy_pcr_auth_policy(selections, per_pcr);
         let sensitive = crate::commands_key::build_ecc_sign_sensitive();
-        let public = crate::commands_key::build_ecc_sign_template();
+        let public = crate::commands_key::build_ecc_sign_policy_template(&digest);
+        let session = self.start_auth_session(crate::constants::rh::NULL, TPM_SE_HMAC)?;
         let (rc, body) =
             self.call_create_primary_with_session(hierarchy, &session, &sensitive, &public)?;
         let _ = self.flush_context(session.handle);
         if rc != 0 {
             return Err(Error::Tpm(rc as u16, crate::error::rc_name(rc as u16)));
         }
-        crate::commands_key::parse_create_primary(&body)
+        let key = crate::commands_key::parse_create_primary(&body)?;
+        // Verify the firmware stored the authPolicy in outPublic (the whole
+        // point of the key: it now requires the policy digest at usage).
+        let parsed = parse_public_area(&key.public)?;
+        if parsed.auth_policy != digest {
+            return Err(Error::Other(format!(
+                "created key authPolicy is {}B, want the 32B policy digest",
+                parsed.auth_policy.len()
+            )));
+        }
+        Ok(key)
     }
 
     /// TPM2_PolicyGetDigest (CC 0x0189) over an existing policy session:

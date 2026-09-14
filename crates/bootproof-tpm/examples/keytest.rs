@@ -192,6 +192,52 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // --polsign: d3b-2. pcr_read(7) -> create_primary_sign_policy (digest
+    // baked into the template's authPolicy, plain HMAC session on the owner
+    // hierarchy) -> verify outPublic carries the 32B policy digest.
+    // keytest /dev/tpm0 --polsign
+    if std::env::args().any(|a| a == "--polsign") {
+        if !target.starts_with('/') {
+            return Err(bootproof_tpm::Error::Other(
+                "--polsign needs a device path (/dev/tpm0)".into(),
+            ));
+        }
+        let mut tpm = Tpm::open_started(&PathBuf::from(&target))?;
+        let pcr = PcrSelection::new(alg::SHA256, &[7]);
+        let live = tpm.pcr_read(&[pcr])?;
+        let pcr7 = live
+            .values
+            .first()
+            .map(|v| v.digest.clone())
+            .ok_or_else(|| bootproof_tpm::Error::Other("no PCR 7 value".into()))?;
+        if pcr7.len() != 32 {
+            return Err(bootproof_tpm::Error::Other(format!(
+                "PCR 7 digest is {}B (want 32)",
+                pcr7.len()
+            )));
+        }
+        println!("[ps0] PCR7 = {}", hex(&pcr7));
+        let key = tpm.create_primary_sign_policy(&[pcr], &[(7, pcr7.clone())])?;
+        println!(
+            "[ps1] CreatePrimary(policy) OK handle=0x{:08x} name={}B",
+            key.handle,
+            key.name.len()
+        );
+        let parsed = bootproof_tpm::parse_public_area(&key.public)?;
+        let want = bootproof_tpm::policy_pcr_auth_policy(&[pcr], &[(7, pcr7.clone())]);
+        println!("[ps2] outPublic authPolicy = {}", hex(&parsed.auth_policy));
+        println!("[ps3] offline policy digest  = {}", hex(&want));
+        if parsed.auth_policy != want {
+            return Err(bootproof_tpm::Error::Other(
+                "outPublic authPolicy != policy digest".into(),
+            ));
+        }
+        println!("[ps4] MATCH: outPublic carries the 32B PCR policy digest");
+        // The key is a primary object: flushing it drops the transient copy.
+        let _ = tpm.flush_context(key.handle);
+        return Ok(());
+    }
+
     // --khprobe: bisect which keyedHash scheme the firmware accepts. Tries
     // XOR/KDF2, XOR/KDF1, HMAC/SHA256, NULL against a storage primary and
     // prints the RC for each. keytest /dev/tpm0 --khprobe
