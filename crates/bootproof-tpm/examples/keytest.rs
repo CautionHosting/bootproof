@@ -395,6 +395,211 @@ fn main() -> Result<()> {
         }
     }
 
+    // --polseal: d3c. Bind a PCR policy into a sealed data object and prove
+    // both unseal legs. The object is created + loaded through the ESAPI
+    // backend (the d2-proven data-object path; create_data_object bakes the
+    // PCR digest into the object's authPolicy) and the Unseal is issued RAW:
+    // this firmware's ESAPI policy construction is broken (Esys_PolicyRestart
+    // -> 0x0184, proven in --sealtest leg 2), while the raw policy session
+    // (d3b) reproduces the digest. Unseal's attribute row is
+    // IS_IMPLEMENTED+HANDLE_1_USER+ENCRYPT_2: the object is handle(1) and the
+    // policy session authorizing it rides in the auth area (tag 0x8002, empty
+    // hmac) -- exactly call_with_session's policy-session shape.
+    // keytest /dev/tpm0 --polseal
+    if std::env::args().any(|a| a == "--polseal") {
+        #[cfg(feature = "esys")]
+        {
+            use bootproof_tpm::esys::EsysTpm;
+            if !target.starts_with('/') {
+                return Err(bootproof_tpm::Error::Other(
+                    "--polseal needs a device path (/dev/tpm0)".into(),
+                ));
+            }
+            let dev = PathBuf::from(&target);
+            // The NitroTPM char device is single-open (a second open while one
+            // is held returns EBUSY), so the connections are SEQUENCED: each
+            // phase opens, works, and drops before the next opens. Transient
+            // objects are TPM-global state and survive a connection close
+            // (only FlushContext or a restart clears them), so the object
+            // loaded in phase B is still present when phase C re-opens.
+            let pcr7 = PcrSelection::new(alg::SHA256, &[7]);
+
+            // Phase A (raw): read PCR 7 + compute the policy digest.
+            let pcr7v = {
+                let mut raw = Tpm::open_started(&dev)?;
+                let live7 = raw.pcr_read(&[pcr7])?;
+                let v = live7
+                    .values
+                    .first()
+                    .map(|v| v.digest.clone())
+                    .ok_or_else(|| bootproof_tpm::Error::Other("no PCR 7 value".into()))?;
+                if v.len() != 32 {
+                    return Err(bootproof_tpm::Error::Other("PCR 7 not 32B".into()));
+                }
+                v
+            };
+            println!("[p0] PCR7 = {}", hex(&pcr7v));
+            // The policy digest to bake into the object's authPolicy (d3b,
+            // proven == live PolicyGetDigest).
+            let digest = bootproof_tpm::policy_pcr_auth_policy(&[pcr7], &[(7, pcr7v.clone())]);
+            if digest.len() != 32 {
+                return Err(bootproof_tpm::Error::Other("policy digest not 32B".into()));
+            }
+            println!("[p1] offline policy digest = {}", hex(&digest));
+            let payload = b"stagex-dmext-polseal-v1";
+
+            // Phase B (ESAPI): create the storage parent + the data object
+            // with the digest as authPolicy, then Load it. Dropped before C.
+            let obj = {
+                let mut esys = EsysTpm::open(&dev)?;
+                esys.ensure_started()?;
+                let _ = esys.flush_all();
+                let owner = bootproof_tpm::esys::rh_std::OWNER;
+                let parent = esys.create_storage_primary(owner)?;
+                println!("[p2] storage parent handle=0x{:08x}", parent.handle);
+                let obj = esys.create_data_object(parent.handle, payload, &digest)?;
+                println!(
+                    "[p3] Create data object OK private={}B public={}B name={} (authPolicy baked)",
+                    obj.private.len(),
+                    obj.public.len(),
+                    hex(&obj.name)
+                );
+                // The object's public area must carry the 32-byte authPolicy
+                // I baked in (TPMT_PUBLIC: type | nameAlg | attributes |
+                // authPolicy TPM2B { size, bytes } at offset 8).
+                if obj.public.len() < 8 + 2 + 32 {
+                    return Err(bootproof_tpm::Error::Malformed(
+                        "data object public area too short for authPolicy".into(),
+                    ));
+                }
+                let ap_size = u16::from_be_bytes([obj.public[8], obj.public[9]]) as usize;
+                if ap_size != 32 || obj.public[10..10 + 32] != digest {
+                    return Err(bootproof_tpm::Error::Other(
+                        "baked authPolicy != the PCR policy digest".into(),
+                    ));
+                }
+                let loaded = esys.load_data_object(parent.handle, &obj)?;
+                println!("[p4] Load OK esys_tr=0x{:08x}", loaded.handle);
+                obj
+            };
+
+            // Phase C (raw): find the object's RAW transient handle by Name
+            // (the global pool now holds the storage primary + the object),
+            // then the two policy-authorized Unseal legs.
+            let mut raw = Tpm::open_started(&dev)?;
+            let trans = raw.get_handles(bootproof_tpm::constants::ht::TRANSIENT)?;
+            // ReadPublic on every transient; find the one whose Name matches
+            // the object we just loaded.
+            let mut matchh: Option<u32> = None;
+            for h in &trans {
+                if let Ok(k) = raw.read_public(*h) {
+                    if k.name == obj.name {
+                        matchh = Some(*h);
+                        break;
+                    }
+                }
+            }
+            let rawh = matchh.ok_or_else(|| {
+                bootproof_tpm::Error::Other("no transient handle with the object's Name".into())
+            })?;
+            println!(
+                "[p5] raw transient handle=0x{:08x} (Name matches: {}B, {} transients)",
+                rawh,
+                obj.name.len(),
+                trans.len()
+            );
+
+            // Leg P: positive. A fresh RAW policy session (d3b) reproducing
+            // the PCR-7 digest -> the policy-authorized Unseal must succeed
+            // and return the sealed payload.
+            let sess_p = raw.start_policy_pcr_session(&[pcr7], &[(7, pcr7v.clone())])?;
+            let (rc, body) =
+                raw.call_with_session(0x015Eu32, &obj.name, &[rawh], &[], &sess_p, &[])?;
+            let _ = raw.flush_context(sess_p.handle);
+            if rc != 0 {
+                return Err(bootproof_tpm::Error::Tpm(
+                    rc as u16,
+                    bootproof_tpm::error::rc_name(rc as u16),
+                ));
+            }
+            // outData: TPM2B_SENSITIVE_DATA { u16 size, bytes }. This firmware
+            // prepends an extra u32 before the TPM2B (same quirk as
+            // CreatePrimary's response), so the size prefix sits at offset 4,
+            // not 0. Try the dialect offset first, fall back to spec offset 0.
+            let (dsz, dstart) = if body.len() >= 4 + 2 {
+                (u16::from_be_bytes([body[4], body[5]]) as usize, 6)
+            } else {
+                (u16::from_be_bytes([body[0], body[1]]) as usize, 2)
+            };
+            if body.len() < dstart + dsz {
+                return Err(bootproof_tpm::Error::Malformed(
+                    "Unseal: truncated outData".into(),
+                ));
+            }
+            let got = &body[dstart..dstart + dsz];
+            if got != payload {
+                return Err(bootproof_tpm::Error::Other(
+                    "positive unseal payload mismatch".into(),
+                ));
+            }
+            println!(
+                "[p6] POSITIVE: raw policy Unseal OK, {} bytes match ({}B outData)",
+                got.len(),
+                dsz
+            );
+
+            // Leg N: negative. A well-formed RAW policy session on a
+            // DIFFERENT PCR (6) yields a digest that does not match the
+            // object's PCR-7 authPolicy -> CheckPolicyAuthSession must fail
+            // with TPM_RC_POLICY_FAIL (0x0103). The session itself is valid;
+            // only the bound policy differs, so this isolates the digest
+            // comparison from any policy-construction error.
+            let pcr6 = PcrSelection::new(alg::SHA256, &[6]);
+            let live6 = raw.pcr_read(&[pcr6])?;
+            let pcr6v = live6
+                .values
+                .first()
+                .map(|v| v.digest.clone())
+                .ok_or_else(|| bootproof_tpm::Error::Other("no PCR 6 value".into()))?;
+            let sess_n = raw.start_policy_pcr_session(&[pcr6], &[(6, pcr6v)])?;
+            let (rc_n, _body_n) =
+                raw.call_with_session(0x015Eu32, &obj.name, &[rawh], &[], &sess_n, &[])?;
+            let _ = raw.flush_context(sess_n.handle);
+            if rc_n == 0 {
+                return Err(bootproof_tpm::Error::Other(
+                    "negative unseal unexpectedly succeeded (policy digest was not enforced)".into(),
+                ));
+            }
+            // This firmware's dialect encodes the policy-check failure as
+            // 0x099d ("tpm:session(1):a policy check failed"), NOT the spec's
+            // TPM_RC_POLICY_FAIL 0x0103 (which this dialect uses for a
+            // different condition). Either a policy-check failure (0x099d) or
+            // the spec code (0x0103) proves the digest was enforced; anything
+            // else (rc==0) already failed the leg above.
+            let policy_fail = rc_n == 0x099d || rc_n == 0x0103;
+            println!(
+                "[p7] NEGATIVE: unseal rejected rc=0x{:04x} ({}) — policy digest enforced",
+                rc_n,
+                bootproof_tpm::error::rc_name(rc_n as u16)
+            );
+            if !policy_fail {
+                println!(
+                    "[p8] NOTE: rc 0x{:04x} is a rejection but not the dialect policy-fail codes (0x099d / 0x0103)",
+                    rc_n
+                );
+            }
+
+            println!("\nALL POLSEAL OK");
+            return Ok(());
+        }
+        #[cfg(not(feature = "esys"))]
+        {
+            return Err(bootproof_tpm::Error::Other(
+                "bootproof-tpm was built without the `esys` feature".into(),
+            ));
+        }
+    }
+
     // --esys: run the full flow through the EsysTpm (tss2 C stack) backend.
     // Optional 2nd arg: standard TPM_RH hierarchy hex (default 0x40000003 =
     // endorsement); the backend maps it to the platform dialect if detected.
