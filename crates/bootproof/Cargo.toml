@@ -8,7 +8,13 @@ default = ["platform-aws"]
 platform-aws = ["dep:aws-nitro-enclaves-nsm-api", "dep:serde_bytes"]
 
 [dependencies]
-bootproof-tpm = { path = "../bootproof-tpm", features = ["attest"] }
+# `attest` = the NitroTPM NSM vendor command (raw, no tss2). `esys` = the
+# StageX tss2 C stack, required by the dmext TPM gate (the d3c proven path:
+# ESAPI CreatePrimary/Create/Load for the sealed data object; only ESAPI's
+# policy construction is broken on the platform firmware, so the Unseal is
+# issued raw). Enabling esys makes the production binary static-link the tss2
+# archives (see the Containerfile `build` target, which owns the link line).
+bootproof-tpm = { path = "../bootproof-tpm", features = ["attest", "esys"] }
 bootproof-sdk = { path = "../bootproof-sdk", features = ["nitro"] }
 x509-parser = "0.18.0"
 thiserror = "2.0.17"

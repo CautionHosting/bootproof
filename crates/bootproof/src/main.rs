@@ -145,6 +145,11 @@ enum Command {
         #[arg(long, default_value = "/var/lib/bootproof")]
         state: PathBuf,
     },
+    /// Seal/unseal a LUKS volume key (TPM2 data object + optional SEV-SNP gate).
+    Dmext {
+        #[command(subcommand)]
+        op: DmextOp,
+    },
     /// Bridge a TCP port to the local TPM (raw TPM2 framing). For capturing
     /// commands from remote tooling (e.g. tss-esapi over an SSH tunnel).
     TpmBridge {
@@ -316,6 +321,47 @@ enum Command {
     },
 }
 
+/// `dmext` operations: seal a volume key under a PCR policy (+ optional
+/// SEV-SNP gate), or unseal it when both proofs pass.
+#[derive(Subcommand)]
+enum DmextOp {
+    /// Seal a volume key into a TPM2 data object bound to a PCR policy.
+    Seal {
+        /// TPM kernel character device (default /dev/tpm0).
+        #[arg(long, default_value = "/dev/tpm0")]
+        device: PathBuf,
+        /// Comma-separated PCR indices to bind (default 4,5,7,9).
+        #[arg(long, default_value = "4,5,7,9")]
+        pcrs: String,
+        /// The volume key to seal: raw base64/hex, `@<file>`, or
+        /// `-` to read from stdin.
+        data: String,
+        /// Where to write the sealed blob (JSON).
+        #[arg(long, default_value = "/run/dmext.sealed.json")]
+        out: PathBuf,
+    },
+    /// Unseal a volume key (gated on the SEV-SNP proof and the PCR policy).
+    Unseal {
+        /// TPM kernel character device (default /dev/tpm0).
+        #[arg(long, default_value = "/dev/tpm0")]
+        device: PathBuf,
+        /// The sealed blob (JSON file).
+        #[arg(long, default_value = "/run/dmext.sealed.json")]
+        blob: PathBuf,
+        /// Skip the SEV-SNP gate (TPM PCR policy only). Fails closed
+        /// otherwise; use only where the enclave proof is not available.
+        #[arg(long)]
+        tpm_only: bool,
+        /// Print the key to stdout (raw bytes). Default: write to `--out`
+        /// and print a summary.
+        #[arg(long)]
+        print: bool,
+        /// Where to write the unsealed key (ignored with `--print`).
+        #[arg(long, default_value = "/run/dmext.key")]
+        out: PathBuf,
+    },
+}
+
 fn parse_pcrs(s: &Option<String>) -> Option<Vec<u8>> {
     let s = s.as_deref()?;
     Some(
@@ -351,6 +397,21 @@ fn hex_to_bytes(s: &str) -> anyhow::Result<Vec<u8>> {
         .collect::<std::result::Result<_, _>>()
         .map_err(|e| anyhow::anyhow!("hex: {e}"))?;
     Ok(b)
+}
+
+/// Read the volume key from a `dmext seal` data arg: `-` reads stdin,
+/// `@<path>` reads a file, anything else is base64/hex.
+fn read_key_arg(data: &str) -> anyhow::Result<Vec<u8>> {
+    if data == "-" {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        std::io::stdin().lock().read_to_end(&mut buf)?;
+        return Ok(buf);
+    }
+    if let Some(path) = data.strip_prefix('@') {
+        return Ok(std::fs::read(path)?);
+    }
+    decode_b64_or_hex(data)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -535,6 +596,45 @@ fn main() -> anyhow::Result<()> {
             eprintln!("sign: not yet implemented");
             std::process::exit(1);
         }
+        Command::Dmext { op } => match op {
+            DmextOp::Seal { device, pcrs, data, out } => {
+                let pcr_list: Vec<u8> = pcrs
+                    .split(',')
+                    .map(|x| x.trim().parse::<u8>().map_err(|e| anyhow::anyhow!("bad PCR index {x:?}: {e}")))
+                    .collect::<Result<_, _>>()?;
+                let key = read_key_arg(&data)?;
+                let blob = bootproof::dmext::seal(&device, &pcr_list, &key, &out)?;
+                eprintln!(
+                    "seal: wrote {} ({}B key, pcrs {:?}, policy_digest {})",
+                    out.display(),
+                    key.len(),
+                    blob.pcrs,
+                    hex_str(&blob.policy_digest.0)
+                );
+            }
+            DmextOp::Unseal { device, blob: blob_path, tpm_only, print, out } => {
+                let blob = bootproof::dmext::SealedBlob::load(&blob_path)?;
+                eprintln!(
+                    "unseal: blob pcrs {:?} policy_digest {} {}",
+                    blob.pcrs,
+                    hex_str(&blob.policy_digest.0),
+                    if tpm_only { "(tpm-only; SNP gate skipped)" } else { "(snp gate on)" }
+                );
+                let key = bootproof::dmext::unseal(&device, &blob, tpm_only)?;
+                if print {
+                    // Raw key bytes to stdout.
+                    use std::io::Write;
+                    std::io::stdout().lock().write_all(&key)?;
+                } else {
+                    std::fs::write(&out, &key)?;
+                    eprintln!(
+                        "unseal: OK, {}B key written to {}",
+                        key.len(),
+                        out.display()
+                    );
+                }
+            }
+        },
         Command::TpmBridge { listen, control, device, log: logpath } => {
             use std::io::{Read, Write};
             if let Some(addr) = control {

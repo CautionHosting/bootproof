@@ -5,9 +5,19 @@
 # `cargo build --release` produces the right artifact.
 
 FROM stagex/pallet-rust AS build
+# The production binary links the tss2 C stack (bootproof-tpm's `esys`
+# feature, used by the dmext TPM gate), so it needs the same static tss2
+# archives the `tpm` target links. The .pc files' Libs lines are emptied so
+# no pkg-config probe emits link flags; bootproof-tpm's build script owns
+# the whole link line (exact archives, dependents before dependencies, libc
+# last).
+COPY --from=stagex/tpm2-tss:sx2024.08.1@sha256:5e362f43a5e0c49f774605a0e3e1b7523dc6bc775f537c206a3aaa8b8b733c93 . /
 ADD . /src
 WORKDIR /src
-RUN cargo rustc --locked --release --bin bootproof -- -C target-feature=+crt-static
+RUN for f in esys sys mu rc tcti-device tctildr; do \
+        sed -i 's|^Libs:.*|Libs: |' /usr/lib/pkgconfig/tss2-$f.pc; \
+    done && \
+    cargo rustc --locked --release -p bootproof --bin bootproof -- -C target-feature=+crt-static
 
 # TPM client: bootproof-tpm with the `esys` feature against the StageX
 # tss2 stack (the platform's TPM dialect). The final link uses the
@@ -27,6 +37,21 @@ RUN for f in esys sys mu rc tcti-device tctildr; do \
     done && \
     cargo rustc --locked --release -p bootproof-tpm --example keytest --features esys -- \
         -C target-feature=+crt-static
+
+# Minimal C probe: decode TPM RCs with the DIALECT tss2-rc and run a minimal
+# keyedHash Create against /dev/tpm0 (built from the same static archives the
+# esys build links, so it is a faithful bisect of the Rust path).
+FROM stagex/pallet-rust AS probe
+COPY --from=stagex/tpm2-tss:sx2024.08.1@sha256:5e362f43a5e0c49f774605a0e3e1b7523dc6bc775f537c206a3aaa8b8b733c93 . /
+ADD . /src
+WORKDIR /src
+RUN clang -O1 -static -o /tmp/tpmprobe tpmprobe.c \
+        -L/usr/lib -L/lib \
+        -Wl,-Bstatic \
+        -l:libtss2-esys.a -l:libcrypto.a -l:libtss2-rc.a -l:libtss2-sys.a \
+        -l:libtss2-tcti-device.a -l:libtss2-tctildr.a -l:libtss2-mu.a \
+        -l:libc.a \
+        -Wl,-Bdynamic -lpthread -lm
 
 # Dev shell: the Rust toolchain plus the TPM tooling (swtpm + tpm2-tools) used
 # for local, software-TPM testing.

@@ -2,6 +2,7 @@ pub mod attest;
 pub mod b64;
 pub mod channel;
 pub mod dns;
+pub mod dmext;
 pub mod facts;
 pub mod format;
 pub mod provenance;
