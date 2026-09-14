@@ -20,10 +20,29 @@ use std::path::Path;
 
 use tss_esapi_sys as sys;
 
+use digest::Digest;
+use sha2::Sha256;
+
 use crate::commands::{PcrReadResult, PcrSelection, PcrValue};
 use crate::commands_key::{Key, Quote};
 use crate::constants::alg;
 use crate::error::{Error, Result};
+
+/// A sealed data object (TPM_ALG_KEYEDHASH with exclusiveOR, or an
+/// auth-only data blob) produced by `create_data_object`. `private` is the
+/// TPM-wrapped sensitive (unsealable only under the parent); `public` is the
+/// `TPMT_PUBLIC` wire bytes; `name` is the object's Name.
+#[derive(Debug, Clone)]
+pub struct DataObject {
+    /// Transient handle after `load_data_object` (0 before it).
+    pub handle: u32,
+    /// TPM2B_PRIVATE buffer (the wrapped sensitive data).
+    pub private: Vec<u8>,
+    /// TPMT_PUBLIC wire bytes (dialect Tss2_MU marshal of the public area).
+    pub public: Vec<u8>,
+    /// The object's Name (TPM2B_NAME buffer).
+    pub name: Vec<u8>,
+}
 
 /// Standard (spec) TPM_RH hierarchy handles.
 pub mod rh_std {
@@ -67,7 +86,14 @@ const TPM_ALG_AES: u16 = 0x0006;
 const TPM_ALG_ECC: u16 = 0x0023;
 const TPM_ALG_ECDSA: u16 = 0x0018;
 const TPM_ALG_SHA256: u16 = 0x000B;
+const TPM_ALG_KEYEDHASH: u16 = 0x0008;
 const ECC_NIST_P256: u16 = 0x0003;
+
+// TPM2_SE: standard HMAC=0x00, EXPLICIT=0x01, POLICY=0x02, TRIAL=0x03.
+// Dialect (StageX tss2 header): HMAC=0x00, POLICY=0x01, TRIAL=0x03.
+const TPM_SE_TRIAL: u8 = 0x03;
+const TPM_SE_POLICY_STD: u8 = 0x02;
+const TPM_SE_POLICY_DIALECT: u8 = 0x01;
 
 // --- dialect-divergent constants ------------------------------------------
 
@@ -93,6 +119,20 @@ const TPM2_SU_STATE: u16 = 0x0001;
 const TPM2_SE_HMAC: u8 = 0x0001;
 const TPM2_CAP_ALGORITHMS: u32 = 0x0000;
 
+// --- data-object (TPM_ALG_KEYEDHASH exclusiveOr) constants -----------------
+
+/// XOR keyedHash scheme selector (dialect `TPM2_ALG_XOR`).
+const TPM_ALG_XOR: u16 = 0x000A;
+/// KDF1 (SP800-56A) for the exclusiveOr scheme (dialect `TPM2_ALG_KDF1_SP800_56A`).
+const TPM_ALG_KDF1_SP800_56A: u16 = 0x0020;
+/// KDF2 for the exclusiveOr scheme (dialect `TPM2_ALG_KDF2`).
+const TPM_ALG_KDF2: u16 = 0x0021;
+/// Dialect `TPMA_OBJECT` for a caller-provided sealed data object:
+/// fixedTPM(0x2) | fixedParent(0x10) | userWithAuth(0x40).
+/// sensitiveDataOrigin is 0 (the caller supplies the data); noDA is not set
+/// (the firmware rejects 0x400, 0x2E1).
+const OBJ_ATTRS_DATA_DIALECT: u32 = 0x0000_0012 | 0x0000_0040;
+
 // Device TCTI entry point (from `tss2_tcti_device.h`; not in the
 // pre-generated bindings). This tss2 build predates the finalize API:
 // the context is caller-allocated (size probe, then init) and released
@@ -103,6 +143,8 @@ unsafe extern "C" {
         size: *mut usize,
         conf: *const c_char,
     ) -> u32;
+    // Dialect RC decoder (libtss2-rc, already linked). Returns a static string.
+    fn Tss2_RC_Decode(rc: u32) -> *const c_char;
     // Command-logging / dialect-shim trampoline (trampoline.c, built by
     // build.rs).
     fn bp_tx_set_orig(fn_ptr: *mut c_void);
@@ -122,8 +164,29 @@ fn check(rc: u32, what: &str) -> Result<()> {
     if rc == 0 {
         Ok(())
     } else {
-        Err(Error::Other(format!("{what}: tss2 RC 0x{rc:08x}")))
+        Err(Error::Other(format!(
+            "{what}: tss2 RC 0x{rc:08x} ({})",
+            decode_rc(rc)
+        )))
     }
+}
+
+/// Decode a tss2 RC through the DIALECT's own RC decoder (libtss2-rc).
+/// This is the authoritative name for the platform firmware's error codes.
+pub fn decode_rc(rc: u32) -> String {
+    let p = unsafe { Tss2_RC_Decode(rc) };
+    if p.is_null() {
+        return String::new();
+    }
+    let mut s = String::new();
+    let mut i = 0usize;
+    unsafe {
+        while *p.add(i) != 0 {
+            s.push(*p.add(i) as u8 as char);
+            i += 1;
+        }
+    }
+    s
 }
 
 fn pcr_selection_list(selections: &[PcrSelection]) -> sys::TPML_PCR_SELECTION {
@@ -281,6 +344,66 @@ fn marshal_public(public_area: &sys::TPMT_PUBLIC) -> Result<Vec<u8>> {
     check(rc, "Tss2_MU_TPMT_PUBLIC_Marshal")?;
     buf.truncate(written as usize);
     Ok(buf)
+}
+
+/// Marshal a `TPMS_SENSITIVE_CREATE` to its significant wire bytes (the
+/// `Tss2_MU` marshaller is the layout authority; used to size the
+/// `TPM2B_SENSITIVE_CREATE.size` field, which is written verbatim to the wire).
+fn marshal_sensitive_create(s: &sys::TPMS_SENSITIVE_CREATE) -> Result<Vec<u8>> {
+    let mut buf = vec![0u8; mem::size_of::<sys::TPMS_SENSITIVE_CREATE>()];
+    let mut written: u64 = 0;
+    let rc = unsafe {
+        sys::Tss2_MU_TPMS_SENSITIVE_CREATE_Marshal(
+            s,
+            buf.as_mut_ptr(),
+            buf.len() as u64,
+            &mut written,
+        )
+    };
+    check(rc, "Tss2_MU_TPMS_SENSITIVE_CREATE_Marshal")?;
+    buf.truncate(written as usize);
+    Ok(buf)
+}
+
+/// Dialect HMAC keyedHash scheme selector (TPM2_ALG_HMAC).
+const TPM_ALG_HMAC: u16 = 0x0005;
+
+/// A `TPMT_PUBLIC` template for a `TPM_ALG_KEYEDHASH` data object with the
+/// requested scheme (dialect attributes, SHA-256 name, empty unique so the
+/// TPM derives the Name). `kdf` applies only to the XOR scheme; `hmac`
+/// uses the SHA-256 scheme; `null` uses no scheme.
+pub fn build_keyedhash_public(scheme: u16, kdf: u16, policy_digest: &[u8]) -> sys::TPMT_PUBLIC {
+    let mut tp: sys::TPMT_PUBLIC = unsafe { mem::zeroed() };
+    tp.type_ = TPM_ALG_KEYEDHASH;
+    tp.nameAlg = TPM_ALG_SHA256;
+    tp.objectAttributes = OBJ_ATTRS_DATA_DIALECT;
+    // authPolicy: empty for auth-only objects, else the bound policy digest.
+    let ap = policy_digest.len().min(64);
+    tp.authPolicy.size = ap as u16;
+    tp.authPolicy.buffer[..ap].copy_from_slice(&policy_digest[..ap]);
+    let scheme_details: sys::TPMU_SCHEME_KEYEDHASH = unsafe { mem::zeroed() };
+    tp.parameters.keyedHashDetail = sys::TPMS_KEYEDHASH_PARMS {
+        scheme: sys::TPMT_KEYEDHASH_SCHEME {
+            scheme,
+            details: scheme_details,
+        },
+    };
+    if scheme == TPM_ALG_XOR {
+        // The firmware rejects XOR keyedHash (0x2D2); kept for completeness.
+        unsafe {
+            tp.parameters.keyedHashDetail.scheme.details.exclusiveOr = sys::TPMS_SCHEME_XOR {
+                hashAlg: TPM_ALG_SHA256,
+                kdf,
+            };
+        }
+    }
+    if scheme == TPM_ALG_HMAC {
+        unsafe {
+            tp.parameters.keyedHashDetail.scheme.details.hmac.hashAlg = TPM_ALG_SHA256;
+        }
+    }
+    // Empty unique (TPM2B_DIGEST size 0): the keyedHash has no public part.
+    tp
 }
 
 /// A TPM connection backed by the tss2 ESAPI (C stack) with a directly
@@ -544,7 +667,9 @@ impl EsysTpm {
         }
     }
 
-    fn flush_session(&mut self, session: u32) {
+    /// Flush one loaded session (policy sessions live at `0x03xxxxxx`,
+    /// outside `flush_all`'s ranges, so callers release them explicitly).
+    pub fn flush_session(&mut self, session: u32) {
         unsafe {
             let _ = sys::Esys_FlushContext(self.esys, session);
         }
@@ -556,6 +681,14 @@ impl EsysTpm {
     pub fn create_primary(&mut self, hierarchy: u32) -> Result<Key> {
         let in_public = build_ecc_sign_public(self.dialect);
         self.create_primary_with_public(hierarchy, &in_public.publicArea)
+    }
+
+    /// Create a **storage** primary (RSA-2048 restricted+decrypt, the proven
+    /// decrypt template). A child object created under a signing primary is
+    /// rejected by the firmware with 0x18A ("handle(1): the type of the value
+    /// is not appropriate for the use") — the parent must be a storage key.
+    pub fn create_storage_primary(&mut self, hierarchy: u32) -> Result<Key> {
+        self.create_primary_with_public(hierarchy, &build_rsa_decrypt_public())
     }
 
     /// TPM2_CreatePrimary with a caller-supplied `TPMT_PUBLIC` template.
@@ -882,6 +1015,323 @@ impl EsysTpm {
             sys::Esys_Free(signature as *mut _);
             self.flush_session(session);
             Ok((r, s))
+        }
+    }
+
+    /// Start an unbound policy session (dialect `TPM2_SE_POLICY`). The
+    /// session is flushed by the caller (or on drop of the context).
+    pub fn start_policy_session(&mut self) -> Result<u32> {
+        self.start_auth_session(TPM_SE_POLICY_DIALECT)
+    }
+
+    /// Start an unbound auth session of an explicit `TPM2_SE` type
+    /// (bisect helper: the staged dialect header claims POLICY=0x01, but the
+    /// firmware's accepted values may follow the standard enum where
+    /// POLICY=0x02).
+    pub fn start_auth_session(&mut self, session_type: u8) -> Result<u32> {
+        let nonce_bytes = self.get_random(32)?;
+        let mut nonce: sys::TPM2B_NONCE = unsafe { mem::zeroed() };
+        nonce.size = nonce_bytes.len() as u16;
+        nonce.buffer[..nonce.size as usize].copy_from_slice(&nonce_bytes);
+        unsafe {
+            let mut session: u32 = 0;
+            let sym: sys::TPMT_SYM_DEF = sys::TPMT_SYM_DEF {
+                algorithm: TPM_ALG_NULL,
+                keyBits: mem::zeroed(),
+                mode: mem::zeroed(),
+            };
+            let rc = sys::Esys_StartAuthSession(
+                self.esys,
+                sys::ESYS_TR_NONE,
+                sys::ESYS_TR_RH_NULL,
+                sys::ESYS_TR_NONE,
+                sys::ESYS_TR_NONE,
+                sys::ESYS_TR_NONE,
+                &nonce,
+                session_type,
+                &sym,
+                TPM_ALG_SHA256,
+                &mut session,
+            );
+            check(rc, "Esys_StartAuthSession")?;
+            Ok(session)
+        }
+    }
+
+    /// TPM2_PolicyRestart: reset the session's policy digest to empty.
+    pub fn policy_restart(&mut self, session: u32) -> Result<()> {
+        let rc = unsafe {
+            sys::Esys_PolicyRestart(self.esys, session, sys::ESYS_TR_NONE, sys::ESYS_TR_NONE, sys::ESYS_TR_NONE)
+        };
+        check(rc, "Esys_PolicyRestart")
+    }
+
+    /// TPM2_PolicyPCR: extend the session policy with the given selection.
+    /// `pcr_digest` is the expected digest of the selected PCRs; `None`
+    /// means zero-length, i.e. the TPM reads the current PCR values.
+    pub fn policy_pcr(
+        &mut self,
+        session: u32,
+        pcr_digest: Option<&[u8]>,
+        selections: &[PcrSelection],
+    ) -> Result<()> {
+        let sel = pcr_selection_list(selections);
+        // Owned digest (if any); its pointer is handed to the FFI call below.
+        let digest: Option<sys::TPM2B_DIGEST> = match pcr_digest {
+            Some(d) => {
+                if d.len() > 64 {
+                    return Err(Error::Malformed("pcr digest exceeds 64 bytes".into()));
+                }
+                let mut dig: sys::TPM2B_DIGEST = unsafe { mem::zeroed() };
+                dig.size = d.len() as u16;
+                dig.buffer[..d.len()].copy_from_slice(d);
+                Some(dig)
+            }
+            None => None,
+        };
+        let digest_ptr: *const sys::TPM2B_DIGEST = match digest.as_ref() {
+            Some(d) => d as *const _,
+            None => std::ptr::null(),
+        };
+        let rc = unsafe {
+            sys::Esys_PolicyPCR(
+                self.esys,
+                session,
+                sys::ESYS_TR_NONE,
+                sys::ESYS_TR_NONE,
+                sys::ESYS_TR_NONE,
+                digest_ptr,
+                &sel,
+            )
+        };
+        check(rc, "Esys_PolicyPCR")
+    }
+
+    /// TPM2_PolicyGetDigest: the session's current policy digest.
+    pub fn policy_get_digest(&mut self, session: u32) -> Result<Vec<u8>> {
+        unsafe {
+            let mut out: *mut sys::TPM2B_DIGEST = std::ptr::null_mut();
+            let rc = sys::Esys_PolicyGetDigest(
+                self.esys,
+                session,
+                sys::ESYS_TR_NONE,
+                sys::ESYS_TR_NONE,
+                sys::ESYS_TR_NONE,
+                &mut out,
+            );
+            check(rc, "Esys_PolicyGetDigest")?;
+            let d = &*out;
+            let bytes = d.buffer[..d.size as usize].to_vec();
+            sys::Esys_Free(out as *mut _);
+            Ok(bytes)
+        }
+    }
+
+    /// TPM2_Create: seal `data` under the parent (a loaded storage key) as
+    /// a `TPM_ALG_KEYEDHASH` data object (NULL scheme). `policy_digest` is the
+    /// bound `authPolicy` (empty for auth-only objects). The TPM returns the
+    /// wrapped `private` blob; the object is not loaded yet.
+    pub fn create_data_object(
+        &mut self,
+        parent: u32,
+        data: &[u8],
+        policy_digest: &[u8],
+    ) -> Result<DataObject> {
+        // A data object (seal/unseal) uses the NULL keyedHash scheme. The
+        // firmware rejects XOR and HMAC keyedHash (0x2D2 "unsupported or
+        // incompatible scheme") — bisected on a live SEV-SNP NitroTPM: only
+        // the NULL scheme is accepted. XOR/HMAC are keyedHash *operations*
+        // (key derivation / MAC), not sealing.
+        self.create_data_object_with_scheme(parent, data, policy_digest, TPM_ALG_NULL, 0)
+    }
+
+    /// `create_data_object` with an explicit keyedHash scheme (bisect helper):
+    /// `scheme` = XOR(0x0A) / HMAC(0x05) / NULL(0x10); `kdf` only for XOR.
+    pub fn create_data_object_with_scheme(
+        &mut self,
+        parent: u32,
+        data: &[u8],
+        policy_digest: &[u8],
+        scheme: u16,
+        kdf: u16,
+    ) -> Result<DataObject> {
+        if data.len() > 256 {
+            return Err(Error::Malformed("data exceeds 256-byte sensitive data".into()));
+        }
+        let parent_tr = hierarchy_to_esys_tr(parent);
+        let in_sensitive = {
+            let mut s: sys::TPM2B_SENSITIVE_CREATE = unsafe { mem::zeroed() };
+            s.sensitive.data.size = data.len() as u16;
+            s.sensitive.data.buffer[..data.len()].copy_from_slice(data);
+            s.size = marshal_sensitive_create(&s.sensitive)?
+                .len() as u16;
+            s
+        };
+        let in_public = {
+            let area = build_keyedhash_public(scheme, kdf, policy_digest);
+            let mut pub2b = sys::TPM2B_PUBLIC {
+                size: 0,
+                publicArea: area,
+            };
+            pub2b.size = marshal_public(&area)?.len() as u16;
+            pub2b
+        };
+        unsafe {
+            let outside_info: sys::TPM2B_DATA = mem::zeroed();
+            let creation_pcr: sys::TPML_PCR_SELECTION = mem::zeroed();
+            let session = self.start_nullauth_session()?;
+            let mut out_private: *mut sys::TPM2B_PRIVATE = std::ptr::null_mut();
+            let mut out_public: *mut sys::TPM2B_PUBLIC = std::ptr::null_mut();
+            let mut creation_data: *mut sys::TPM2B_CREATION_DATA = std::ptr::null_mut();
+            let mut creation_hash: *mut sys::TPM2B_DIGEST = std::ptr::null_mut();
+            let mut creation_ticket: *mut sys::TPMT_TK_CREATION = std::ptr::null_mut();
+            let rc = sys::Esys_Create(
+                self.esys,
+                parent_tr,
+                session,
+                sys::ESYS_TR_NONE,
+                sys::ESYS_TR_NONE,
+                &in_sensitive,
+                &in_public,
+                &outside_info,
+                &creation_pcr,
+                &mut out_private,
+                &mut out_public,
+                &mut creation_data,
+                &mut creation_hash,
+                &mut creation_ticket,
+            );
+            self.flush_session(session);
+            if rc != 0 {
+                return Err(Error::Other(format!(
+                    "Esys_Create (parent 0x{parent:08x}, scheme 0x{scheme:04x}): \
+                     tss2 RC 0x{rc:08x} ({})",
+                    decode_rc(rc)
+                )));
+            }
+            let priv_buf = {
+                let p = &*out_private;
+                let b = p.buffer[..p.size as usize].to_vec();
+                sys::Esys_Free(out_private as *mut _);
+                b
+            };
+            let pub_area = (*out_public).publicArea;
+            sys::Esys_Free(out_public as *mut _);
+            sys::Esys_Free(creation_data as *mut _);
+            sys::Esys_Free(creation_hash as *mut _);
+            sys::Esys_Free(creation_ticket as *mut _);
+            let public = marshal_public(&pub_area)?;
+            // Name = nameAlg (2B BE) || H(marshaled TPMT_PUBLIC), per Part 1 16.9.
+            let name = {
+                let mut n = Vec::with_capacity(2 + 32);
+                n.extend_from_slice(&TPM_ALG_SHA256.to_be_bytes());
+                n.extend_from_slice(&Sha256::digest(&public));
+                n
+            };
+            Ok(DataObject {
+                handle: 0,
+                private: priv_buf,
+                public,
+                name,
+            })
+        }
+    }
+
+    /// TPM2_Load: load a previously created data object under `parent`.
+    /// Cross-checks the TPM-computed Name against the stored one.
+    pub fn load_data_object(&mut self, parent: u32, data: &DataObject) -> Result<DataObject> {
+        let parent_tr = hierarchy_to_esys_tr(parent);
+        let in_private = {
+            let mut p: sys::TPM2B_PRIVATE = unsafe { mem::zeroed() };
+            if data.private.len() > p.buffer.len() {
+                return Err(Error::Malformed("private exceeds TPM2B_PRIVATE".into()));
+            }
+            p.size = data.private.len() as u16;
+            p.buffer[..p.size as usize].copy_from_slice(&data.private);
+            p
+        };
+        let in_public = {
+            let mut area: sys::TPMT_PUBLIC = unsafe { mem::zeroed() };
+            let mut off: u64 = 0;
+            let rc = unsafe {
+                sys::Tss2_MU_TPMT_PUBLIC_Unmarshal(
+                    data.public.as_ptr(),
+                    data.public.len() as u64,
+                    &mut off,
+                    &mut area,
+                )
+            };
+            check(rc, "Tss2_MU_TPMT_PUBLIC_Unmarshal")?;
+            let mut pub2b = sys::TPM2B_PUBLIC {
+                size: 0,
+                publicArea: area,
+            };
+            pub2b.size = marshal_public(&area)?.len() as u16;
+            pub2b
+        };
+        unsafe {
+            let session = self.start_nullauth_session()?;
+            let mut handle: u32 = 0;
+            let rc = sys::Esys_Load(
+                self.esys,
+                parent_tr,
+                session,
+                sys::ESYS_TR_NONE,
+                sys::ESYS_TR_NONE,
+                &in_private,
+                &in_public,
+                &mut handle,
+            );
+            self.flush_session(session);
+            check(rc, "Esys_Load")?;
+            let mut name_ptr: *mut sys::TPM2B_NAME = std::ptr::null_mut();
+            let rc = sys::Esys_TR_GetName(self.esys, handle, &mut name_ptr);
+            check(rc, "Esys_TR_GetName")?;
+            let n = &*name_ptr;
+            let live_name = n.name[..n.size as usize].to_vec();
+            sys::Esys_Free(name_ptr as *mut _);
+            if live_name != data.name {
+                return Err(Error::Malformed(format!(
+                    "loaded object Name mismatch: stored {} live {}",
+                    data.name.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                    live_name.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                )));
+            }
+            Ok(DataObject {
+                handle,
+                ..data.clone()
+            })
+        }
+    }
+
+    /// TPM2_Unseal: recover the sealed data of a loaded data object,
+    /// authorized by the caller's (null-auth) session.
+    pub fn unseal(&mut self, item: u32) -> Result<Vec<u8>> {
+        unsafe {
+            let session = self.start_nullauth_session()?;
+            let mut out: *mut sys::TPM2B_SENSITIVE_DATA = std::ptr::null_mut();
+            let rc = sys::Esys_Unseal(self.esys, item, session, sys::ESYS_TR_NONE, sys::ESYS_TR_NONE, &mut out);
+            self.flush_session(session);
+            check(rc, "Esys_Unseal")?;
+            let d = &*out;
+            let bytes = d.buffer[..d.size as usize].to_vec();
+            sys::Esys_Free(out as *mut _);
+            Ok(bytes)
+        }
+    }
+
+    /// TPM2_Unseal authorized by a live policy session (the object must carry
+    /// a matching `authPolicy`). `session` is flushed on the way out.
+    pub fn unseal_policy(&mut self, item: u32, session: u32) -> Result<Vec<u8>> {
+        unsafe {
+            let mut out: *mut sys::TPM2B_SENSITIVE_DATA = std::ptr::null_mut();
+            let rc = sys::Esys_Unseal(self.esys, item, session, sys::ESYS_TR_NONE, sys::ESYS_TR_NONE, &mut out);
+            self.flush_session(session);
+            check(rc, "Esys_Unseal(policy)")?;
+            let d = &*out;
+            let bytes = d.buffer[..d.size as usize].to_vec();
+            sys::Esys_Free(out as *mut _);
+            Ok(bytes)
         }
     }
 }

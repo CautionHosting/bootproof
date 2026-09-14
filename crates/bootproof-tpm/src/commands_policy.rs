@@ -2,18 +2,22 @@
 //!
 //! A `sign` key is created with a `TPM2_PolicyPCR` auth policy: the TPM
 //! accepts the key's private operations (Quote, Sign) only while the live
-//! PCRs still match the policy. Per TPM 2.0 Part 1 the policy digest
-//! updates as:
+//! PCRs still match the policy. Per the ref model (ms-tpm-20-ref
+//! `src/command/EA/PolicyPCR.c`) the policy digest updates as:
 //!
 //! ```text
 //! authPolicy = H( prev_authPolicy
 //!                || TPM_CC_PolicyPCR        (0x0000017F, 4 bytes)
 //!                || TPML_PCR_SELECTION      (count u32 + selections)
-//!                || TPML_PCR_DIGEST         (count u32 + each digest TPM2B,
-//!                                           ascending index order) )
+//!                || pcrDigest               (SINGLE combined digest =
+//!                                            H(concat of the selected PCR
+//!                                            values, ascending index),
+//!                                            raw bytes, no size prefix) )
 //! ```
 //!
-//! with `prev_authPolicy` empty for the first policy command.
+//! with `prev_authPolicy` empty for the first policy command. Policy commands
+//! take `policySession` as a bare handle(1) and carry NO auth session
+//! (NO_SESSIONS): the command attribute row has no `HANDLE_1_USER`.
 
 use sha2::Sha256;
 use digest::Digest;
@@ -132,8 +136,17 @@ impl Tpm {
     /// over the given selection / per-PCR digests. Returns the live policy
     /// session (the caller flushes it).
     ///
-    /// `per_pcr` must be the selected PCR values in ascending index order
-    /// (each a full digest, matching the selection's hash algorithm).
+    /// Wire format (TCG 2.0 Part 1, `PolicyPCR_fp.h` — confirmed against
+    /// ms-tpm-20-ref): `policySession` is the command's **handle(1)** (its
+    /// RC modifier is `TPM_RC_H+TPM_RC_1` = 0x0184, the failure we hit when
+    /// the handle area was empty). Parameters follow in the order
+    /// `pcrDigest TPM2B_DIGEST` (a SINGLE digest = the TPM-computed
+    /// `H(concat of the selected PCR values, ascending index)` —
+    /// `PCRComputeCurrentDigest` in the ref model), then `pcrs
+    /// TPML_PCR_SELECTION`. `per_pcr` must be the selected PCR values in
+    /// ascending index order (each a full digest, matching the selection's
+    /// hash algorithm); we combine them into the single digest the TPM
+    /// expects.
     pub fn start_policy_pcr_session(
         &mut self,
         selections: &[PcrSelection],
@@ -144,31 +157,37 @@ impl Tpm {
         // hierarchy handle is separate.
         let session = self.start_auth_session(crate::constants::rh::NULL, TPM_SE_POLICY)?;
 
-        // params: pcrSelect TPML_PCR_SELECTION | pcrs TPML_PCR_DIGEST
-        let mut params = marshal_pcr_selection_list(selections);
-        params.extend_from_slice(&(per_pcr.len() as u32).to_be_bytes());
-        for (_idx, d) in per_pcr {
-            params.extend_from_slice(&(d.len() as u16).to_be_bytes());
-            params.extend_from_slice(d);
-        }
+        // pcrDigest: the single combined digest the TPM computes itself —
+        // H(concat of the selected PCR values, ascending index).
+        let combined = combine_pcr_digest(per_pcr);
 
-        // PolicyPCR has no handles; cpHash entity is empty.
-        let (rc, body) = self.call_with_session(
-            cc::POLICY_PCR as u32,
-            &[],
-            &[],
-            &params,
-            &session,
-            &[],
-        )?;
-        if rc != 0 {
-            // Release the session context: the firmware's pool is small and
-            // a leaked session here starves the next CreatePrimary (0x0902).
-            let _ = self.flush_context(session.handle);
-            return Err(Error::Tpm(rc as u16, crate::error::rc_name(rc as u16)));
+        // params (ref-model order, PolicyPCR_fp.h): pcrDigest TPM2B_DIGEST
+        // | pcrs TPML_PCR_SELECTION.
+        let mut params = Vec::new();
+        params.extend_from_slice(&(combined.len() as u16).to_be_bytes());
+        params.extend_from_slice(&combined);
+        params.extend_from_slice(&marshal_pcr_selection_list(selections));
+
+        // PolicyPCR carries NO authorization session. The ref-model command
+        // attribute row is IS_IMPLEMENTED+DECRYPT_2+ALLOW_TRIAL — no
+        // HANDLE_1_USER — so `policySession` is a bare handle(1), not an auth
+        // entity, and the command is sent as NO_SESSIONS (tss2
+        // Esys_PolicyCommandCode passes ESYS_TR_NONE for all three session
+        // slots). Putting the policy session in the auth area instead trips
+        // ParseSessionBuffer's "no associated handle + no decrypt/encrypt/
+        // audit" check (RC 0x0982, session(1) inconsistent attributes).
+        let mut cmd = Command::new(cc::POLICY_PCR, st::NO_SESSIONS);
+        cmd.push_u32(session.handle); // policySession = handle(1)
+        cmd.push_bytes(&params);
+        match self.call(&cmd) {
+            Ok(_) => Ok(session),
+            Err(e) => {
+                // Release the session context: the firmware's pool is small and
+                // a leaked session here starves the next CreatePrimary (0x0902).
+                let _ = self.flush_context(session.handle);
+                Err(e)
+            }
         }
-        let _ = body;
-        Ok(session)
     }
 
     /// Create a primary ECC signing key bound to a PCR policy in the OWNER
@@ -195,6 +214,33 @@ impl Tpm {
         crate::commands_key::parse_create_primary(&body)
     }
 
+    /// TPM2_PolicyGetDigest (CC 0x0189) over an existing policy session:
+    /// returns the session's current policy digest. `policySession` is the
+    /// command's handle(1) (`PolicyGetDigest_fp.h`: `RC_PolicyGetDigest_
+    /// policySession = TPM_RC_H+TPM_RC_1`); no parameters; no auth session
+    /// (NO_SESSIONS); the response is a single `TPM2B_DIGEST`.
+    pub fn policy_get_digest(&mut self, session: &Session) -> Result<Vec<u8>> {
+        let mut cmd = Command::new(cc::POLICY_GET_DIGEST, st::NO_SESSIONS);
+        cmd.push_u32(session.handle); // policySession = handle(1)
+        match self.call(&cmd) {
+            Ok((_rc, body)) => {
+                // policyDigest TPM2B_DIGEST: u16 size + bytes.
+                if body.len() < 2 {
+                    return Err(Error::Malformed("PolicyGetDigest: truncated".into()));
+                }
+                let sz = u16::from_be_bytes([body[0], body[1]]) as usize;
+                if body.len() < 2 + sz {
+                    return Err(Error::Malformed("PolicyGetDigest: truncated digest".into()));
+                }
+                Ok(body[2..2 + sz].to_vec())
+            }
+            Err(e) => {
+                let _ = self.flush_context(session.handle);
+                Err(e)
+            }
+        }
+    }
+
     /// Read an object's public area and name raw (works for persistent NV
     /// indexes too, where the "public" data is the raw stored bytes, e.g. an
     /// X.509 EK certificate).
@@ -217,22 +263,46 @@ impl Tpm {
     }
 }
 
+/// The combined PCR digest the TPM computes internally for `TPM2_PolicyPCR`
+/// (`PCRComputeCurrentDigest` in the ref model): `H(concat of the selected
+/// PCR values, ascending index)` — the same combination the Quote's
+/// `pcrValue` digest uses. `per_pcr` is sorted by index so the concatenation
+/// is deterministic regardless of input order.
+pub fn combine_pcr_digest(per_pcr: &[(u8, Vec<u8>)]) -> Vec<u8> {
+    let mut sorted: Vec<&(u8, Vec<u8>)> = per_pcr.iter().collect();
+    sorted.sort_by_key(|(i, _)| *i);
+    let mut h = Sha256::new();
+    for (_, d) in sorted {
+        h.update(d);
+    }
+    h.finalize().to_vec()
+}
+
 /// The expected `authPolicy` after a single `TPM2_PolicyPCR` (empty previous
-/// policy). Per TPM 2.0 Part 1 the policy digest updates as
-/// `H( policyDigest || TPM_CC_PolicyPCR || pcrSelections || pcrDigests )`,
-/// where `pcrDigests` is the full `TPML_PCR_DIGEST` (count u32 + each digest
-/// as a TPM2B, ascending index order).
+/// policy). Per the ref model `TPM2_PolicyPCR` (ms-tpm-20-ref
+/// src/command/EA/PolicyPCR.c) the digest updates as
+/// `H( policyDigest || TPM_CC_PolicyPCR || PCRS || pcrDigest )` where `PCRS`
+/// is the marshaled `TPML_PCR_SELECTION` and `pcrDigest` is the SINGLE
+/// combined digest (raw bytes, no size prefix — `CryptDigestUpdate2B` hashes
+/// the buffer only).
+///
+/// **Dialect divergence (verified against the live SEV-SNP NitroTPM):** this
+/// firmware seeds a fresh policy session's `policyDigest` with a full
+/// zero-filled digest buffer (32 bytes for SHA256), NOT the empty buffer the
+/// reference model uses. So the "previous" contribution here is 32 zero
+/// bytes. Proven byte-exact: live `PolicyGetDigest` == `H(0x00×32 || CC ||
+/// TPML || combined)`. This is the value a key created under this policy
+/// carries as `authPolicy`, and the value a caller must present (or
+/// reproduce in a fresh policy session) to use the key.
 pub fn policy_pcr_auth_policy(
     selections: &[PcrSelection],
     per_pcr: &[(u8, Vec<u8>)],
 ) -> Vec<u8> {
     let mut h = Sha256::new();
+    h.update([0u8; 32]); // dialect: previous policyDigest is a zero-filled buffer
     h.update((cc::POLICY_PCR as u32).to_be_bytes());
     h.update(marshal_pcr_selection_list(selections));
-    h.update(&(per_pcr.len() as u32).to_be_bytes());
-    for (_, d) in per_pcr {
-        h.update(&(d.len() as u16).to_be_bytes());
-        h.update(d);
-    }
+    let combined = combine_pcr_digest(per_pcr);
+    h.update(&combined);
     h.finalize().to_vec()
 }
