@@ -31,7 +31,7 @@ use bootproof_tpm::{policy_pcr_auth_policy, PcrSelection, Tpm};
 
 /// Wire format for a sealed volume key. Persisted as JSON so it can be carried
 /// out of the guest / into a key store. All byte fields are base64 via `B64`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SealedBlob {
     /// Format version (currently 1).
     pub version: u32,
@@ -240,10 +240,18 @@ pub fn unseal(device: &Path, blob: &SealedBlob, tpm_only: bool) -> anyhow::Resul
         );
     }
 
-    // outData: TPM2B_SENSITIVE_DATA { u16 size, bytes }. This firmware
-    // prepends an extra u32 before the TPM2B (same quirk as CreatePrimary), so
-    // the size prefix sits at offset 4, not 0. Dialect offset first, then the
-    // spec offset.
+    decode_outdata(&body)
+}
+
+/// Decode the Unseal `outData` (the sealed `TPM2B_SENSITIVE_DATA`).
+///
+/// Spec form: `TPM2B_SENSITIVE_DATA { u16 size, bytes }` — the size prefix is
+/// the first two bytes. This platform's firmware (StageX / NitroTPM dialect)
+/// prepends an extra `u32` before the TPM2B (the same quirk as CreatePrimary),
+/// so the size prefix sits at offset 4, not 0. We try the dialect offset first
+/// (any body long enough to hold a 4-byte prefix + size), then the spec offset.
+/// Returns the raw sealed bytes.
+fn decode_outdata(body: &[u8]) -> anyhow::Result<Vec<u8>> {
     let (dsz, dstart) = if body.len() >= 4 + 2 {
         (u16::from_be_bytes([body[4], body[5]]) as usize, 6)
     } else {
@@ -257,4 +265,111 @@ pub fn unseal(device: &Path, blob: &SealedBlob, tpm_only: bool) -> anyhow::Resul
         );
     }
     Ok(body[dstart..dstart + dsz].to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+
+    fn blob(pcrs: &[u8], data: &[u8]) -> SealedBlob {
+        SealedBlob {
+            version: 1,
+            pcrs: pcrs.to_vec(),
+            policy_digest: B64::new([0xab; 32]),
+            private: B64::new(data),
+            public: B64::new([0xcd; 64]),
+            name: B64::new([0xef; 34]),
+        }
+    }
+
+    /// serde round-trip: serialize to JSON, parse back, fields identical.
+    #[test]
+    fn sealed_blob_serde_roundtrip() {
+        let b = blob(&[5, 7], b"stagex-dmext-d4-testkey-v1");
+        let json = b.to_json_pretty().unwrap();
+        let back: SealedBlob = serde_json::from_slice(&json).unwrap();
+        assert_eq!(back, b);
+    }
+
+    /// The JSON is valid UTF-8, human-inspectable, and round-trips through
+    /// serde_json::Value without loss (the on-disk / key-store form).
+    #[test]
+    fn sealed_blob_json_is_valid_and_inspectable() {
+        let b = blob(&[5, 7, 9], b"key-bytes");
+        let json = b.to_json_pretty().unwrap();
+        let _ = std::str::from_utf8(&json).expect("json must be valid utf-8");
+        let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(v["version"], 1);
+        assert_eq!(v["pcrs"][0], 5);
+        assert_eq!(v["pcrs"][2], 9);
+        // base64 field decodes back to the exact bytes
+        let priv64 = v["private"].as_str().unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD.decode(priv64).unwrap();
+        assert_eq!(decoded, b"key-bytes");
+    }
+
+    /// `selection` sorts ascending and packs the PCR bits into the 3-byte
+    /// `pcr_select` (byte i holds PCRs 8i..8i+7, bit i%8). Input [9,5,7] ->
+    /// ascending [5,7,9]; bits: 5 -> b0 bit5 (0x20), 7 -> b0 bit7 (0x80),
+    /// 9 -> b1 bit1 (0x02). So pcr_select = [0xA0, 0x02, 0x00], hash = SHA-256.
+    #[test]
+    fn selection_sorts_and_packs_bits() {
+        let sel = selection(&[9, 5, 7]);
+        assert_eq!(sel.hash, alg::SHA256);
+        assert_eq!(sel.pcr_select, [0xA0, 0x02, 0x00]);
+    }
+
+    /// A single high PCR (>= 16) lands in byte 2. PCR 20 -> byte2 bit4 (0x10).
+    #[test]
+    fn selection_high_pcr_byte2() {
+        let sel = selection(&[20]);
+        assert_eq!(sel.pcr_select, [0x00, 0x00, 0x10]);
+    }
+
+    /// Dialect outData: a 4-byte prefix + {u16 size, bytes}. The size prefix is
+    /// at offset 4, data at offset 6. A 26-byte key -> size 0x001a.
+    #[test]
+    fn decode_outdata_dialect_prefix() {
+        let key: Vec<u8> = b"stagex-dmext-d4-testkey-v1".to_vec(); // 26B
+        assert_eq!(key.len(), 26);
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8, 0, 0, 0]); // the extra u32
+        body.extend_from_slice(&(26u16).to_be_bytes()); // size at offset 4
+        body.extend_from_slice(&key); // data at offset 6
+        assert_eq!(decode_outdata(&body).unwrap(), key);
+    }
+
+    /// A 32-byte (real LUKS volume key size) key through the dialect path.
+    #[test]
+    fn decode_outdata_32b_key() {
+        let key = [0x5a; 32];
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8, 0, 0, 0]);
+        body.extend_from_slice(&(32u16).to_be_bytes());
+        body.extend_from_slice(&key);
+        assert_eq!(decode_outdata(&body).unwrap(), key.to_vec());
+    }
+
+    /// Spec form (no 4-byte prefix, body shorter than 6): size at offset 0.
+    #[test]
+    fn decode_outdata_spec_small_body() {
+        let key: Vec<u8> = vec![1, 2, 3];
+        let mut body = Vec::new();
+        body.extend_from_slice(&(3u16).to_be_bytes()); // size at offset 0
+        body.extend_from_slice(&key);
+        // body.len() == 5 < 6 -> spec path
+        assert_eq!(decode_outdata(&body).unwrap(), key);
+    }
+
+    /// Truncation: declared size larger than the body -> error (fail-closed).
+    #[test]
+    fn decode_outdata_truncated_is_error() {
+        // dialect prefix declares size 26 but only 4 data bytes present
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8, 0, 0, 0]);
+        body.extend_from_slice(&(26u16).to_be_bytes());
+        body.extend_from_slice(&[0u8; 4]);
+        assert!(decode_outdata(&body).is_err());
+    }
 }
