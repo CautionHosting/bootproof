@@ -26,6 +26,30 @@ fn main() -> Result<()> {
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:2402".into());
 
+    // --decode <rc...>: decode TPM/tss2 RC codes with the DIALECT's own
+    // RC decoder (no device needed). e.g. keytest --decode 0x18a
+    if std::env::args().any(|a| a == "--decode") {
+        #[cfg(feature = "esys")]
+        {
+            let args: Vec<String> = std::env::args().collect();
+            let i = args.iter().position(|a| a == "--decode").unwrap();
+            for s in args.iter().skip(i + 1) {
+                if let Ok(rc) = u32::from_str_radix(s.trim_start_matches("0x"), 16) {
+                    println!("{s} = {}", bootproof_tpm::esys::decode_rc(rc));
+                } else if let Ok(rc) = u32::from_str_radix(s, 16) {
+                    println!("{s} = {}", bootproof_tpm::esys::decode_rc(rc));
+                }
+            }
+            return Ok(());
+        }
+        #[cfg(not(feature = "esys"))]
+        {
+            return Err(bootproof_tpm::Error::Other(
+                "bootproof-tpm was built without the `esys` feature".into(),
+            ));
+        }
+    }
+
     // --rsatpl: build an RSA-2048 restricted-decrypt template, print its
     // dialect-marshalled wire bytes (via the platform tss2 Tss2_MU), then
     // CreatePrimary through the EsysTpm backend. Capture with BP_LOG_TCTI=1
@@ -55,6 +79,266 @@ fn main() -> Result<()> {
                 ),
                 Err(e) => println!("[rs] CreatePrimary RSA ERR {e}"),
             }
+            return Ok(());
+        }
+        #[cfg(not(feature = "esys"))]
+        {
+            return Err(bootproof_tpm::Error::Other(
+                "bootproof-tpm was built without the `esys` feature".into(),
+            ));
+        }
+    }
+
+    // --sepprobe: bisect the TPM2_SE wire byte for a policy session. Tries
+    // 0x00 (HMAC), 0x01, 0x02 (std POLICY), 0x03 (TRIAL) through
+    // StartAuthSession -> PolicyRestart -> PolicyPCR -> PolicyGetDigest.
+    // keytest /dev/tpm0 --sepprobe
+    if std::env::args().any(|a| a == "--sepprobe") {
+        #[cfg(feature = "esys")]
+        {
+            use bootproof_tpm::esys::EsysTpm;
+            if !target.starts_with('/') {
+                return Err(bootproof_tpm::Error::Other(
+                    "--sepprobe needs a device path (/dev/tpm0)".into(),
+                ));
+            }
+            let mut tpm = EsysTpm::open(&PathBuf::from(&target))?;
+            tpm.ensure_started()?;
+            let _ = tpm.flush_all();
+            let pcr = PcrSelection::new(alg::SHA256, &[7]);
+            for st in [0x00u8, 0x01, 0x02, 0x03] {
+                match tpm.start_auth_session(st) {
+                    Err(e) => println!("[p] SE=0x{st:02x} START FAILED: {e}"),
+                    Ok(sess) => {
+                        println!("[p] SE=0x{st:02x} session=0x{sess:08x}");
+                        // Fresh-session digest (is this a usable policy session?).
+                        match tpm.policy_get_digest(sess) {
+                            Ok(d) => println!("[p]   GetDigest(fresh) OK {}B", d.len()),
+                            Err(e) => println!("[p]   GetDigest(fresh) FAIL: {e}"),
+                        }
+                        // Add PCR7 (the op the working raw path used).
+                        match tpm.policy_pcr(sess, None, &[pcr]) {
+                            Ok(()) => println!("[p]   PolicyPCR OK"),
+                            Err(e) => println!("[p]   PolicyPCR FAIL: {e}"),
+                        }
+                        match tpm.policy_get_digest(sess) {
+                            Ok(d) => println!("[p]   GetDigest(postPCR) OK {}B {}", d.len(), hex(&d)),
+                            Err(e) => println!("[p]   GetDigest(postPCR) FAIL: {e}"),
+                        }
+                        // PolicyRestart (the op that has been failing).
+                        match tpm.policy_restart(sess) {
+                            Ok(()) => println!("[p]   PolicyRestart OK"),
+                            Err(e) => println!("[p]   PolicyRestart FAIL: {e}"),
+                        }
+                        tpm.flush_session(sess);
+                    }
+                }
+            }
+            return Ok(());
+        }
+        #[cfg(not(feature = "esys"))]
+        {
+            return Err(bootproof_tpm::Error::Other(
+                "bootproof-tpm was built without the `esys` feature".into(),
+            ));
+        }
+    }
+
+    // --rawpolicy: prove the RAW hand-rolled policy session path on a device.
+    // pcr_read(7) -> start_policy_pcr_session (explicit live PCR 7) ->
+    // policy_get_digest, cross-checked against the offline
+    // policy_pcr_auth_policy() computation. keytest /dev/tpm0 --rawpolicy
+    if std::env::args().any(|a| a == "--rawpolicy") {
+        if !target.starts_with('/') {
+            return Err(bootproof_tpm::Error::Other(
+                "--rawpolicy needs a device path (/dev/tpm0)".into(),
+            ));
+        }
+        let mut tpm = Tpm::open_started(&PathBuf::from(&target))?;
+        let pcr = PcrSelection::new(alg::SHA256, &[7]);
+        let live = tpm.pcr_read(&[pcr])?;
+        let pcr7 = live
+            .values
+            .first()
+            .map(|v| v.digest.clone())
+            .ok_or_else(|| bootproof_tpm::Error::Other("no PCR 7 value".into()))?;
+        if pcr7.len() != 32 {
+            return Err(bootproof_tpm::Error::Other(format!(
+                "PCR 7 digest is {}B (want 32)",
+                pcr7.len()
+            )));
+        }
+        println!("[rp0] PCR7 = {}", hex(&pcr7));
+        let sess = tpm.start_policy_pcr_session(&[pcr], &[(7, pcr7.clone())])?;
+        println!("[rp1] raw policy session OK handle=0x{:08x}", sess.handle);
+        let digest = tpm.policy_get_digest(&sess)?;
+        let _ = tpm.flush_context(sess.handle);
+        if digest.len() != 32 {
+            return Err(bootproof_tpm::Error::Other(format!(
+                "live policy digest is {}B (want 32)",
+                digest.len()
+            )));
+        }
+        println!("[rp2] live PolicyGetDigest = {}", hex(&digest));
+        let offline = bootproof_tpm::policy_pcr_auth_policy(&[pcr], &[(7, pcr7.clone())]);
+        println!("[rp3] offline policy_pcr_auth_policy = {}", hex(&offline));
+        if digest == offline {
+            println!("[rp4] MATCH: live session digest == offline computation (32B)");
+        } else {
+            return Err(bootproof_tpm::Error::Other(
+                "live policy digest != offline computation".into(),
+            ));
+        }
+        return Ok(());
+    }
+
+    // --khprobe: bisect which keyedHash scheme the firmware accepts. Tries
+    // XOR/KDF2, XOR/KDF1, HMAC/SHA256, NULL against a storage primary and
+    // prints the RC for each. keytest /dev/tpm0 --khprobe
+    if std::env::args().any(|a| a == "--khprobe") {
+        #[cfg(feature = "esys")]
+        {
+            use bootproof_tpm::esys::EsysTpm;
+            if !target.starts_with('/') {
+                return Err(bootproof_tpm::Error::Other(
+                    "--khprobe needs a device path (/dev/tpm0)".into(),
+                ));
+            }
+            let mut tpm = EsysTpm::open(&PathBuf::from(&target))?;
+            tpm.ensure_started()?;
+            let _ = tpm.flush_all();
+            let owner = bootproof_tpm::esys::rh_std::OWNER;
+            let parent = tpm.create_storage_primary(owner)?;
+            println!("[k0] storage parent 0x{:08x}", parent.handle);
+            let data = b"khprobe";
+            let cands: [(u16, u16, &str); 4] = [
+                (0x000A, 0x0021, "XOR/KDF2"),
+                (0x000A, 0x0020, "XOR/KDF1"),
+                (0x0005, 0x0000, "HMAC/SHA256"),
+                (0x0010, 0x0000, "NULL"),
+            ];
+            for (scheme, kdf, name) in cands {
+                match tpm.create_data_object_with_scheme(parent.handle, data, &[], scheme, kdf) {
+                    Ok(o) => println!(
+                        "[k] {} OK private={}B name={}",
+                        name,
+                        o.private.len(),
+                        hex(&o.name)
+                    ),
+                    Err(e) => println!("[k] {} REJECTED: {e}", name),
+                }
+            }
+            return Ok(());
+        }
+        #[cfg(not(feature = "esys"))]
+        {
+            return Err(bootproof_tpm::Error::Other(
+                "bootproof-tpm was built without the `esys` feature".into(),
+            ));
+        }
+    }
+
+    // --sealtest: validate the sealed-data-object path (EsysTpm). Seals a
+    // keyedHash data object under the OWNER storage parent, Load + Unseal
+    // round-trips it (no policy), then exercises an isolated policy session
+    // (Restart -> PCR -> GetDigest) with a positive and a negative unseal.
+    if std::env::args().any(|a| a == "--sealtest") {
+        #[cfg(feature = "esys")]
+        {
+            use bootproof_tpm::esys::EsysTpm;
+            if !target.starts_with('/') {
+                return Err(bootproof_tpm::Error::Other(
+                    "--sealtest needs a device path (/dev/tpm0)".into(),
+                ));
+            }
+            let mut tpm = EsysTpm::open(&PathBuf::from(&target))?;
+            tpm.ensure_started()?;
+            let _ = tpm.flush_all();
+            let owner = bootproof_tpm::esys::rh_std::OWNER;
+            // The Create PARENT must be a storage (restricted+decrypt) key.
+            // A signing primary here is rejected by the firmware with 0x18A
+            // ("handle(1): the type of the value is not appropriate").
+            let parent = tpm.create_storage_primary(owner)?;
+            println!(
+                "[s0] storage parent OK handle=0x{:08x} (rsa restricted+decrypt)",
+                parent.handle
+            );
+
+            // Leg 1: no-policy data object, Create -> Load -> Unseal.
+            let payload = b"stagex-dmext-sealtest-v1";
+            let obj = tpm.create_data_object(parent.handle, payload, &[])?;
+            println!(
+                "[s1] Create data object OK private={}B public={}B name={}",
+                obj.private.len(),
+                obj.public.len(),
+                hex(&obj.name)
+            );
+            let loaded = tpm.load_data_object(parent.handle, &obj)?;
+            println!("[s2] Load OK handle=0x{:08x} (Name cross-checked)", loaded.handle);
+            let got = tpm.unseal(loaded.handle)?;
+            if got != payload {
+                return Err(bootproof_tpm::Error::Other(
+                    "unseal round-trip mismatch".into(),
+                ));
+            }
+            println!("[s3] Unseal OK: {} bytes match", got.len());
+
+            // Leg 2: isolated policy session — Restart -> PCR(7, current)
+            // -> GetDigest. Verify the digest is non-empty and deterministic
+            // (a second identical session yields the same digest).
+            let pcr = PcrSelection::new(alg::SHA256, &[7]);
+            let live_pcr = tpm.pcr_read(&[PcrSelection::new(alg::SHA256, &[7])])?;
+            let pcr7 = live_pcr
+                .values
+                .first()
+                .map(|v| v.digest.clone())
+                .ok_or_else(|| bootproof_tpm::Error::Other("no PCR 7 value".into()))?;
+            let sess = tpm.start_policy_session()?;
+            tpm.policy_restart(sess)?;
+            tpm.policy_pcr(sess, None, &[pcr])?;
+            let digest = tpm.policy_get_digest(sess)?;
+            tpm.flush_session(sess);
+            if digest.len() != 32 {
+                return Err(bootproof_tpm::Error::Other(format!(
+                    "policy digest wrong length: {} (want 32)",
+                    digest.len()
+                )));
+            }
+            let sess_b = tpm.start_policy_session()?;
+            tpm.policy_restart(sess_b)?;
+            tpm.policy_pcr(sess_b, None, &[pcr])?;
+            let digest_b = tpm.policy_get_digest(sess_b)?;
+            tpm.flush_session(sess_b);
+            if digest != digest_b {
+                return Err(bootproof_tpm::Error::Other(
+                    "policy digest not deterministic across sessions".into(),
+                ));
+            }
+            println!(
+                "[s4] policy session OK pcr7={} digest={} (deterministic)",
+                hex(&pcr7),
+                hex(&digest)
+            );
+
+            // Leg 3: negative — an explicit PCR 7 digest that does not match
+            // the live value must be rejected (by PolicyPCR or Unseal).
+            let wrong = pcr7.iter().map(|b| b ^ 0xFF).collect::<Vec<u8>>();
+            let sess2 = tpm.start_policy_session()?;
+            tpm.policy_restart(sess2)?;
+            let res = tpm.policy_pcr(sess2, Some(&wrong), &[pcr]).and_then(|()| {
+                tpm.unseal_policy(loaded.handle, sess2)
+            });
+            tpm.flush_session(sess2);
+            match res {
+                Err(e) => println!("[s5] negative policy correctly rejected: {e}"),
+                Ok(_) => {
+                    return Err(bootproof_tpm::Error::Other(
+                        "negative policy unexpectedly succeeded".into(),
+                    ))
+                }
+            }
+
+            println!("\nALL SEALTEST COMMANDS OK");
             return Ok(());
         }
         #[cfg(not(feature = "esys"))]
