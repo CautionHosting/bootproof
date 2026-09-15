@@ -106,8 +106,7 @@ fn verify_cert_and_bundle_with_root(
     let end_cert = webpki::EndEntityCert::try_from(cert)
         .map_err(|_| Error::MalformedData("provided cert".into()))?;
     let bundle = bundle.iter().map(Vec::as_slice).collect::<Vec<_>>();
-    let adjusted_time = time_since_epoch.saturating_add(CLOCK_SKEW_TOLERANCE);
-    let time = webpki::Time::from_seconds_since_unix_epoch(adjusted_time.as_secs());
+    let time = webpki::Time::from_seconds_since_unix_epoch(time_since_epoch.as_secs());
 
     if let Err(e) = end_cert.verify_is_valid_tls_server_cert(
         &[&webpki::ECDSA_P384_SHA384],
@@ -191,20 +190,48 @@ fn verify_es384(pubkey: &[u8], sig: &[u8], data: &[u8]) -> Result<()> {
 }
 
 impl VerifiableSignedAttestationFormat for Nitro {
-    // Strategy:
-    // * Validate provided nonce
-    // * Parse payload to get COSE signature and CA info
-    // * Verify Nitro certificate against AWS root
-    // * Verify COSE signature
-    // * Verify PCRs
-    // * Verify nonce
-
-    // TODO: Should 
-
     #[tracing::instrument(skip(self, nonce))]
     fn verify(&self, time_since_epoch: Duration, nonce: &dyn AsNonce) -> Result<Value> {
-        debug!("validating provided nonce");
-        let nonce = nonce.as_nonce()?;
+        self.verify_with_root(
+            Some(time_since_epoch.saturating_add(CLOCK_SKEW_TOLERANCE)),
+            Some(nonce),
+            AWS_NITRO_ROOT_CA_DER,
+        )
+    }
+}
+
+impl Nitro {
+    /// Verify a persisted attestation at its signed generation timestamp.
+    ///
+    /// This proves historical provenance, not freshness. Callers must check the
+    /// returned `user_data` against the expected artifact and apply their policy
+    /// to the authenticated timestamp. Use `verify` with a fresh challenge for
+    /// live attestation.
+    ///
+    /// `Some(nonce)` requires an exact match and the usual minimum nonce length.
+    /// `None` requires an absent or null nonce; it does not ignore a present nonce.
+    /// Certificate validity is checked without a clock-skew adjustment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid timestamp, certificate chain, signature,
+    /// PCRs, or nonce. No payload is returned before all checks succeed.
+    pub fn verify_at_attestation_time(
+        &self,
+        expected_nonce: Option<&dyn AsNonce>,
+    ) -> Result<Value> {
+        self.verify_with_root(None, expected_nonce, AWS_NITRO_ROOT_CA_DER)
+    }
+
+    // Only production entry points choose the AWS root. Tests use a local root
+    // to exercise signed documents that cannot be generated without Nitro.
+    fn verify_with_root(
+        &self,
+        time_since_epoch: Option<Duration>,
+        expected_nonce: Option<&dyn AsNonce>,
+        root: &[u8],
+    ) -> Result<Value> {
+        let nonce = expected_nonce.map(AsNonce::as_nonce).transpose()?;
 
         debug!("parsing cose data");
         let cose_signed_blob = CoseSign1::from_slice(&self.data)
@@ -220,12 +247,11 @@ impl VerifiableSignedAttestationFormat for Nitro {
 
         debug!("extracing cert and ca bundle");
         let (cert, cabundle) = extract_cert_and_bundle(&payload)?;
-        verify_cert_and_bundle_with_root(
-            &cert,
-            &cabundle,
-            AWS_NITRO_ROOT_CA_DER,
-            time_since_epoch,
-        )?;
+        let verification_time = match time_since_epoch {
+            Some(time) => time,
+            None => attestation_timestamp(&payload)?,
+        };
+        verify_cert_and_bundle_with_root(&cert, &cabundle, root, verification_time)?;
 
         debug!("parsing x509 certificate");
         let (remainder, cert) = X509Certificate::from_der(&cert).map_err(|_| {
@@ -283,17 +309,39 @@ impl VerifiableSignedAttestationFormat for Nitro {
         }
 
         debug!("verifying nonce");
-        if let Value::Map(map) = &payload && let Some(Value::Bytes(validated_nonce)) = map.get(&Value::Text("nonce".into())) {
-            if validated_nonce != nonce {
-                return Err(Error::InvalidNonce);
-            }
-        } else {
+        let Value::Map(map) = &payload else {
             return Err(Error::MissingData("cose.payload.nonce".into()));
+        };
+        match (nonce, map.get(&Value::Text("nonce".into()))) {
+            (Some(expected), Some(Value::Bytes(actual))) if actual == expected => {}
+            (Some(_), Some(Value::Bytes(_))) => return Err(Error::InvalidNonce),
+            (Some(_), _) => return Err(Error::MissingData("cose.payload.nonce".into())),
+            (None, None | Some(Value::Null)) => {}
+            (None, _) => return Err(Error::InvalidNonce),
         }
 
         Ok(payload)
     }
 }
+
+fn attestation_timestamp(payload: &Value) -> Result<Duration> {
+    let Value::Map(map) = payload else {
+        return Err(Error::MissingData("cose.payload.timestamp".into()));
+    };
+    let Some(timestamp) = map.get(&Value::Text("timestamp".into())) else {
+        return Err(Error::MissingData("cose.payload.timestamp".into()));
+    };
+    let Value::Integer(timestamp) = timestamp else {
+        return Err(Error::MalformedData("cose.payload.timestamp".into()));
+    };
+    let milliseconds = u64::try_from(*timestamp)
+        .map_err(|_| Error::MalformedData("cose.payload.timestamp".into()))?;
+    Ok(Duration::from_millis(milliseconds))
+}
+
+#[cfg(test)]
+#[path = "nitro_historical_tests.rs"]
+mod historical_tests;
 
 #[cfg(test)]
 mod tests {
@@ -306,13 +354,13 @@ mod tests {
     }
 
     // A time shortly after a valid attestation was generated.
-    const CBOR_DATA: &'static [u8] = include_bytes!("data/aws-test.cbor");
+    pub(super) const CBOR_DATA: &'static [u8] = include_bytes!("data/aws-test.cbor");
     const VALID_DURATION: std::time::Duration = std::time::Duration::from_secs(1766510416);
-    const NONCE: LazyLock<Vec<u8>> = LazyLock::new(|| {
+    pub(super) const NONCE: LazyLock<Vec<u8>> = LazyLock::new(|| {
         hex::decode("d041b23bce8678bbc7c174bd8494c4f9759386eec963ec69bfd45c1452b10636").unwrap()
     });
 
-    const PCRS: LazyLock<NitroPcrs> = LazyLock::new(|| {
+    pub(super) const PCRS: LazyLock<NitroPcrs> = LazyLock::new(|| {
         let hex0 = hex::decode("ef093e4c1fd13878956589833c0e396b935cdf5ae45c1cc595e1a19a6da5812850f0ef3e77df918cb2a86d88ddf9cc03").unwrap();
         let hex1 = hex::decode("ef093e4c1fd13878956589833c0e396b935cdf5ae45c1cc595e1a19a6da5812850f0ef3e77df918cb2a86d88ddf9cc03").unwrap();
         let hex2 = hex::decode("21b9efbc184807662e966d34f390821309eeac6802309798826296bf3e8bec7c10edb30948c90ba67310f7b964fc500a").unwrap();
