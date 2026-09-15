@@ -124,13 +124,14 @@ pub fn disk(
     // segment facts (cipher_spec, data offset in bytes, sector size). Read
     // ONLY the header region (hdr_size bytes), never the whole volume.
     let (cipher, seg_offset, seg_sector) = {
-        use std::io::Read;
+        use std::io::{Read, Seek, SeekFrom};
         let mut f = File::open(disk)?;
         // First 4096 B: binary superblock; hdr_size is a big-endian u64 at offset 8.
         let mut bin = [0u8; 4096];
         f.by_ref().take(4096).read_exact(&mut bin)?;
         let hdr_size = u64::from_be_bytes(bin[8..16].try_into().unwrap()) as usize;
         let mut hdr = vec![0u8; hdr_size.max(4096)];
+        f.seek(SeekFrom::Start(0))?;
         f.read_exact(&mut hdr)?;
         let h2 = luks::Luks2Header::parse(&hdr)?;
         let s = h2
