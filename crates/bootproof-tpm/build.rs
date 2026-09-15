@@ -27,22 +27,22 @@ fn main() {
 
         println!("cargo:rustc-link-arg=-L/usr/lib");
         println!("cargo:rustc-link-arg=-L/lib");
-        // Exact-archive (-l:libX.a) flags: dependents before dependencies.
-        // OpenSSL (musl static from the Rust pallet's /lib) follows
-        // libtss2-esys, which calls into it for session encryption.
-        println!("cargo:rustc-link-arg=-l:libtss2-esys.a");
-        println!("cargo:rustc-link-arg=-l:libcrypto.a");
-        println!("cargo:rustc-link-arg=-l:libtss2-rc.a");
-        println!("cargo:rustc-link-arg=-l:libtss2-sys.a");
+        // Dynamic link (policy: C libs link dynamically so a shared-library
+        // update never forces a Rust rebuild). The tss2 .so + libcrypto come
+        // from the rootfs (user-tpm2-tss, core-openssl); each tss2 .so records
+        // its own DT_NEEDED by SONAME, so the flags below only tell the linker
+        // which NEEDED entries to record. Plain `-l` (not `-l:libX.a`), and no
+        // `libc.a` (dynamic musl pulls libc through the loader). Dependents
+        // before dependencies.
+        println!("cargo:rustc-link-arg=-ltss2-esys");
+        println!("cargo:rustc-link-arg=-lcrypto");
+        println!("cargo:rustc-link-arg=-ltss2-rc");
+        println!("cargo:rustc-link-arg=-ltss2-sys");
         // Device TCTI linked directly so no dlopen is needed at runtime.
-        println!("cargo:rustc-link-arg=-l:libtss2-tcti-device.a");
-        println!("cargo:rustc-link-arg=-l:libtss2-tctildr.a");
+        println!("cargo:rustc-link-arg=-ltss2-tcti-device");
+        println!("cargo:rustc-link-arg=-ltss2-tctildr");
         // tss2-mu is referenced by most of the above, so it goes last.
-        println!("cargo:rustc-link-arg=-l:libtss2-mu.a");
-        // Static single-pass linking: libc (rand, dlopen stubs, unwinder)
-        // must come after every archive that references it. Exact archive:
-        // /lib/libc.so is the dynamic loader on musl systems.
-        println!("cargo:rustc-link-arg=-l:libc.a");
+        println!("cargo:rustc-link-arg=-ltss2-mu");
     }
     println!("cargo:rerun-if-changed=build.rs");
 }

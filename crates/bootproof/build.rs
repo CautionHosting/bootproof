@@ -1,4 +1,5 @@
-// Final-link tss2 wiring for the `bootproof` binary.
+// Final-link wiring for the `bootproof` binary: tss2 C stack + libdevmapper,
+// linked DYNAMICALLY against the guest rootfs's shared objects.
 //
 // Cargo applies a build script's `cargo:rustc-link-arg` only to the units the
 // package that emitted them actually builds; the flags do NOT propagate to a
@@ -8,32 +9,43 @@
 // own build script's args). But the production `bootproof` bin is a SEPARATE
 // package that merely depends on bootproof-tpm, so once dmext pulls in an
 // EsysTpm (and with it the whole tss2 C stack + the trampoline shim), that
-// bin's final link is missing every tss2 archive and the trampoline.o and
+// bin's final link is missing every tss2 symbol and the trampoline.o and
 // fails with undefined Tss2_MU_*/Esys_*/bp_* references.
 //
-// The fix is to re-emit the identical, ordered link-args from THIS package's
-// build script, because `rustc-link-arg` emitted by the top-level crate being
-// linked DOES reach the final link. This mirrors crates/bootproof-tpm/build.rs
-// exactly (same exact-archive order, dependents before dependencies, libc
-// last) plus a fresh compile of the shared trampoline.c.
+// The fix is to re-emit the ordered link-args from THIS package's build
+// script, because `rustc-link-arg` emitted by the top-level crate being linked
+// DOES reach the final link, plus a fresh compile of the shared trampoline.c.
 //
-// The tss2 archives come from the StageX tss2 image (COPY'd into / in the
-// Containerfile `build` target, so they land at /usr/lib/libtss2-*.a); libc.a
-// and libcrypto.a come from the pallet-rust base (/lib). clang is on PATH in
-// the same base.
+// Dynamic link (policy: C libs link dynamically so a shared-library update
+// never forces a Rust rebuild). The Containerfile `build` target COPYs the
+// StageX tss2 image (user-tpm2-tss) and lvm2 (user-lvm2) into /, so the shared
+// objects land at /usr/lib/libtss2-*.so and /usr/lib/libdevmapper.so. libcrypto
+// comes from the pallet-rust base (/lib). Each tss2 .so records its own
+// DT_NEEDED by SONAME, so the runtime loader resolves the rest; the flags here
+// only tell the linker which NEEDED entries to record. clang is on PATH in the
+// same base.
 fn main() {
     use std::path::Path;
     use std::process::Command;
 
     // Presence gate: fail loudly with a clear message if the build environment
-    // is missing the tss2 C stack (the primary archive; it pulls the rest in
-    // the link line below).
-    let esys = Path::new("/usr/lib/libtss2-esys.a");
+    // is missing the tss2 C stack (the primary shared object) or libdevmapper.
+    let esys = Path::new("/usr/lib/libtss2-esys.so");
     if !esys.is_file() {
         panic!(
-            "tss2 C stack not found at /usr/lib/libtss2-esys.a; build the \
+            "tss2 C stack not found at /usr/lib/libtss2-esys.so; build the \
              bootproof binary through the Containerfile `build` target, which \
-             COPYs the StageX tss2 image (the `esys` link line depends on it)"
+             COPYs the StageX tss2 + lvm2 images (the dynamic link line depends on them)"
+        );
+    }
+    let devmapper = Path::new("/usr/lib/pkgconfig/devmapper.pc");
+    if !devmapper.is_file() {
+        panic!(
+            "devmapper.pc not found at /usr/lib/pkgconfig/devmapper.pc; the \
+             Containerfile `build` target must COPY the StageX lvm2 image \
+             (user-lvm2) into / so devicemapper-sys can bindgen the dm_ioctl \
+             structs from libdevmapper.h at BUILD time (the crate itself does raw \
+             DM ioctls and links no libdevmapper)"
         );
     }
 
@@ -58,22 +70,32 @@ fn main() {
     println!("cargo:rustc-link-arg={obj}");
     println!("cargo:rustc-link-arg=-L/usr/lib");
     println!("cargo:rustc-link-arg=-L/lib");
-    // Exact-archive (-l:libX.a) flags: dependents before dependencies.
-    // OpenSSL (musl static from the pallet's /lib) follows libtss2-esys, which
-    // calls into it for session encryption.
-    println!("cargo:rustc-link-arg=-l:libtss2-esys.a");
-    println!("cargo:rustc-link-arg=-l:libcrypto.a");
-    println!("cargo:rustc-link-arg=-l:libtss2-rc.a");
-    println!("cargo:rustc-link-arg=-l:libtss2-sys.a");
+    // Dynamic link (per the "link C libs dynamically so they can be updated
+    // without rebuilding the Rust binaries" policy): the guest rootfs ships
+    // the tss2 shared objects (user-tpm2-tss) and libcrypto (core-openssl).
+    // A shared-library update never forces a Rust rebuild. Each tss2 .so
+    // records its own DT_NEEDED by SONAME, so the runtime loader resolves the
+    // rest; the flags here just tell the LINKER which NEEDED entries to record
+    // on the binary. Plain `-l` (not `-l:libX.a`): resolves to the .so at
+    // /usr/lib. No `libc.a`: dynamic musl pulls libc through the loader.
+    //
+    // NOTE: libdevmapper is NOT linked here. The stratis `devicemapper` crate
+    // talks to the kernel via raw DM ioctls (do_ioctl -> ioctl(DM_*)), not the
+    // libdevmapper C API, so the final binary has no libdevmapper DT_NEEDED and
+    // no undefined dm_ symbols. user-lvm2 is still COPY'd into the build image
+    // for its headers + devmapper.pc: devicemapper-sys bindgens the dm_ioctl
+    // struct + DM_* constants from them at BUILD time. (Proven: removing the
+    // -ldevmapper flag still links with zero undefined references.)
+    // Dependents before dependencies.
+    println!("cargo:rustc-link-arg=-ltss2-esys");
+    println!("cargo:rustc-link-arg=-lcrypto");
+    println!("cargo:rustc-link-arg=-ltss2-rc");
+    println!("cargo:rustc-link-arg=-ltss2-sys");
     // Device TCTI linked directly so no dlopen is needed at runtime.
-    println!("cargo:rustc-link-arg=-l:libtss2-tcti-device.a");
-    println!("cargo:rustc-link-arg=-l:libtss2-tctildr.a");
+    println!("cargo:rustc-link-arg=-ltss2-tcti-device");
+    println!("cargo:rustc-link-arg=-ltss2-tctildr");
     // tss2-mu is referenced by most of the above, so it goes last.
-    println!("cargo:rustc-link-arg=-l:libtss2-mu.a");
-    // Static single-pass linking: libc (rand, dlopen stubs, unwinder) must come
-    // after every archive that references it. Exact archive: /lib/libc.so is
-    // the dynamic loader on musl systems.
-    println!("cargo:rustc-link-arg=-l:libc.a");
+    println!("cargo:rustc-link-arg=-ltss2-mu");
 
     println!("cargo:rerun-if-changed=build.rs");
 }
