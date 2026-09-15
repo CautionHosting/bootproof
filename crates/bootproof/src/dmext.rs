@@ -106,10 +106,11 @@ fn snp_gate() -> anyhow::Result<()> {
              outside a confidential VM"
         );
     }
-    let mut nonce = [0u8; 32];
+    let mut nonce = [0u8; 64];
     rand::RngCore::fill_bytes(&mut rand::rng(), &mut nonce);
     let col = ch.collect(&nonce, &[]).map_err(anyhow::Error::msg)?;
-    crate::verify::snp::SnpVerifier::verify_snp(&col.evidence, &nonce)
+    let front: [u8; 32] = nonce[..32].try_into().unwrap();
+    crate::verify::snp::SnpVerifier::verify_snp(&col.evidence, &front)
         .map_err(|e| anyhow::anyhow!("snp gate: {e}"))?;
     Ok(())
 }

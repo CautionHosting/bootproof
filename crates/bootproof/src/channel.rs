@@ -3,6 +3,11 @@
 //! one new module implementing these two traits; the Bundle, the HTTP
 //! surface, the table renderer, and pinning are untouched.
 
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+use tracing::warn;
+
 use crate::wire::{Bundle, Evidence, Fact, Keys};
 
 /// Attest-side: a channel produces signed evidence for a challenge nonce.
@@ -15,18 +20,93 @@ pub trait Channel {
 
     /// Collect signed evidence bound to `nonce`.
     ///
+    /// `nonce` is the 64-byte challenge. The tpm2 channel binds its FRONT 32
+    /// bytes as the Quote `qualifyingData` (byte-identical to today's
+    /// verifier comparison); the snp channel echoes the FULL 64 bytes into
+    /// the report's `report_data` (its front 32 == the client's 32-byte
+    /// nonce, which is what `verify/snp.rs` checks). The client's 32-byte
+    /// nonce is the front 32 of this challenge.
+    ///
     /// `other_docs` are the raw `doc` bytes of the other channels, in
     /// channel-name order: the tpm2 channel folds them into the slot link
     /// (PCR22) before quoting, which is what binds every channel to one TPM
     /// at one moment. Other channels ignore `other_docs`.
-    fn collect(&self, nonce: &[u8; 32], other_docs: &[Vec<u8>]) -> Result<Collected, String>;
+    fn collect(&self, nonce: &[u8; 64], other_docs: &[Vec<u8>]) -> Result<Collected, String>;
 }
 
 /// What a channel produced for a challenge: its evidence plus any
-/// state-bound keys it publishes in the Bundle.
+/// state-bound keys it publishes in the Bundle. Serialized (as one entry of
+/// the collect UDS payload) so the `collect` daemon and the `attest` node can
+/// hand the exact same value across the socket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Collected {
     pub evidence: Evidence,
     pub keys: Option<Keys>,
+}
+
+/// Collect from every channel in the order the slot-link fold requires:
+/// the non-tpm2 channels first (best-effort, so an absent channel degrades
+/// rather than failing the request), then the tpm2 channel LAST with
+/// `other_docs` set to the non-tpm2 channels' raw doc bytes in channel-name
+/// order. The tpm2 channel folds those into the slot link (PCR22) before
+/// quoting, which is what binds every channel to one TPM at one moment.
+///
+/// `channels` is the shared registration (built once by `attest::build_channels`
+/// and used by both the `collect` daemon and the `attest` in-process fallback).
+/// Returns the collected entries in collect order (non-tpm2 channels, then
+/// tpm2). The tpm2 channel's failure is propagated: it is the mandatory core.
+///
+/// This is the SINGLE place the collect ordering + slot-link fold is defined,
+/// so the `collect` daemon and the `attest` node can never drift apart.
+pub fn collect_all(
+    channels: &Arc<Vec<Box<dyn Channel + Send + Sync>>>,
+    challenge: &[u8; 64],
+) -> Result<Vec<Collected>, String> {
+    let mut docs: Vec<Vec<u8>> = Vec::new();
+    let mut out: Vec<Collected> = Vec::new();
+    for c in channels.iter() {
+        if c.name() == "tpm2" {
+            continue;
+        }
+        if !c.detect() {
+            warn!(channel = c.name(), "channel inactive (hardware absent); degrading");
+            continue;
+        }
+        match c.collect(challenge, &docs) {
+            Ok(col) => {
+                docs.push(col.evidence.doc.0.clone());
+                out.push(col);
+            }
+            Err(e) => {
+                warn!(channel = c.name(), %e, "channel collect failed; degrading");
+            }
+        }
+    }
+    for c in channels.iter() {
+        if c.name() != "tpm2" {
+            continue;
+        }
+        let col = c.collect(challenge, &docs)?;
+        out.push(col);
+    }
+    Ok(out)
+}
+
+/// Expand the client's 32-byte nonce into the 64-byte challenge the channels
+/// bind: the nonce in the front 32 bytes, zero in the back 32.
+///
+/// This is the SINGLE definition of the challenge contract:
+/// - the tpm2 channel binds the FRONT 32 as its Quote `qualifyingData`
+///   (byte-identical to today's verifier comparison);
+/// - the snp channel echoes the FULL 64 into the report's `report_data`
+///   (its front 32 == the client's nonce, which is what `verify/snp.rs`
+///   checks).
+/// Both the `attest` node (in-process fallback and UDS client) and the
+/// `collect` daemon route through this, so the byte contract can't drift.
+pub fn challenge_from_nonce(nonce: &[u8; 32]) -> [u8; 64] {
+    let mut c = [0u8; 64];
+    c[..32].copy_from_slice(nonce);
+    c
 }
 
 /// The result of a successful channel verification: channel-specific

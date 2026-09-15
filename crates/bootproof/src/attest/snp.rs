@@ -5,10 +5,11 @@
 //! 1. If `/dev/sev-guest` is absent (QEMU dev / non-SNP host) the channel
 //!    reports itself unavailable and the Bundle is tpm2-only: graceful
 //!    degradation, never a request failure.
-//! 2. Otherwise issue `SNP_GET_EXT_REPORT` with the CLIENT's challenge nonce
-//!    in `report_data` (`nonce || 0x00 * 32`, so the signed report echoes the
-//!    same nonce the tpm2 quote binds) and request `VMPL 0` (the report
-//!    echoes the VMPL the guest runs at).
+//! 2. Otherwise issue `SNP_GET_EXT_REPORT` with the FULL 64-byte challenge
+//!    nonce in `report_data` (its front 32 bytes are the client's 32-byte
+//!    challenge — what `verify/snp.rs` checks; the back 32 are bound by the
+//!    VLEK signature) and request `VMPL 0` (the report echoes the VMPL the
+//!    guest runs at).
 //! 3. Publish the full 1184-byte v5 report as the `doc`, and the
 //!    platform-provisioned VLEK certificate (DER) as the `vlek` anchor so
 //!    the verifier can check the report signature and chain it to AMD's
@@ -50,7 +51,7 @@ impl Channel for Snp {
         snp::device_present()
     }
 
-    fn collect(&self, nonce: &[u8; 32], _other_docs: &[Vec<u8>]) -> Result<Collected, String> {
+    fn collect(&self, nonce: &[u8; 64], _other_docs: &[Vec<u8>]) -> Result<Collected, String> {
         // Graceful degradation: no device -> the channel is simply not part
         // of the Bundle. The caller (attest::attestation) skips channels that
         // are not detected, so on a non-SNP host this path is never reached;
@@ -60,8 +61,10 @@ impl Channel for Snp {
             return Err("snp: /dev/sev-guest not present".to_string());
         }
 
-        let rd = snp::report_data_for_nonce(nonce);
-        let ext = snp::issue_report(rd, snp::REQUIRED_VMPL)?;
+        // The FULL 64-byte challenge is echoed into report_data verbatim
+        // (front 32 == the client's 32-byte nonce, which verify/snp.rs
+        // checks; the back 32 are integrity-covered by the VLEK signature).
+        let ext = snp::issue_report(*nonce, snp::REQUIRED_VMPL)?;
 
         let mut anchors = BTreeMap::new();
         if let Some(vlek) = &ext.vlek {

@@ -24,7 +24,7 @@ use tower_service::Service;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, info, warn};
 
-use crate::channel::{Channel, Collected};
+use crate::channel::{challenge_from_nonce, collect_all, Channel, Collected};
 use crate::spki::pin_of_cert;
 use crate::wire::{B64, Bundle, Info, BUNDLE_V};
 
@@ -305,43 +305,21 @@ async fn attestation(
             n
         }
     };
+    // The 64-byte challenge the channels bind (the canonical expansion:
+    // front 32 == the client's 32-byte nonce, back 32 zero). The Bundle's
+    // nonce field stays the 32-byte client nonce so `verify --direct` is
+    // byte-for-byte unchanged.
+    let challenge = challenge_from_nonce(&nonce);
 
-    // Collect the non-tpm2 channels first, then the tpm2 channel last so it
-    // can fold the other docs into the slot link before quoting. Non-tpm2
-    // channels are best-effort: a channel whose hardware is absent (or whose
-    // firmware request fails) is skipped with a warning so the Bundle degrades
-    // to the channels actually present (tpm2-only on a non-SNP host) instead
-    // of failing the request. The tpm2 channel is the mandatory core.
+    // Collect through the single shared ordering (non-tpm2 first, tpm2 last
+    // with the other docs folded into the slot link). This is the SAME
+    // `channel::collect_all` the `collect` daemon runs, so the in-process
+    // fallback and the UDS path can never drift. The tpm2 channel is the
+    // mandatory core; non-tpm2 channels degrade (hardware absent) rather than
+    // failing the request.
     let channels = app.channels.clone();
     let collected: Vec<Collected> = tokio::task::spawn_blocking(move || -> Result<Vec<Collected>, String> {
-        let mut docs: Vec<Vec<u8>> = Vec::new();
-        let mut out: Vec<Collected> = Vec::new();
-        for c in channels.iter() {
-            if c.name() == "tpm2" {
-                continue;
-            }
-            if !c.detect() {
-                info!(channel = c.name(), "channel inactive (hardware absent); degrading");
-                continue;
-            }
-            match c.collect(&nonce, &docs) {
-                Ok(col) => {
-                    docs.push(col.evidence.doc.0.clone());
-                    out.push(col);
-                }
-                Err(e) => {
-                    warn!(channel = c.name(), %e, "channel collect failed; degrading");
-                }
-            }
-        }
-        for c in channels.iter() {
-            if c.name() != "tpm2" {
-                continue;
-            }
-            let col = c.collect(&nonce, &docs)?;
-            out.push(col);
-        }
-        Ok(out)
+        collect_all(&channels, &challenge)
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
@@ -375,6 +353,39 @@ fn cors() -> CorsLayer {
         .allow_headers([CONTENT_TYPE])
 }
 
+/// Build the channel set for this host from an optional swtpm TCP endpoint.
+/// This is the SINGLE place the hardware-touching channels (/dev/tpm0,
+/// /dev/sev-guest) are registered, so both the `attest` node (dev
+/// in-process fallback) and the `collect` daemon (the sole device toucher)
+/// share it.
+pub fn build_channels(tcp: Option<&str>) -> Vec<Box<dyn Channel + Send + Sync>> {
+    let mut channels: Vec<Box<dyn Channel + Send + Sync>> = Vec::new();
+    match tcp {
+        Some(addr) => {
+            channels.push(Box::new(tpm2::Tpm2::new("/dev/tpm0").with_tcp(addr.to_string())));
+            info!(tcp = %addr, "channel tpm2 active (swtpm over tcp)");
+        }
+        _ => {
+            if let Some(dev) = tpm2::detect_device() {
+                channels.push(Box::new(tpm2::Tpm2::new(dev)));
+                info!("channel tpm2 active");
+            } else {
+                warn!("no TPM device found; the tpm2 channel is inactive");
+            }
+        }
+    }
+    // The snp channel is per-challenge in-process (SNP_GET_EXT_REPORT against
+    // /dev/sev-guest). Register it only when the device is present; on a
+    // non-SNP host the node serves tpm2-only and degrades gracefully.
+    if crate::snp::device_present() {
+        channels.push(Box::new(snp::Snp::new()));
+        info!("channel snp active (/dev/sev-guest)");
+    } else {
+        info!("no /dev/sev-guest; the snp channel is inactive");
+    }
+    channels
+}
+
 /// Run the attest server.
 pub async fn run(opts: Opts) -> anyhow::Result<()> {
     let node_id = std::fs::read_to_string("/etc/hostname")
@@ -400,31 +411,7 @@ pub async fn run(opts: Opts) -> anyhow::Result<()> {
         None => None,
     };
 
-    let mut channels: Vec<Box<dyn Channel + Send + Sync>> = Vec::new();
-    match &opts.tcp {
-        Some(addr) => {
-            channels.push(Box::new(tpm2::Tpm2::new("/dev/tpm0").with_tcp(addr.clone())));
-            info!(tcp = %addr, "channel tpm2 active (swtpm over tcp)");
-        }
-        _ => {
-            if let Some(dev) = tpm2::detect_device() {
-                channels.push(Box::new(tpm2::Tpm2::new(dev)));
-                info!("channel tpm2 active");
-            } else {
-                warn!("no TPM device found; the tpm2 channel is inactive");
-            }
-        }
-    }
-    // The snp channel is per-challenge in-process (SNP_GET_EXT_REPORT against
-    // /dev/sev-guest). Register it only when the device is present; on a
-    // non-SNP host the node serves tpm2-only and degrades gracefully.
-    if crate::snp::device_present() {
-        channels.push(Box::new(snp::Snp::new()));
-        info!("channel snp active (/dev/sev-guest)");
-    } else {
-        info!("no /dev/sev-guest; the snp channel is inactive");
-    }
-    let channels = Arc::new(channels);
+    let channels = Arc::new(build_channels(opts.tcp.as_deref()));
 
     let app = Arc::new(App {
         identity,

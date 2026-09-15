@@ -11,7 +11,8 @@
 //! 3. Create the state-bound `sign` key: `PolicyPCR` over the attested set,
 //!    then `CreatePrimary` authorized by that policy.
 //! 4. Create the AK (signing, auth-only) and produce a Quote over the
-//!    attested set with `qualifyingData == nonce`.
+//!    attested set with `qualifyingData == nonce[..32]` (the front 32 bytes
+//!    of the 64-byte challenge).
 //! 5. Read the EK certificate from NV if present (bundled as an anchor).
 //!
 //! The tpm2 `doc` layout (v1, big-endian):
@@ -88,8 +89,12 @@ impl Channel for Tpm2 {
         self.open().is_ok()
     }
 
-    fn collect(&self, nonce: &[u8; 32], other_docs: &[Vec<u8>]) -> Result<Collected, String> {
+    fn collect(&self, nonce: &[u8; 64], other_docs: &[Vec<u8>]) -> Result<Collected, String> {
         let mut tpm = self.open()?;
+        // The Quote binds the FRONT 32 bytes of the 64-byte challenge as
+        // `qualifyingData` (byte-identical to the verifier's comparison: the
+        // verifier's 32-byte challenge is the front 32 of this challenge).
+        let qualifying: [u8; 32] = nonce[..32].try_into().unwrap();
         // Clear contexts left behind by earlier connections: this firmware
         // keeps sessions across process lifetimes, a live session blocks the
         // next StartAuthSession (0x0903), and it refuses
@@ -193,12 +198,12 @@ impl Channel for Tpm2 {
             }
         };
 
-        // 5. AK + Quote(qualifyingData = nonce).
+        // 5. AK + Quote(qualifyingData = front 32 of the challenge).
         let ak = tpm
             .create_primary_ecc_sign()
             .map_err(|e| format!("AK CreatePrimary: {e}"))?;
         let quote = tpm
-            .quote(&ak, nonce, &[sel])
+            .quote(&ak, &qualifying, &[sel])
             .map_err(|e| format!("Quote: {e}"))?;
         if quote.pcr_digest != pcr_digest {
             return Err(format!(
