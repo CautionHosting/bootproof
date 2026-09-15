@@ -69,6 +69,19 @@ enum Command {
         #[arg(long)]
         tcp: Option<String>,
     },
+    /// Run the collect daemon: the SOLE process that touches the
+    /// attestation hardware (/dev/tpm0, /dev/sev-guest). Listens on a Unix
+    /// domain socket and collects signed evidence for one 64-byte challenge
+    /// per connection. The sandboxed `attest` node talks to this daemon
+    /// instead of reading devices directly (gVisor forbids the device reads).
+    Collect {
+        /// Unix domain socket to listen on (default /run/bootproof/collect.sock).
+        #[arg(long, default_value = "/run/bootproof/collect.sock")]
+        socket: PathBuf,
+        /// Connect to swtpm over TCP (host:port). Overrides char-device detection.
+        #[arg(long)]
+        tcp: Option<String>,
+    },
     /// Verify and print the trust tree (no target), or challenge a remote
     /// node (with target), verify its proof offline, and print the facts table.
     Verify {
@@ -536,6 +549,16 @@ fn main() -> anyhow::Result<()> {
                     metadata,
                     tcp,
                 }))?;
+        }
+        Command::Collect { socket, tcp } => {
+            // The SOLE device toucher: build the channel registration once and
+            // run the collect UDS daemon. Runs on the host (outside gVisor),
+            // where /dev/tpm0 and /dev/sev-guest are readable.
+            let channels = std::sync::Arc::new(bootproof::attest::build_channels(tcp.as_deref()));
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(bootproof::collect::serve(socket, channels))?;
         }
         Command::Verify {
             target,
