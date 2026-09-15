@@ -1,7 +1,7 @@
 //! `bootproof attest` — the node server.
 //!
-//! Loads (or generates) an ECDSA P-384 TLS identity, detects the active
-//! channels, and serves the attestation API over TLS:
+//! Loads (or generates) an ECDSA P-384 TLS identity and serves the
+//! attestation API over TLS:
 //!
 //! - `POST /attestation` `{ nonce? }` -> the Bundle
 //! - `GET  /info`      -> node id, platform, channels, daemon pin
@@ -9,6 +9,16 @@
 //!
 //! The server is stateless per request: nonce in, Bundle out. The only
 //! persistent state is the TLS identity key.
+//!
+//! This node does NOT touch the attestation hardware. It runs sandboxed
+//! (gVisor) and routes every challenge to the host-side `collect` daemon
+//! over a plain Unix domain socket (`/run/bootproof/collect.sock` by
+//! default): the collect daemon is the SOLE device owner on the host, and
+//! there is no in-process device fallback by design. When the collect daemon
+//! is unreachable, the request still succeeds: the Bundle carries the
+//! challenge nonce but NO hardware evidence — the honest boundary is that
+//! the node's HW channels are NOT PROVEN for that request, never a 500 and
+//! never a device read from inside the sandbox.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -24,7 +34,8 @@ use tower_service::Service;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, info, warn};
 
-use crate::channel::{challenge_from_nonce, collect_all, Channel, Collected};
+use crate::channel::{challenge_from_nonce, Channel, Collected};
+use crate::collect::request as collect_request;
 use crate::spki::pin_of_cert;
 use crate::wire::{B64, Bundle, Info, BUNDLE_V};
 
@@ -43,8 +54,11 @@ pub struct Opts {
     pub key: Option<std::path::PathBuf>,
     /// Optional metadata JSON file.
     pub metadata: Option<std::path::PathBuf>,
-    /// swtpm over TCP (host:port). Overrides char-device detection.
-    pub tcp: Option<String>,
+    /// Unix domain socket of the host-side collect daemon (the SOLE device
+    /// owner). Every attestation challenge is routed here; the node itself
+    /// never opens /dev/tpm0 or /dev/sev-guest. Unreachable = the Bundle
+    /// degrades to no hardware evidence (NOT PROVEN), never a device read.
+    pub collect_socket: std::path::PathBuf,
 }
 
 /// Install the ring crypto provider as the rustls default.
@@ -251,7 +265,12 @@ struct App {
     identity: Arc<Identity>,
     node_id: String,
     platform: String,
-    channels: Arc<Vec<Box<dyn Channel + Send + Sync>>>,
+    /// The collect daemon socket every challenge is routed to (the node
+    /// itself holds NO channels: it has no devices in its sandbox).
+    collect_socket: std::path::PathBuf,
+    /// The channels the collect daemon serves, probed at startup (drives
+    /// /info). Empty when the daemon was unreachable at startup.
+    channels: Vec<String>,
     metadata: Option<serde_json::Value>,
 }
 
@@ -260,19 +279,12 @@ async fn health() -> &'static str {
 }
 
 async fn info(State(app): State<Arc<App>>) -> Json<Info> {
-    // Report the channels this node actually serves: a channel that is
-    // registered but whose hardware is absent (e.g. snp on a non-SNP host)
-    // is filtered out so the advertised set matches the Bundle.
-    let channels: Vec<String> = app
-        .channels
-        .iter()
-        .filter(|c| c.detect())
-        .map(|c| c.name().to_string())
-        .collect();
+    // Report the channels the collect daemon serves (probed at startup): the
+    // advertised set matches what the node will actually emit in a Bundle.
     Json(Info {
         node_id: app.node_id.clone(),
         platform: app.platform.clone(),
-        channels,
+        channels: app.channels.clone(),
         daemon_pubkey: app.identity.pin(),
         metadata: app.metadata.clone(),
     })
@@ -311,25 +323,28 @@ async fn attestation(
     // byte-for-byte unchanged.
     let challenge = challenge_from_nonce(&nonce);
 
-    // Collect through the single shared ordering (non-tpm2 first, tpm2 last
-    // with the other docs folded into the slot link). This is the SAME
-    // `channel::collect_all` the `collect` daemon runs, so the in-process
-    // fallback and the UDS path can never drift. The tpm2 channel is the
-    // mandatory core; non-tpm2 channels degrade (hardware absent) rather than
-    // failing the request.
-    let channels = app.channels.clone();
-    let collected: Vec<Collected> = tokio::task::spawn_blocking(move || -> Result<Vec<Collected>, String> {
-        collect_all(&channels, &challenge)
-    })
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    // Route the challenge to the host-side collect daemon over the UDS. The
+    // node holds no channels and opens no devices: the daemon is the SOLE
+    // device owner. If the daemon is unreachable, this is an HONEST BOUNDARY,
+    // not an error: the Bundle degrades to no hardware evidence (the
+    // verifier will show the node's HW channels as NOT PROVEN for this
+    // request) and the request still succeeds.
+    let socket = app.collect_socket.clone();
+    let collected: Option<Vec<Collected>> = match collect_request(&socket, &challenge).await {
+        Ok(cols) => Some(cols),
+        Err(e) => {
+            warn!(%e, "collect daemon unreachable; serving with no hardware evidence (NOT PROVEN)");
+            None
+        }
+    };
 
     let mut evidence = Vec::new();
     let mut keys = None;
-    for col in collected {
-        keys = keys.or(col.keys);
-        evidence.push(col.evidence);
+    if let Some(cols) = collected {
+        for col in cols {
+            keys = keys.or(col.keys);
+            evidence.push(col.evidence);
+        }
     }
 
     let bundle = Bundle {
@@ -355,9 +370,9 @@ fn cors() -> CorsLayer {
 
 /// Build the channel set for this host from an optional swtpm TCP endpoint.
 /// This is the SINGLE place the hardware-touching channels (/dev/tpm0,
-/// /dev/sev-guest) are registered, so both the `attest` node (dev
-/// in-process fallback) and the `collect` daemon (the sole device toucher)
-/// share it.
+/// /dev/sev-guest) are registered on the host. It is used by the `collect`
+/// daemon (the SOLE device owner). The `attest` node itself never calls
+/// this: it routes challenges to the collect daemon over the UDS.
 pub fn build_channels(tcp: Option<&str>) -> Vec<Box<dyn Channel + Send + Sync>> {
     let mut channels: Vec<Box<dyn Channel + Send + Sync>> = Vec::new();
     match tcp {
@@ -411,12 +426,32 @@ pub async fn run(opts: Opts) -> anyhow::Result<()> {
         None => None,
     };
 
-    let channels = Arc::new(build_channels(opts.tcp.as_deref()));
+    // The node holds NO channels in-process: it routes every challenge to
+    // the host-side collect daemon over the UDS (the daemon is the SOLE
+    // device owner; the node runs sandboxed and must not read devices).
+    // Probe the daemon once at startup so /info advertises the channels it
+    // actually serves (best-effort: if the daemon is not up yet, /info
+    // reports none and /attestation keeps retrying the UDS per request).
+    let probe = [0u8; 64];
+    let channels = match collect_request(&opts.collect_socket, &probe).await {
+        Ok(cols) => {
+            let mut names: Vec<String> = cols.iter().map(|c| c.evidence.channel.clone()).collect();
+            names.sort();
+            names.dedup();
+            info!(channels = ?names, "attest: collect daemon probed");
+            names
+        }
+        Err(e) => {
+            warn!(%e, "collect daemon unreachable at startup; /info reports no channels until it is up");
+            Vec::new()
+        }
+    };
 
     let app = Arc::new(App {
         identity,
         node_id,
         platform,
+        collect_socket: opts.collect_socket,
         channels,
         metadata,
     });
@@ -460,6 +495,9 @@ pub async fn run(opts: Opts) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
+    use crate::wire::Evidence;
     use p384::pkcs8::EncodePrivateKey;
 
     #[test]
@@ -482,5 +520,126 @@ mod tests {
         assert_eq!(der, pkcs8_from_scalar(&b));
         let scalar = scalar_from_pkcs8(&der).expect("scalar");
         assert_eq!(scalar, b);
+    }
+
+    // A minimal channel that emits deterministic evidence, so the E2E can
+    // prove evidence actually flows through the UDS without real hardware.
+    struct MockCh;
+    impl Channel for MockCh {
+        fn name(&self) -> &'static str {
+            "snp"
+        }
+        fn detect(&self) -> bool {
+            true
+        }
+        fn collect(&self, nonce: &[u8; 64], _od: &[Vec<u8>]) -> Result<Collected, String> {
+            let mut doc = Vec::new();
+            doc.extend_from_slice(b"mock-doc:");
+            doc.extend_from_slice(&nonce[..8]);
+            Ok(Collected {
+                evidence: Evidence {
+                    channel: "snp".into(),
+                    doc: B64::new(doc),
+                    anchors: BTreeMap::new(),
+                },
+                keys: None,
+            })
+        }
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    fn e2e_app(socket: std::path::PathBuf, channels: Vec<String>, state: &std::path::Path) -> Arc<App> {
+        let identity = Arc::new(
+            Identity::load_or_generate(state, "e2e", None).expect("identity"),
+        );
+        Arc::new(App {
+            identity,
+            node_id: "e2e".into(),
+            platform: "baremetal".into(),
+            collect_socket: socket,
+            channels,
+            metadata: None,
+        })
+    }
+
+    /// End-to-end: the attest handler routes its challenge to a live collect
+    /// daemon over the UDS and splices the returned evidence into the Bundle;
+    /// and when the daemon is unreachable it degrades to NO evidence (the
+    /// honest NOT PROVEN boundary) while still returning a 200 Bundle.
+    #[test]
+    fn attestation_routes_through_collect_udspath_and_honest_boundary() {
+        let dir = std::env::temp_dir().join(format!(
+            "bootproof-attest-e2e-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state_up = dir.join("state");
+        let state_down = dir.join("state");
+        let sock = dir.join("collect.sock");
+        let _ = std::fs::remove_file(&sock);
+        let nonce = [0x5Au8; 32];
+
+        // 1. Daemon UP: evidence flows through the UDS.
+        let up = block_on(async move {
+            let ch: Arc<Vec<Box<dyn Channel + Send + Sync>>> =
+                Arc::new(vec![Box::new(MockCh) as Box<dyn Channel + Send + Sync>]);
+            let daemon = tokio::spawn(crate::collect::serve(sock.clone(), ch));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !sock.exists() {
+                if std::time::Instant::now() > deadline {
+                    daemon.abort();
+                    return Err((
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        "socket never appeared".to_string(),
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let app = e2e_app(sock, vec!["snp".to_string()], &state_up);
+            let req = AttestationRequest {
+                nonce: Some(B64::new(nonce.to_vec())),
+            };
+            attestation(State(app), Json(req)).await
+        })
+        .expect("handler returned Ok (not an error status)");
+
+        // 2. Daemon DOWN (a socket path with nothing listening): honest boundary.
+        let down = block_on({
+            let absent = dir.join("absent.sock");
+            async move {
+                let app = e2e_app(absent, Vec::new(), &state_down);
+                let req = AttestationRequest {
+                    nonce: Some(B64::new(nonce.to_vec())),
+                };
+                attestation(State(app), Json(req)).await
+            }
+        })
+        .expect("honest boundary still returns Ok (200), never 500");
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        // UP: the Bundle carries the mock snp evidence and echoes the nonce.
+        let b: Bundle = up.0;
+        assert_eq!(b.evidence.len(), 1, "evidence should flow from the daemon");
+        assert_eq!(b.evidence[0].channel, "snp");
+        assert_eq!(b.evidence[0].doc.0.len(), 9 + 8); // "mock-doc:" + 8 nonce bytes
+        assert_eq!(&b.evidence[0].doc.0[9..], &nonce[..8]);
+        assert_eq!(b.nonce.0, nonce.to_vec(), "Bundle nonce == client nonce (32B)");
+
+        // DOWN: still a valid Bundle, but with NO hardware evidence (NOT PROVEN).
+        let d: Bundle = down.0;
+        assert!(d.evidence.is_empty(), "daemon down => no evidence, honest boundary");
+        assert_eq!(d.nonce.0, nonce.to_vec(), "nonce still echoed when daemon down");
     }
 }

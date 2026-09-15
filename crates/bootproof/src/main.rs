@@ -65,9 +65,12 @@ enum Command {
         /// Optional metadata JSON file.
         #[arg(long)]
         metadata: Option<PathBuf>,
-        /// Connect to swtpm over TCP (host:port). Overrides char-device detection.
-        #[arg(long)]
-        tcp: Option<String>,
+        /// Unix domain socket of the host-side collect daemon (the SOLE
+        /// device owner). Every challenge is routed here; the node itself
+        /// never opens a device (it runs sandboxed). Unreachable = the Bundle
+        /// degrades to no hardware evidence (NOT PROVEN), never a device read.
+        #[arg(long, default_value = "/run/bootproof/collect.sock")]
+        collect_socket: PathBuf,
     },
     /// Run the collect daemon: the SOLE process that touches the
     /// attestation hardware (/dev/tpm0, /dev/sev-guest). Listens on a Unix
@@ -537,7 +540,7 @@ fn main() -> anyhow::Result<()> {
             state,
             key,
             metadata,
-            tcp,
+            collect_socket,
         } => {
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -547,7 +550,7 @@ fn main() -> anyhow::Result<()> {
                     state,
                     key,
                     metadata,
-                    tcp,
+                    collect_socket,
                 }))?;
         }
         Command::Collect { socket, tcp } => {
