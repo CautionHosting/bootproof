@@ -77,6 +77,21 @@ fn open_crypt_device(name: &str, len_sectors: u64, params: &str) -> anyhow::Resu
     dm.table_load(&id, &[(0u64, len_sectors, "crypt".to_string(), params.to_string())], DmOptions::private())?;
     // No DM_SUSPEND flag = resume: the device goes active.
     dm.device_suspend(&id, DmOptions::private())?;
+    // No udev in the guest: devtmpfs already created the real `/dev/dm-N`
+    // node; the `/dev/mapper/<name>` entry is normally a udev symlink job.
+    // libdevmapper (cryptsetup) does this for its callers; our raw-ioctl
+    // path must do it itself — a plain `symlink(2)`, same as cryptsetup's
+    // `copen -> /dev/dm-0`.
+    let real = format!("/dev/dm-{}", dm.device_info(&id)?.device().minor);
+    let link = Path::new("/dev/mapper").join(name);
+    match std::os::unix::fs::symlink(&real, &link) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(&link)?;
+            std::os::unix::fs::symlink(&real, &link)?;
+        }
+        Err(e) => return Err(e.into()),
+    }
     Ok(format!("/dev/mapper/{name}"))
 }
 
