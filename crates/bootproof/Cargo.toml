@@ -33,6 +33,19 @@ sha1 = "0.10"
 sha2 = "0.10"
 digest = "0.10"
 rand = "0.9"
+# Pure-Rust LUKS1/LUKS2 reader (no cryptsetup): LUKS2 header parse, argon2id
+# PBKDF, anti-forensic re-merge, keyslot AES-XTS decrypt -> master key.
+# `forbid(unsafe)`, audited RustCrypto primitives, ships cryptsetup-oracle tests.
+luks-core = "0.1.8"
+# Linux device-mapper control (stratis): DM_CREATE_MAPPER / TABLE_LOAD /
+# DEV_SUSPEND for the crypt target. Pure-Rust surface (devicemapper-sys = ABI
+# structs); it pulls nix->libc internally for the struct-pointer ioctl — a
+# later rewrite candidate, not something we should hand-roll.
+devicemapper = "0.34.8"
+# mount(2) for ext4. rustix over nix: the syscall wrapper stays out of libc in
+# our own code (linux_raw backend), per the "rewrite libc-dependent crates"
+# direction.
+rustix = { version = "1.1", features = ["mount"] }
 # OpenPGP verification in-process (replaces the gpg exec). The keyring we ship
 # is a plain OpenPGP public-key packet stream, which rPGP reads directly.
 pgp = "0.20"

@@ -166,6 +166,13 @@ enum Command {
         #[command(subcommand)]
         op: DmextOp,
     },
+    /// Unseal a value or an entire LUKS disk after dual attestation
+    /// (in-process SEV-SNP + TPM2 PCR policy). The disk path is pure Rust:
+    /// LUKS2 -> dm-crypt -> ext4 -> mount, no cryptsetup/mount/losetup.
+    Unseal {
+        #[command(subcommand)]
+        op: UnsealOp,
+    },
     /// Bridge a TCP port to the local TPM (raw TPM2 framing). For capturing
     /// commands from remote tooling (e.g. tss-esapi over an SSH tunnel).
     TpmBridge {
@@ -375,6 +382,51 @@ enum DmextOp {
         /// Where to write the unsealed key (ignored with `--print`).
         #[arg(long, default_value = "/run/dmext.key")]
         out: PathBuf,
+    },
+}
+
+/// `unseal` operations: release a sealed value, or open a LUKS disk end-to-end
+/// (LUKS2 -> dm-crypt -> ext4 -> mount) in pure Rust, gated on dual attestation.
+#[derive(Subcommand)]
+enum UnsealOp {
+    /// Release a sealed value (identical to `dmext unseal`).
+    Value {
+        /// TPM kernel character device (default /dev/tpm0).
+        #[arg(long, default_value = "/dev/tpm0")]
+        device: PathBuf,
+        /// The sealed blob (JSON file).
+        #[arg(long, default_value = "/run/dmext.sealed.json")]
+        blob: PathBuf,
+        /// Skip the SEV-SNP gate (TPM PCR policy only).
+        #[arg(long)]
+        tpm_only: bool,
+        /// Print the key to stdout (raw bytes). Default: write to `--out`.
+        #[arg(long)]
+        print: bool,
+        /// Where to write the unsealed key (ignored with `--print`).
+        #[arg(long, default_value = "/run/unseal.key")]
+        out: PathBuf,
+    },
+    /// Open a LUKS disk: dual gate -> keyfile -> LUKS2 master key -> dm-crypt
+    /// -> (optional) ext4 mount. Pure Rust, no cryptsetup/mount/losetup.
+    Disk {
+        /// TPM kernel character device (default /dev/tpm0).
+        #[arg(long, default_value = "/dev/tpm0")]
+        device: PathBuf,
+        /// The sealed blob (JSON file).
+        #[arg(long, default_value = "/run/dmext.sealed.json")]
+        blob: PathBuf,
+        /// The LUKS2 block device (whole disk, not a partition).
+        disk: PathBuf,
+        /// dm-crypt device name (default: home).
+        #[arg(long, default_value = "home")]
+        name: String,
+        /// Mount the opened device as ext4 at this path (default: no mount).
+        #[arg(long)]
+        mount: Option<PathBuf>,
+        /// Skip the SEV-SNP gate (TPM PCR policy only).
+        #[arg(long)]
+        tpm_only: bool,
     },
 }
 
@@ -659,6 +711,44 @@ fn main() -> anyhow::Result<()> {
                         out.display()
                     );
                 }
+            }
+        },
+        Command::Unseal { op } => match op {
+            UnsealOp::Value { device, blob: blob_path, tpm_only, print, out } => {
+                let blob = bootproof::dmext::SealedBlob::load(&blob_path)?;
+                eprintln!(
+                    "unseal value: blob pcrs {:?} policy_digest {} {}",
+                    blob.pcrs,
+                    hex_str(&blob.policy_digest.0),
+                    if tpm_only { "(tpm-only; SNP gate skipped)" } else { "(snp gate on)" }
+                );
+                let key = bootproof::unseal::value(&device, &blob, tpm_only)?;
+                if print {
+                    use std::io::Write;
+                    std::io::stdout().lock().write_all(&key)?;
+                } else {
+                    std::fs::write(&out, &key)?;
+                    eprintln!("unseal value: OK, {}B key written to {}", key.len(), out.display());
+                }
+            }
+            UnsealOp::Disk { device, blob: blob_path, disk, name, mount, tpm_only } => {
+                let blob = bootproof::dmext::SealedBlob::load(&blob_path)?;
+                eprintln!(
+                    "unseal disk: {} blob pcrs {:?} policy_digest {} {}",
+                    disk.display(),
+                    blob.pcrs,
+                    hex_str(&blob.policy_digest.0),
+                    if tpm_only { "(tpm-only; SNP gate skipped)" } else { "(snp gate on)" }
+                );
+                let mapped = bootproof::unseal::disk(
+                    &device,
+                    &blob,
+                    tpm_only,
+                    &disk,
+                    &name,
+                    mount.as_deref(),
+                )?;
+                eprintln!("unseal disk: OK, {}", mapped);
             }
         },
         Command::TpmBridge { listen, control, device, log: logpath } => {

@@ -11,5 +11,6 @@ pub mod serve;
 pub mod snp;
 pub mod spki;
 pub mod trust;
+pub mod unseal;
 pub mod verify;
 pub mod wire;
