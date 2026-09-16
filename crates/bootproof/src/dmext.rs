@@ -253,6 +253,41 @@ pub fn seal_persistent(device: &Path, pcrs: &[u8], data: &[u8], handle: u32, out
     Ok(blob)
 }
 
+/// Re-seal one persistent object under a different PCR policy: unseal
+/// `from` (PCR policy `from_pcrs`), then seal the released key to `to`
+/// (PCR policy `to_pcrs`). The key bytes never leave this process.
+///
+/// Idempotent: if `to` already holds a persistent object, this is a no-op
+/// success (a previous boot already migrated). Returns `true` when a
+/// migration happened, `false` when `to` was already occupied.
+pub fn migrate_persistent(
+    device: &Path,
+    from: u32,
+    from_pcrs: &[u8],
+    to: u32,
+    to_pcrs: &[u8],
+    tpm_only: bool,
+) -> anyhow::Result<bool> {
+    if from == to {
+        anyhow::bail!("migrate: --from and --to must differ");
+    }
+    if !ht::PERSISTENT_RANGE.contains(&from) || !ht::PERSISTENT_RANGE.contains(&to) {
+        anyhow::bail!("migrate: handles must be persistent (0x8100_0000..=0x81FF_FFFF)");
+    }
+    // Idempotency: destination already sealed by a previous boot.
+    {
+        let mut raw = Tpm::open_started(device)?;
+        if raw.read_public(to).is_ok() {
+            return Ok(false);
+        }
+    }
+    let key = unseal_persistent_with_pcrs(device, from, from_pcrs, tpm_only)?;
+    // The blob is written to /dev/null: the persistent handle IS the record,
+    // and the caller never needs the JSON.
+    seal_persistent(device, to_pcrs, &key, to, Path::new("/dev/null"))?;
+    Ok(true)
+}
+
 /// Unseal a `SealedBlob`'s volume key. Gated on (a) the SEV-SNP proof (unless
 /// `tpm_only`) and (b) the TPM PCR policy (live PCRs must reproduce the digest
 /// baked at seal time). Returns the sealed `data`.

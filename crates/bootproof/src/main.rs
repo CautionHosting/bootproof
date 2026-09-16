@@ -397,6 +397,31 @@ enum DmextOp {
         #[arg(long, default_value = "/run/dmext.key")]
         out: PathBuf,
     },
+    /// Re-seal one persistent object under a different PCR policy: unseal
+    /// `--from` (PCR policy `--from-pcrs`) and EvictControl the result to
+    /// `--to` (PCR policy `--to-pcrs`). The key bytes never leave this
+    /// process (no `--print`, no file, no shell).
+    ///
+    /// Idempotent: if `--to` already holds a persistent object, this is a
+    /// no-op success (a previous boot already migrated).
+    Migrate {
+        /// TPM kernel character device (default /dev/tpm0).
+        #[arg(long, default_value = "/dev/tpm0")]
+        device: PathBuf,
+        /// Source persistent handle (hex u32, e.g. 0x81010200).
+        from: String,
+        /// PCR policy the source object was sealed with (comma-separated).
+        #[arg(long)]
+        from_pcrs: String,
+        /// Destination persistent handle (hex u32, e.g. 0x81010201).
+        to: String,
+        /// PCR policy to seal the destination object with (comma-separated).
+        #[arg(long)]
+        to_pcrs: String,
+        /// Skip the SEV-SNP gate (TPM PCR policy only).
+        #[arg(long)]
+        tpm_only: bool,
+    },
 }
 
 /// `unseal` operations: release a sealed value, or open a LUKS disk end-to-end
@@ -753,6 +778,32 @@ fn main() -> anyhow::Result<()> {
                         out.display()
                     );
                 }
+            }
+            DmextOp::Migrate { device, from, from_pcrs, to, to_pcrs, tpm_only } => {
+                let parse = |s: &String| -> anyhow::Result<Vec<u8>> {
+                    s.split(',')
+                        .map(|x| x.trim().parse::<u8>().map_err(|e| anyhow::anyhow!("bad PCR index {x:?}: {e}")))
+                        .collect::<Result<_, _>>()
+                };
+                let from_p = parse(&from_pcrs)?;
+                let to_p = parse(&to_pcrs)?;
+                let h = |s: &String| {
+                    u32::from_str_radix(s.trim().trim_start_matches("0x").trim_start_matches("0X"), 16)
+                        .map_err(|e| anyhow::anyhow!("bad handle {s:?}: {e}"))
+                };
+                let from_h = h(&from)?;
+                let to_h = h(&to)?;
+                eprintln!(
+                    "migrate: 0x{from_h:08x} (pcrs {:?}) -> 0x{to_h:08x} (pcrs {:?}) {}",
+                    from_p,
+                    to_p,
+                    if tpm_only { "(tpm-only; SNP gate skipped)" } else { "(snp gate on)" }
+                );
+                let migrated = bootproof::dmext::migrate_persistent(&device, from_h, &from_p, to_h, &to_p, tpm_only)?;
+                eprintln!(
+                    "migrate: {} (0x{to_h:08x})",
+                    if migrated { "ok" } else { "already migrated (no-op)" }
+                );
             }
         },
         Command::Unseal { op } => match op {
