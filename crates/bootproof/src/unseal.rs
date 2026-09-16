@@ -118,12 +118,23 @@ pub fn disk(
 ) -> anyhow::Result<String> {
     // Gate 1 (SEV-SNP, unless tpm_only) + Gate 2 (TPM PCR policy) -> keyfile.
     let keyfile = dmext::unseal(device, blob, tpm_only)?;
+    disk_from_keyfile(&keyfile, disk, name, mount)
+}
 
+/// The disk flow starting from an already-released keyfile (the
+/// `--handle` path: the key was released by `dmext::unseal_persistent`
+/// before calling this). LUKS2 master key -> dm-crypt -> (optional) mount.
+pub fn disk_from_keyfile(
+    keyfile: &[u8],
+    disk: &Path,
+    name: &str,
+    mount: Option<&Path>,
+) -> anyhow::Result<String> {
     // LUKS2: parse header + derive the master key from the keyfile (the
     // TPM-sealed value is the LUKS passphrase/keyfile, NOT the master key).
     let file = File::open(disk)
         .map_err(|e| anyhow::anyhow!("open {disk:?} (is it a LUKS volume?): {e}"))?;
-    let payload = luks::LuksVolume::unlock2_with_passphrase_within(file, &keyfile, UNLOCK_BUDGET)
+    let payload = luks::LuksVolume::unlock2_with_passphrase_within(file, keyfile, UNLOCK_BUDGET)
         .map_err(|e| anyhow::anyhow!("luks unlock failed: {e}"))?;
     let info = payload.info();
     let key = payload.master_key();

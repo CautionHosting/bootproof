@@ -573,68 +573,6 @@ impl EsysTpm {
         Ok(out)
     }
 
-    /// Flush the transient handle range (like `tpm2 flushall`). This
-    /// firmware does not support GetCapability over the handle ranges, so
-    /// raw FlushContext commands go over the device TCTI directly.
-    pub fn flush_all(&mut self) -> usize {
-        let mut n = 0;
-        // Transient objects (0x80000000) and loaded sessions
-        // (0x02000000) are the two ranges worth flushing before a key
-        // workflow; stale sessions otherwise shift session-handle
-        // allocation and confuse comparisons with known-good traffic.
-        for base in [0x8000_0000u32, 0x0200_0000u32] {
-            for i in 0..0x100u32 {
-                let handle = base + i;
-                let cmd = [
-                    0x80u8, 0x01, // TPM_ST_NO_SESSIONS
-                    0x00, 0x00, 0x00, 0x0E, // command size
-                    0x00, 0x00, 0x01, 0x65, // TPM_CC_FlushContext
-                    (handle >> 24) as u8,
-                    (handle >> 16) as u8,
-                    (handle >> 8) as u8,
-                    handle as u8,
-                ];
-                if self.tcti_flush(&cmd).is_ok() {
-                    n += 1;
-                }
-            }
-        }
-        n
-    }
-
-    /// Transmit a raw command over the device TCTI and verify the
-    /// response code. Bypasses ESYS for commands whose handles are not
-    /// representable as `ESYS_TR` values.
-    fn tcti_flush(&self, cmd: &[u8]) -> Result<()> {
-        let ctx = self.tcti.as_ptr() as *mut sys::TSS2_TCTI_CONTEXT;
-        let common = self.tcti.as_ptr() as *const sys::TSS2_TCTI_CONTEXT_COMMON_V1;
-        let (transmit, receive) = unsafe { ((*common).transmit, (*common).receive) };
-        let transmit = transmit.ok_or_else(|| Error::Other("tcti has no transmit hook".into()))?;
-        let receive = receive.ok_or_else(|| Error::Other("tcti has no receive hook".into()))?;
-        let mut rsp = vec![0u8; 1024];
-        let mut size = rsp.len();
-        unsafe {
-            let rc = transmit(ctx, cmd.len() as _, cmd.as_ptr());
-            check(rc, "tcti transmit")?;
-            let rc = receive(
-                ctx,
-                &mut size as *mut usize as *mut u64,
-                rsp.as_mut_ptr(),
-                -1,
-            );
-            check(rc, "tcti receive")?;
-        }
-        if size < 10 {
-            return Err(Error::Malformed("short TPM response".into()));
-        }
-        let rc = u32::from_be_bytes([rsp[6], rsp[7], rsp[8], rsp[9]]);
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(Error::Tpm(rc as u16, "FlushContext".into()))
-        }
-    }
-
     /// Start a null-auth HMAC session bound to the NULL hierarchy (the
     /// session framing tpm2-tools on this platform uses).
     fn start_nullauth_session(&mut self) -> Result<u32> {
@@ -668,7 +606,7 @@ impl EsysTpm {
     }
 
     /// Flush one loaded session (policy sessions live at `0x03xxxxxx`,
-    /// outside `flush_all`'s ranges, so callers release them explicitly).
+    /// so callers release them explicitly).
     pub fn flush_session(&mut self, session: u32) {
         unsafe {
             let _ = sys::Esys_FlushContext(self.esys, session);
@@ -1332,6 +1270,56 @@ impl EsysTpm {
             let bytes = d.buffer[..d.size as usize].to_vec();
             sys::Esys_Free(out as *mut _);
             Ok(bytes)
+        }
+    }
+
+    /// Register an existing TPM handle (e.g. a persistent 0x81xx_xxxx) as an
+    /// ESYS_TR resource object. This is the ESAPI equivalent of the
+    /// tpm2-tools flow: the ESAPI wrappers only operate on persistent handles
+    /// through a registered resource (a raw persistent u32 passed straight to
+    /// them fails "Esys handle does not exist", 0x00070018). The returned
+    /// ESYS_TR is released by `Esys_Finalize` on context drop (this binding
+    /// exposes no per-resource delete; `Esys_TR_Close` takes `*mut ESYS_TR`
+    /// and is not used).
+    pub fn from_tpm_public(&mut self, tpm_handle: u32) -> Result<u32> {
+        unsafe {
+            let mut esys_tr: u32 = 0;
+            let rc = sys::Esys_TR_FromTPMPublic(
+                self.esys,
+                tpm_handle,
+                sys::ESYS_TR_NONE,
+                sys::ESYS_TR_NONE,
+                sys::ESYS_TR_NONE,
+                &mut esys_tr,
+            );
+            check(rc, "Esys_TR_FromTPMPublic")?;
+            Ok(esys_tr)
+        }
+    }
+
+    /// TPM2_EvictControl: move `object` (a loaded transient, or a persistent
+    /// handle registered via `from_tpm_public`) to the `persistent` handle
+    /// (0x81xx_xxxx), or — with `persistent` = 0 — unload the object at
+    /// `object`. `auth` is the authorizing hierarchy (OWNER for an empty-auth
+    /// data object). The `tpm2_evictcontrol` model: the object survives
+    /// reboots and is reachable by tpm2-tools under the same handle.
+    pub fn evict_control(&mut self, auth: u32, object: u32, persistent: u32) -> Result<()> {
+        let auth_tr = hierarchy_to_esys_tr(auth);
+        unsafe {
+            let session = self.start_nullauth_session()?;
+            let mut new_handle: u32 = 0;
+            let rc = sys::Esys_EvictControl(
+                self.esys,
+                auth_tr,
+                object,
+                session,
+                sys::ESYS_TR_NONE,
+                sys::ESYS_TR_NONE,
+                persistent,
+                &mut new_handle,
+            );
+            self.flush_session(session);
+            check(rc, "Esys_EvictControl")
         }
     }
 }

@@ -97,6 +97,8 @@ pub mod rh {
 pub mod ht {
     pub const TRANSIENT: u32 = 0x8000_0000;
     pub const PERSISTENT: u32 = 0x8100_0000;
+    /// The full persistent-handle range (0x8100_0000..=0x81FF_FFFF).
+    pub const PERSISTENT_RANGE: std::ops::RangeInclusive<u32> = 0x8100_0000..=0x81FF_FFFF;
     pub const LOADED_METADATA: u32 = 0x8200_0000;
     /// Session handle type (TPM_HT_SESSIONS), spec Part 2 Table 22: 0x02xxxxxx.
     /// HMAC=0x02, policy=0x03, trial=0x03.

@@ -362,15 +362,29 @@ enum DmextOp {
         /// Where to write the sealed blob (JSON).
         #[arg(long, default_value = "/run/dmext.sealed.json")]
         out: PathBuf,
+        /// Also EvictControl the object to this persistent handle (hex u32,
+        /// e.g. 0x81010200) so it survives reboots and is visible to
+        /// tpm2-tools. The blob is still written to `--out`.
+        #[arg(long)]
+        persistent: Option<String>,
     },
     /// Unseal a volume key (gated on the SEV-SNP proof and the PCR policy).
     Unseal {
         /// TPM kernel character device (default /dev/tpm0).
         #[arg(long, default_value = "/dev/tpm0")]
         device: PathBuf,
-        /// The sealed blob (JSON file).
+        /// The sealed blob (JSON file). Ignored when `--handle` is given.
         #[arg(long, default_value = "/run/dmext.sealed.json")]
         blob: PathBuf,
+        /// Unseal the persistent-handle data object at this hex u32 (e.g.
+        /// 0x81010200) instead of a blob file — the `tpm2_unseal -c` model.
+        /// Requires `--pcrs`.
+        #[arg(long)]
+        handle: Option<String>,
+        /// PCR indices for the `--handle` path (comma-separated; no default —
+        /// be explicit about the policy).
+        #[arg(long)]
+        pcrs: Option<String>,
         /// Skip the SEV-SNP gate (TPM PCR policy only). Fails closed
         /// otherwise; use only where the enclave proof is not available.
         #[arg(long)]
@@ -413,9 +427,16 @@ enum UnsealOp {
         /// TPM kernel character device (default /dev/tpm0).
         #[arg(long, default_value = "/dev/tpm0")]
         device: PathBuf,
-        /// The sealed blob (JSON file).
+        /// The sealed blob (JSON file). Ignored when `--handle` is given.
         #[arg(long, default_value = "/run/dmext.sealed.json")]
         blob: PathBuf,
+        /// Unseal the persistent-handle data object at this hex u32 (e.g.
+        /// 0x81010200) instead of a blob file. Requires `--pcrs`.
+        #[arg(long)]
+        handle: Option<String>,
+        /// PCR indices for the `--handle` path (comma-separated; no default).
+        #[arg(long)]
+        pcrs: Option<String>,
         /// The LUKS2 block device (whole disk, not a partition).
         disk: PathBuf,
         /// dm-crypt device name (default: home).
@@ -675,13 +696,21 @@ fn main() -> anyhow::Result<()> {
             std::process::exit(1);
         }
         Command::Dmext { op } => match op {
-            DmextOp::Seal { device, pcrs, data, out } => {
+            DmextOp::Seal { device, pcrs, data, out, persistent } => {
                 let pcr_list: Vec<u8> = pcrs
                     .split(',')
                     .map(|x| x.trim().parse::<u8>().map_err(|e| anyhow::anyhow!("bad PCR index {x:?}: {e}")))
                     .collect::<Result<_, _>>()?;
                 let key = read_key_arg(&data)?;
-                let blob = bootproof::dmext::seal(&device, &pcr_list, &key, &out)?;
+                let blob = match &persistent {
+                    Some(h) => {
+                        let handle = u32::from_str_radix(h.trim().trim_start_matches("0x").trim_start_matches("0X"), 16)
+                            .map_err(|e| anyhow::anyhow!("bad persistent handle {h:?}: {e}"))?;
+                        eprintln!("seal: persisting to handle 0x{handle:08x}");
+                        bootproof::dmext::seal_persistent(&device, &pcr_list, &key, handle, &out)?
+                    }
+                    None => bootproof::dmext::seal(&device, &pcr_list, &key, &out)?,
+                };
                 eprintln!(
                     "seal: wrote {} ({}B key, pcrs {:?}, policy_digest {})",
                     out.display(),
@@ -690,15 +719,28 @@ fn main() -> anyhow::Result<()> {
                     hex_str(&blob.policy_digest.0)
                 );
             }
-            DmextOp::Unseal { device, blob: blob_path, tpm_only, print, out } => {
-                let blob = bootproof::dmext::SealedBlob::load(&blob_path)?;
-                eprintln!(
-                    "unseal: blob pcrs {:?} policy_digest {} {}",
-                    blob.pcrs,
-                    hex_str(&blob.policy_digest.0),
-                    if tpm_only { "(tpm-only; SNP gate skipped)" } else { "(snp gate on)" }
-                );
-                let key = bootproof::dmext::unseal(&device, &blob, tpm_only)?;
+            DmextOp::Unseal { device, blob: blob_path, handle, pcrs, tpm_only, print, out } => {
+                let key = if let Some(h) = &handle {
+                    let handle = u32::from_str_radix(h.trim().trim_start_matches("0x").trim_start_matches("0X"), 16)
+                        .map_err(|e| anyhow::anyhow!("bad handle {h:?}: {e}"))?;
+                    let pcr_list = parse_pcrs(&pcrs)
+                        .ok_or_else(|| anyhow::anyhow!("--handle requires --pcrs (the sealed PCR selection)"))?;
+                    eprintln!(
+                        "unseal: handle 0x{handle:08x} pcrs {:?} {}",
+                        pcr_list,
+                        if tpm_only { "(tpm-only; SNP gate skipped)" } else { "(snp gate on)" }
+                    );
+                    bootproof::dmext::unseal_persistent_with_pcrs(&device, handle, &pcr_list, tpm_only)?
+                } else {
+                    let blob = bootproof::dmext::SealedBlob::load(&blob_path)?;
+                    eprintln!(
+                        "unseal: blob pcrs {:?} policy_digest {} {}",
+                        blob.pcrs,
+                        hex_str(&blob.policy_digest.0),
+                        if tpm_only { "(tpm-only; SNP gate skipped)" } else { "(snp gate on)" }
+                    );
+                    bootproof::dmext::unseal(&device, &blob, tpm_only)?
+                };
                 if print {
                     // Raw key bytes to stdout.
                     use std::io::Write;
@@ -731,23 +773,38 @@ fn main() -> anyhow::Result<()> {
                     eprintln!("unseal value: OK, {}B key written to {}", key.len(), out.display());
                 }
             }
-            UnsealOp::Disk { device, blob: blob_path, disk, name, mount, tpm_only } => {
-                let blob = bootproof::dmext::SealedBlob::load(&blob_path)?;
-                eprintln!(
-                    "unseal disk: {} blob pcrs {:?} policy_digest {} {}",
-                    disk.display(),
-                    blob.pcrs,
-                    hex_str(&blob.policy_digest.0),
-                    if tpm_only { "(tpm-only; SNP gate skipped)" } else { "(snp gate on)" }
-                );
-                let mapped = bootproof::unseal::disk(
-                    &device,
-                    &blob,
-                    tpm_only,
-                    &disk,
-                    &name,
-                    mount.as_deref(),
-                )?;
+            UnsealOp::Disk { device, blob: blob_path, handle, pcrs, disk, name, mount, tpm_only } => {
+                let mapped = if let Some(h) = &handle {
+                    let handle = u32::from_str_radix(h.trim().trim_start_matches("0x").trim_start_matches("0X"), 16)
+                        .map_err(|e| anyhow::anyhow!("bad handle {h:?}: {e}"))?;
+                    let pcr_list = parse_pcrs(&pcrs)
+                        .ok_or_else(|| anyhow::anyhow!("--handle requires --pcrs (the sealed PCR selection)"))?;
+                    eprintln!(
+                        "unseal disk: {} handle 0x{handle:08x} pcrs {:?} {}",
+                        disk.display(),
+                        pcr_list,
+                        if tpm_only { "(tpm-only; SNP gate skipped)" } else { "(snp gate on)" }
+                    );
+                    let keyfile = bootproof::dmext::unseal_persistent_with_pcrs(&device, handle, &pcr_list, tpm_only)?;
+                    bootproof::unseal::disk_from_keyfile(&keyfile, &disk, &name, mount.as_deref())?
+                } else {
+                    let blob = bootproof::dmext::SealedBlob::load(&blob_path)?;
+                    eprintln!(
+                        "unseal disk: {} blob pcrs {:?} policy_digest {} {}",
+                        disk.display(),
+                        blob.pcrs,
+                        hex_str(&blob.policy_digest.0),
+                        if tpm_only { "(tpm-only; SNP gate skipped)" } else { "(snp gate on)" }
+                    );
+                    bootproof::unseal::disk(
+                        &device,
+                        &blob,
+                        tpm_only,
+                        &disk,
+                        &name,
+                        mount.as_deref(),
+                    )?
+                };
                 eprintln!("unseal disk: OK, {}", mapped);
             }
         },

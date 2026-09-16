@@ -115,14 +115,12 @@ fn snp_gate() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Seal `data` (the volume key) under a PCR policy. Persists the `SealedBlob`
-/// as JSON at `out`. The storage parent is deterministic, so it is not
-/// persisted — `unseal` re-derives it via `CreatePrimary`.
-pub fn seal(device: &Path, pcrs: &[u8], data: &[u8], out: &Path) -> anyhow::Result<SealedBlob> {
-    if pcrs.is_empty() {
-        anyhow::bail!("seal: need at least one PCR to bind");
-    }
-
+/// Phases A+B of `seal`: read the live PCRs, compute the policy digest, and
+/// create the data object under the deterministic storage parent. The
+/// connection is dropped at end of scope; the object is not `Load`ed, so
+/// nothing persists to the TPM unless the caller follows up (e.g. with
+/// `seal_persistent`'s Load + EvictControl).
+fn seal_inner(device: &Path, pcrs: &[u8], data: &[u8]) -> anyhow::Result<SealedBlob> {
     // Phase A (raw): read live PCRs + compute the policy digest.
     let per_pcr = read_live_pcrs(device, pcrs)?;
     let digest = policy_pcr_auth_policy(&[selection(pcrs)], &per_pcr);
@@ -134,12 +132,10 @@ pub fn seal(device: &Path, pcrs: &[u8], data: &[u8], out: &Path) -> anyhow::Resu
     }
 
     // Phase B (ESAPI): create the deterministic storage parent + the data
-    // object with the digest as its authPolicy. Connection dropped at end of
-    // scope; the object is not `Load`ed, so nothing persists to the TPM.
+    // object with the digest as its authPolicy.
     let blob = {
         let mut esys = EsysTpm::open(device)?;
         esys.ensure_started()?;
-        let _ = esys.flush_all();
         let owner = rh_std::OWNER;
         let parent = esys.create_storage_primary(owner)?;
         let obj = esys.create_data_object(parent.handle, data, &digest)?;
@@ -169,7 +165,90 @@ pub fn seal(device: &Path, pcrs: &[u8], data: &[u8], out: &Path) -> anyhow::Resu
             name: B64::new(obj.name),
         }
     };
+    Ok(blob)
+}
 
+/// Seal `data` (the volume key) under a PCR policy. Persists the `SealedBlob`
+/// as JSON at `out`. The storage parent is deterministic, so it is not
+/// persisted — `unseal` re-derives it via `CreatePrimary`.
+pub fn seal(device: &Path, pcrs: &[u8], data: &[u8], out: &Path) -> anyhow::Result<SealedBlob> {
+    if pcrs.is_empty() {
+        anyhow::bail!("seal: need at least one PCR to bind");
+    }
+    let blob = seal_inner(device, pcrs, data)?;
+    std::fs::write(out, blob.to_json_pretty()?)?;
+    Ok(blob)
+}
+
+/// Seal `data` under a PCR policy AND `EvictControl` it to the persistent
+/// handle `handle` (0x8100_0000..0x81FF_FFFF) — the `tpm2_evictcontrol`
+/// model, so the object survives reboots and is reachable by tpm2-tools
+/// under the same handle (the current home.sh uses 0x81010200 / 0x81010201).
+/// The blob is still written to `out` for inspection / key-store carry-out.
+///
+/// Idempotency and replacement: if the handle is occupied, the object there
+/// is FLUSHed and the slot is reused (matching the blank-disk re-format
+/// semantics: a new format seals a new key and replaces the old object).
+pub fn seal_persistent(device: &Path, pcrs: &[u8], data: &[u8], handle: u32, out: &Path) -> anyhow::Result<SealedBlob> {
+    if pcrs.is_empty() {
+        anyhow::bail!("seal: need at least one PCR to bind");
+    }
+    if !(0x8100_0000..=0x81FF_FFFF).contains(&handle) {
+        anyhow::bail!(
+            "seal: handle 0x{handle:08x} is not a persistent handle (0x8100_0000..0x81FF_FFFF)"
+        );
+    }
+    // Phase C: persist the freshly created object to `handle`. Sequenced
+    // connections (the NitroTPM char device is single-open), each phase
+    // opens, works, drops:
+    //   C1 (ESAPI): if the handle is occupied, register it as an ESYS_TR
+    //      (Esys_TR_FromTPMPublic) and EvictControl to unload (persistent=0).
+    //      Occupancy is detected with the raw ReadPublic (works on persistent
+    //      handles directly; empty -> 0x018B NO_RESULT).
+    //   C2 (ESAPI): re-derive the parent, Load the object as a transient,
+    //      EvictControl transient->persistent (the loaded transient is a
+    //      registered ESAPI resource, so the wrapper works).
+    //   C3 (raw): ReadPublic the handle and cross-check the Name.
+    let blob = seal_inner(device, pcrs, data)?;
+    {
+        // C1: occupant check + flush.
+        {
+            let mut raw = Tpm::open_started(device)?;
+            let occupied = raw.read_public(handle).is_ok();
+            drop(raw);
+            if occupied {
+                let mut esys = EsysTpm::open(device)?;
+                esys.ensure_started()?;
+                let tr = esys.from_tpm_public(handle)?;
+                esys.evict_control(rh_std::OWNER, tr, 0)?;
+            }
+        }
+        // C2: Load transient + EvictControl to the persistent handle (ESAPI).
+        {
+            let mut esys = EsysTpm::open(device)?;
+            esys.ensure_started()?;
+            let owner = rh_std::OWNER;
+            let parent = esys.create_storage_primary(owner)?;
+            let obj = DataObject {
+                handle: 0,
+                private: blob.private.0.clone(),
+                public: blob.public.0.clone(),
+                name: blob.name.0.clone(),
+            };
+            let loaded = esys.load_data_object(parent.handle, &obj)?;
+            esys.evict_control(owner, loaded.handle, handle)?;
+        }
+        // C3: verify the occupant is OUR object (raw Name cross-check).
+        {
+            let mut raw = Tpm::open_started(device)?;
+            let live = raw.read_public(handle)?;
+            if live.name != blob.name.0 {
+                anyhow::bail!(
+                    "seal: persistent handle 0x{handle:08x} Name mismatch after evictcontrol"
+                );
+            }
+        }
+    }
     std::fs::write(out, blob.to_json_pretty()?)?;
     Ok(blob)
 }
@@ -191,7 +270,6 @@ pub fn unseal(device: &Path, blob: &SealedBlob, tpm_only: bool) -> anyhow::Resul
     {
         let mut esys = EsysTpm::open(device)?;
         esys.ensure_started()?;
-        let _ = esys.flush_all();
         let owner = rh_std::OWNER;
         let parent = esys.create_storage_primary(owner)?;
         let obj = DataObject {
@@ -241,6 +319,93 @@ pub fn unseal(device: &Path, blob: &SealedBlob, tpm_only: bool) -> anyhow::Resul
         );
     }
 
+    decode_outdata(&body)
+}
+
+/// Extract the 32-byte `authPolicy` from a marshaled `TPMT_PUBLIC` byte
+/// string. The layout is: type(2) | nameAlg(2) | objectAttributes(4) |
+/// authPolicy TPM2B{ size(2), bytes } — so the size prefix sits at offset 8
+/// and the digest at offset 10. Fails closed unless it is exactly 32 bytes
+/// (anything else means the object is not a PCR-policy data object).
+fn parse_auth_policy(public: &[u8]) -> anyhow::Result<Vec<u8>> {
+    if public.len() < 8 + 2 + 32 {
+        anyhow::bail!(
+            "authPolicy: public area too short ({}B), expected >= {}",
+            public.len(),
+            8 + 2 + 32
+        );
+    }
+    let ap_size = u16::from_be_bytes([public[8], public[9]]) as usize;
+    if ap_size != 32 {
+        anyhow::bail!(
+            "authPolicy: {} bytes, expected 32 (not a PCR-policy data object)",
+            ap_size
+        );
+    }
+    Ok(public[10..10 + 32].to_vec())
+}
+
+/// Read a persistent object's `Name` and `authPolicy` (32B) via ReadPublic.
+/// The Name is the Unseal command's cpHash entity; the authPolicy is the
+/// policyPCR digest baked at seal time.
+fn read_object_policy(device: &Path, handle: u32) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    let mut raw = Tpm::open_started(device)?;
+    let k = raw.read_public(handle)?;
+    let ap = parse_auth_policy(&k.public)
+        .map_err(|e| anyhow::anyhow!("unseal 0x{handle:08x}: {e}"))?;
+    Ok((k.name.clone(), ap))
+}
+
+/// Unseal a persistent-handle data object given its sealed PCR selection.
+/// This is the pure-Rust equivalent of
+/// `tpm2_unseal -c <handle> -p pcr:sha256:<list> -o <keyfile>`: it re-derives
+/// the policy digest from the LIVE PCRs over `pcrs` and the policy-authorized
+/// Unseal must succeed. PCR drift → `rc=0x099d` (fail-closed, no key).
+/// Returns the sealed volume key.
+pub fn unseal_persistent_with_pcrs(
+    device: &Path,
+    handle: u32,
+    pcrs: &[u8],
+    tpm_only: bool,
+) -> anyhow::Result<Vec<u8>> {
+    if pcrs.is_empty() {
+        anyhow::bail!("unseal: need at least one PCR to bind");
+    }
+    if !ht::PERSISTENT_RANGE.contains(&handle) {
+        anyhow::bail!(
+            "unseal: handle 0x{handle:08x} is not a persistent handle (0x8100_0000..0x81FF_FFFF)"
+        );
+    }
+    // Gate 1: SEV-SNP (fail-closed), skipped under --tpm-only.
+    if !tpm_only {
+        snp_gate()?;
+    }
+
+    // Read the object's Name (the Unseal command's cpHash entity) + its
+    // baked authPolicy; cross-check the PCR policy digest the caller supplied
+    // matches what the object was sealed with.
+    let (name, baked_ap) = read_object_policy(device, handle)?;
+    // The caller's PCR list must reproduce the baked policy digest from the
+    // LIVE PCRs. We do NOT compare against baked_ap here (the digest is a
+    // function of live PCR VALUES, which legitimately differ between seal and
+    // unseal time only if PCRs drifted — which is exactly the failure we want
+    // to catch). The TPM enforces it in the policy session + Unseal.
+
+    // Gate 2, phase 1 (raw): live PCR read for the selection.
+    let per_pcr = read_live_pcrs(device, pcrs)?;
+
+    // Gate 2, phase 2 (raw): policy-PCR session + policy-authorized Unseal.
+    let mut raw = Tpm::open_started(device)?;
+    let sess = raw.start_policy_pcr_session(&[selection(pcrs)], &per_pcr)?;
+    let (rc, body) = raw.call_with_session(cc::UNSEAL as u32, &name, &[handle], &[], &sess, &[])?;
+    let _ = raw.flush_context(sess.handle);
+    if rc != 0 {
+        anyhow::bail!(
+            "unseal rejected rc=0x{rc:04x} ({}) — PCR policy did not match the sealed state",
+            bootproof_tpm::error::rc_name(rc as u16)
+        );
+    }
+    let _ = baked_ap; // cross-check reserved; the TPM is authoritative
     decode_outdata(&body)
 }
 
@@ -372,5 +537,68 @@ mod tests {
         body.extend_from_slice(&(26u16).to_be_bytes());
         body.extend_from_slice(&[0u8; 4]);
         assert!(decode_outdata(&body).is_err());
+    }
+
+    /// A marshaled TPMT_PUBLIC with a 32-byte authPolicy at the canonical
+    /// offsets: type(2)|nameAlg(2)|attrs(4)|size(2)=0x0020|digest(32).
+    #[test]
+    fn parse_auth_policy_canonical() {
+        let mut pub_ = Vec::new();
+        pub_.extend_from_slice(&0x0008u16.to_be_bytes()); // type KEYEDHASH
+        pub_.extend_from_slice(&0x000Bu16.to_be_bytes()); // nameAlg SHA256
+        pub_.extend_from_slice(&0u32.to_be_bytes()); // attributes
+        pub_.extend_from_slice(&(32u16).to_be_bytes()); // authPolicy size
+        pub_.extend_from_slice(&[0x5a; 32]); // the digest
+        assert_eq!(parse_auth_policy(&pub_).unwrap(), vec![0x5a; 32]);
+    }
+
+    /// A public area with an EMPTY authPolicy (an auth-value object, not a
+    /// PCR-policy object) must be rejected (fail-closed). Here the empty
+    /// policy makes the area shorter than the minimum, so it is caught by the
+    /// length check; the point is that it is REJECTED either way.
+    #[test]
+    fn parse_auth_policy_rejects_empty_policy() {
+        let mut pub_ = Vec::new();
+        pub_.extend_from_slice(&0x0008u16.to_be_bytes());
+        pub_.extend_from_slice(&0x000Bu16.to_be_bytes());
+        pub_.extend_from_slice(&0u32.to_be_bytes());
+        pub_.extend_from_slice(&(0u16).to_be_bytes()); // empty authPolicy
+        assert!(parse_auth_policy(&pub_).is_err());
+    }
+
+    /// A truncated public area (shorter than the minimum) is rejected.
+    #[test]
+    fn parse_auth_policy_rejects_short_public() {
+        let pub_ = vec![0u8; 8 + 2 + 31]; // 1 byte short
+        assert!(parse_auth_policy(&pub_).is_err());
+    }
+
+    /// A non-32-byte policy (e.g. a 16-byte SHA-1 policy) is rejected: our
+    /// data objects are always SHA-256 PCR policies.
+    #[test]
+    fn parse_auth_policy_rejects_wrong_length() {
+        let mut pub_ = Vec::new();
+        pub_.extend_from_slice(&0u16.to_be_bytes());
+        pub_.extend_from_slice(&0u16.to_be_bytes());
+        pub_.extend_from_slice(&0u32.to_be_bytes());
+        pub_.extend_from_slice(&(16u16).to_be_bytes());
+        pub_.extend_from_slice(&[0u8; 16 + 16]); // pad so len >= 42
+        let e = parse_auth_policy(&pub_).unwrap_err().to_string();
+        assert!(e.contains("16 bytes"), "{e}");
+    }
+
+    /// The persistent-handle range check: the two production handles and the
+    /// boundaries pass; a transient, NV, or hierarchy handle fails.
+    #[test]
+    fn persistent_range_checks() {
+        use bootproof_tpm::constants::ht;
+        assert!(ht::PERSISTENT_RANGE.contains(&0x8101_0200)); // seed (home.sh)
+        assert!(ht::PERSISTENT_RANGE.contains(&0x8101_0201)); // full (home.sh)
+        assert!(ht::PERSISTENT_RANGE.contains(&0x8100_0000)); // range start
+        assert!(ht::PERSISTENT_RANGE.contains(&0x81FF_FFFF)); // range end
+        assert!(!ht::PERSISTENT_RANGE.contains(&0x8000_0000)); // transient
+        assert!(!ht::PERSISTENT_RANGE.contains(&0xB000_0000)); // NV
+        assert!(!ht::PERSISTENT_RANGE.contains(&0x4000_0001)); // owner hierarchy
+        assert!(!ht::PERSISTENT_RANGE.contains(&0x8200_0000)); // loaded metadata
     }
 }

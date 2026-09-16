@@ -453,7 +453,6 @@ fn main() -> Result<()> {
             let obj = {
                 let mut esys = EsysTpm::open(&dev)?;
                 esys.ensure_started()?;
-                let _ = esys.flush_all();
                 let owner = bootproof_tpm::esys::rh_std::OWNER;
                 let parent = esys.create_storage_primary(owner)?;
                 println!("[p2] storage parent handle=0x{:08x}", parent.handle);
