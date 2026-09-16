@@ -6,6 +6,7 @@ pub mod dns;
 pub mod dmext;
 pub mod facts;
 pub mod format;
+pub mod protocol;
 pub mod provenance;
 pub mod serve;
 pub mod snp;

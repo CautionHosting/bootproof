@@ -12,12 +12,15 @@
 //! two paths can never drift on ordering or the slot-link fold.
 //!
 //! Wire format (one request per connection):
-//!   request : exactly 64 bytes = the challenge `C` (front 32 == the client's
-//!             32-byte nonce, back 32 zero; see `channel::challenge_from_nonce`)
-//!   response: 1 status byte, 4-byte big-endian payload length, payload
-//!             status 0 (OK)  -> serde_json of `Vec<Collected>`
-//!             status 1 (ERR) -> UTF-8 error message
+//!   request : [OP_COLLECT, 4-byte BE len, 64-byte challenge C]
+//!             (front 32 of C == the client's 32-byte nonce, back 32 zero;
+//!             see `channel::challenge_from_nonce`)
+//!   response: [status, 4-byte BE len, payload]
+//!             status RESP_OK (0)  -> serde_json of `Vec<Collected>`
+//!             status RESP_ERR (1) -> UTF-8 error message
 //!
+//! The framing itself lives in `crate::protocol` (shared with the network-
+//! facing daemon); this module is a thin user of it.
 //! The `Collected` entries ride as the exact same JSON the Bundle carries, so
 //! the sandboxed node can splice them straight into its `Bundle` evidence.
 
@@ -25,7 +28,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, info};
 
 use crate::channel::{collect_all, Channel, Collected};
@@ -35,16 +37,11 @@ use crate::channel::{collect_all, Channel, Collected};
 pub const DEFAULT_SOCKET: &str = "/run/bootproof/collect.sock";
 
 /// The request is a fixed-size 64-byte challenge.
-pub const CHALLENGE_LEN: usize = 64;
+pub const CHALLENGE_LEN: usize = crate::protocol::CHALLENGE_LEN;
 
 /// Response status bytes.
-pub const RESP_OK: u8 = 0;
-pub const RESP_ERR: u8 = 1;
-
-/// Reject any daemon response payload larger than this (a defense against a
-/// corrupt/malicious length prefix on the socket). 16 MiB is far above any
-/// real Bundle (a few hundred KB at most).
-const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
+pub const RESP_OK: u8 = crate::protocol::RESP_OK;
+pub const RESP_ERR: u8 = crate::protocol::RESP_ERR;
 
 /// Collect daemon: bind the UDS and serve one request per connection, forever.
 ///
@@ -86,11 +83,23 @@ async fn handle_conn(
     mut stream: tokio::net::UnixStream,
     channels: Arc<Vec<Box<dyn Channel + Send + Sync>>>,
 ) {
-    let mut challenge = [0u8; CHALLENGE_LEN];
-    if let Err(e) = stream.read_exact(&mut challenge).await {
-        debug!(%e, "collect: read challenge failed");
+    let (op, payload) = match crate::protocol::read_frame(&mut stream).await {
+        Ok(x) => x,
+        Err(e) => {
+            debug!(%e, "collect: read request failed");
+            return;
+        }
+    };
+    if op != crate::protocol::OP_COLLECT {
+        debug!(op = op, "collect: unexpected op");
         return;
     }
+    if payload.len() != CHALLENGE_LEN {
+        debug!(len = payload.len(), "collect: bad challenge length");
+        return;
+    }
+    let challenge: [u8; CHALLENGE_LEN] =
+        payload.as_slice().try_into().expect("length checked above");
 
     // Collect off the async executor: the channels read devices (blocking I/O).
     let result = tokio::task::spawn_blocking({
@@ -108,11 +117,7 @@ async fn handle_conn(
         Err(e) => (RESP_ERR, e.to_string().into_bytes()),
     };
 
-    let mut frame = Vec::with_capacity(5 + payload.len());
-    frame.push(status);
-    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    frame.extend_from_slice(&payload);
-    if let Err(e) = stream.write_all(&frame).await {
+    if let Err(e) = crate::protocol::write_frame(&mut stream, status, &payload).await {
         debug!(%e, "collect: write response failed");
     }
 }
@@ -124,22 +129,17 @@ async fn handle_conn(
 pub async fn request(socket: &Path, challenge: &[u8; CHALLENGE_LEN]) -> anyhow::Result<Vec<Collected>> {
     let mut stream = tokio::net::UnixStream::connect(socket).await?;
 
-    // Request: the raw 64-byte challenge.
-    stream.write_all(challenge).await?;
+    // Request: [OP_COLLECT, 4-byte BE len, 64-byte challenge].
+    crate::protocol::write_frame(&mut stream, crate::protocol::OP_COLLECT, challenge)
+        .await
+        .map_err(|e| anyhow::anyhow!("collect: {e}"))?;
 
-    // Response: status byte + 4-byte BE length + payload.
-    let mut status = [0u8; 1];
-    stream.read_exact(&mut status).await?;
-    let mut len = [0u8; 4];
-    stream.read_exact(&mut len).await?;
-    let n = u32::from_be_bytes(len) as usize;
-    if n > MAX_PAYLOAD {
-        anyhow::bail!("collect daemon payload too large: {n} bytes");
-    }
-    let mut buf = vec![0u8; n];
-    stream.read_exact(&mut buf).await?;
+    // Response: [status, 4-byte BE len, payload] (length cap enforced).
+    let (status, buf) = crate::protocol::read_frame(&mut stream)
+        .await
+        .map_err(|e| anyhow::anyhow!("collect: {e}"))?;
 
-    match status[0] {
+    match status {
         RESP_OK => Ok(serde_json::from_slice(&buf)?),
         RESP_ERR => {
             let msg = String::from_utf8_lossy(&buf);
