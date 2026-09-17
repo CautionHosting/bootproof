@@ -68,8 +68,6 @@ fn main() -> Result<()> {
             println!("[rs] marshalled RSA TPMT_PUBLIC ({}B): {}", mb.len(), hex(&mb));
             let mut tpm = EsysTpm::open(&PathBuf::from(&target))?;
             tpm.ensure_started()?;
-            let flushed = tpm.flush_all();
-            println!("[rs] flush_all OK: {flushed} handles flushed");
             match tpm.create_primary_with_public(rh_std::OWNER, &tp) {
                 Ok(k) => println!(
                     "[rs] CreatePrimary RSA OK handle=0x{:08x} public={}B name={}",
@@ -104,7 +102,6 @@ fn main() -> Result<()> {
             }
             let mut tpm = EsysTpm::open(&PathBuf::from(&target))?;
             tpm.ensure_started()?;
-            let _ = tpm.flush_all();
             let pcr = PcrSelection::new(alg::SHA256, &[7]);
             for st in [0x00u8, 0x01, 0x02, 0x03] {
                 match tpm.start_auth_session(st) {
@@ -252,7 +249,6 @@ fn main() -> Result<()> {
             }
             let mut tpm = EsysTpm::open(&PathBuf::from(&target))?;
             tpm.ensure_started()?;
-            let _ = tpm.flush_all();
             let owner = bootproof_tpm::esys::rh_std::OWNER;
             let parent = tpm.create_storage_primary(owner)?;
             println!("[k0] storage parent 0x{:08x}", parent.handle);
@@ -299,7 +295,6 @@ fn main() -> Result<()> {
             }
             let mut tpm = EsysTpm::open(&PathBuf::from(&target))?;
             tpm.ensure_started()?;
-            let _ = tpm.flush_all();
             let owner = bootproof_tpm::esys::rh_std::OWNER;
             // The Create PARENT must be a storage (restricted+decrypt) key.
             // A signing primary here is rejected by the firmware with 0x18A
@@ -630,8 +625,6 @@ fn main() -> Result<()> {
                 });
             eprintln!("[e] backend=esys hierarchy=0x{hierarchy:08x}");
             println!("[e0] esys open + started: {target} dialect={}", tpm.dialect());
-            let flushed = tpm.flush_all();
-            println!("[0] flush_all OK: {flushed} handles flushed");
             let key = tpm.create_primary(hierarchy)?;
             println!("[1] CreatePrimary OK handle=0x{:08x}", key.handle);
             println!("    public len={} name={}", key.public.len(), hex(&key.name));
