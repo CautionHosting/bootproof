@@ -1,19 +1,16 @@
 //! `bootproof` — unified remote-attestation binary.
 //!
 //! Subcommands:
-//!   attest   — node server: serve a REST remote-attestation API
-//!   verify   — client: challenge a node, verify proof offline, print facts
-//!   decrypt  — decrypt a blob with the local (PCR-gated) TPM key
-//!   sign     — sign data with the local (PCR-gated) TPM key
+//!   attest   — one-shot: collect one Bundle from the collect daemon and
+//!              write its JSON to `--out <file>`
+//!   verify   — offline bundle verify (`verify <file>`), or challenge a
+//!              remote bootproofd node (`verify <remote>`)
 //!   tpm-probe— debug: read PCRs + properties from a local TPM
-//!   nsi      — request the NitroTPM attestation document bound to a nonce
 
 mod tpm_probe;
-mod verify_nitro;
 
 use std::path::PathBuf;
 
-use base64::Engine as _;
 use clap::{Parser, Subcommand};
 
 use bootproof_tpm::Tpm;
@@ -51,17 +48,15 @@ enum Command {
         #[arg(long)]
         create_ek: bool,
     },
-    /// Serve a REST remote-attestation API for this node.
+    /// One-shot attest: collect one Bundle from the host-side collect
+    /// daemon and write its JSON to this file, then exit. Pairs with
+    /// `bootproof verify <file>` for offline attestation. (The TLS node
+    /// server and the collect daemon have moved to the enclaved daemon /
+    /// bootproofd; this CLI only does the one-shot path.)
     Attest {
-        /// Address to listen on (default :443).
-        #[arg(long, default_value = "0.0.0.0:443")]
-        listen: String,
-        /// State directory for the TLS key + TPM keys (default /var/lib/bootproof).
-        #[arg(long, default_value = "/var/lib/bootproof")]
-        state: PathBuf,
-        /// Static TLS key (PEM). If absent, one is generated and persisted.
+        /// Destination for the one-shot Bundle JSON.
         #[arg(long)]
-        key: Option<PathBuf>,
+        out: PathBuf,
         /// Optional metadata JSON file.
         #[arg(long)]
         metadata: Option<PathBuf>,
@@ -71,25 +66,6 @@ enum Command {
         /// degrades to no hardware evidence (NOT PROVEN), never a device read.
         #[arg(long, default_value = "/run/bootproof/collect.sock")]
         collect_socket: PathBuf,
-        /// P3 one-shot mode: instead of serving the TLS node, collect one
-        /// Bundle from the collect daemon and write its JSON to this file,
-        /// then exit. Pairs with `bootproof verify <file>` for offline
-        /// attestation.
-        #[arg(long)]
-        out: Option<PathBuf>,
-    },
-    /// Run the collect daemon: the SOLE process that touches the
-    /// attestation hardware (/dev/tpm0, /dev/sev-guest). Listens on a Unix
-    /// domain socket and collects signed evidence for one 64-byte challenge
-    /// per connection. The sandboxed `attest` node talks to this daemon
-    /// instead of reading devices directly (gVisor forbids the device reads).
-    Collect {
-        /// Unix domain socket to listen on (default /run/bootproof/collect.sock).
-        #[arg(long, default_value = "/run/bootproof/collect.sock")]
-        socket: PathBuf,
-        /// Connect to swtpm over TCP (host:port). Overrides char-device detection.
-        #[arg(long)]
-        tcp: Option<String>,
     },
     /// Verify and print the trust tree (no target), or challenge a remote
     /// node (with target), verify its proof offline, and print the facts table.
@@ -151,335 +127,6 @@ enum Command {
         #[arg(long)]
         min_level: Option<u8>,
     },
-    /// Decrypt a blob with the local TPM (gated by the attested PCR state).
-    Decrypt {
-        /// The encrypted blob (base64 or path to file).
-        blob: String,
-        /// State directory for the TPM keys (default /var/lib/bootproof).
-        #[arg(long, default_value = "/var/lib/bootproof")]
-        state: PathBuf,
-    },
-    /// Sign data with the local TPM (gated by the attested PCR state).
-    Sign {
-        /// The data to sign (raw bytes or path to file).
-        data: String,
-        /// State directory for the TPM keys (default /var/lib/bootproof).
-        #[arg(long, default_value = "/var/lib/bootproof")]
-        state: PathBuf,
-    },
-    /// Seal/unseal a LUKS volume key (TPM2 data object + optional SEV-SNP gate).
-    Dmext {
-        #[command(subcommand)]
-        op: DmextOp,
-    },
-    /// Unseal a value or an entire LUKS disk after dual attestation
-    /// (in-process SEV-SNP + TPM2 PCR policy). The disk path is pure Rust:
-    /// LUKS2 -> dm-crypt -> ext4 -> mount, no cryptsetup/mount/losetup.
-    Unseal {
-        #[command(subcommand)]
-        op: UnsealOp,
-    },
-    /// Bridge a TCP port to the local TPM (raw TPM2 framing). For capturing
-    /// commands from remote tooling (e.g. tss-esapi over an SSH tunnel).
-    TpmBridge {
-        /// Address to listen on.
-        #[arg(long, default_value = "127.0.0.1:51000")]
-        listen: String,
-        /// swtpm control-socket address (returns success for all control
-        /// commands; needed by tss2's swtpm TCTI).
-        #[arg(long)]
-        control: Option<String>,
-        /// TPM kernel character device (default /dev/tpm0).
-        #[arg(long, default_value = "/dev/tpm0")]
-        device: PathBuf,
-        /// Append a hex log of every command/response to this file.
-        #[arg(long)]
-        log: Option<PathBuf>,
-    },
-    /// Request the NitroTPM attestation document (AWS NSM vendor command)
-    /// bound to a nonce, and print it base64.
-    Nsi {
-        /// TPM kernel character device (default /dev/tpm0).
-        #[arg(long, default_value = "/dev/tpm0")]
-        device: PathBuf,
-        /// The nonce to bind (hex or base64; default: 32 random bytes).
-        #[arg(long)]
-        nonce: Option<String>,
-        /// Extra user data to echo (hex or base64).
-        #[arg(long)]
-        user_data: Option<String>,
-        /// A client public key (PEM/DER file) to include in the document.
-        #[arg(long)]
-        public_key: Option<PathBuf>,
-        /// Raw NV index of the persistent scratch buffer (hex u32).
-        #[arg(long, default_value = "1")]
-        nv_index: String,
-        /// Connect via tpm-bridge TCP endpoint (host:port).
-        #[arg(long)]
-        tcp: Option<String>,
-    },
-    /// Serve a self-contained NitroTPM attestation API (plain HTTP):
-    /// `POST /attest` returns the nonce-bound attestation chain.
-    Serve {
-        /// Address to listen on (default 127.0.0.1:8443).
-        #[arg(long, default_value = "127.0.0.1:8443")]
-        listen: String,
-        /// TPM kernel character device (default /dev/tpm0).
-        #[arg(long, default_value = "/dev/tpm0")]
-        device: PathBuf,
-        /// Connect via tpm-bridge TCP endpoint (host:port). Overrides --device.
-        #[arg(long)]
-        tcp: Option<String>,
-        /// Raw NV index of the persistent NSM scratch buffer (hex u32).
-        #[arg(long, default_value = "0")]
-        nv_index: String,
-    },
-    /// Verify a NitroTPM attestation against the AWS Nitro roots of trust
-    /// (signature + chain + nonce, plus an optional pinned-PCR policy).
-    VerifyNitro {
-        /// The attestation: a `serve` JSON response, or a raw base64 COSE doc.
-        doc: PathBuf,
-        /// Expected nonce (hex or base64). Defaults to a serve JSON doc's nonce.
-        #[arg(long)]
-        nonce: Option<String>,
-        /// JSON file of expected PCRs `{"0": "hex", ...}`. If absent, no PCR
-        /// policy is checked (signature + chain + nonce only).
-        #[arg(long)]
-        pcrs: Option<PathBuf>,
-        /// Verify at this Unix time (seconds) instead of the current wall clock.
-        #[arg(long)]
-        time: Option<u64>,
-        /// After a successful verify, write the doc's PCRs here as a
-        /// known-good reference.
-        #[arg(long)]
-        emit_pcrs: Option<PathBuf>,
-        /// Emit JSON instead of the facts table.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Probe NV_DefineSpace attribute layouts against a live TPM.
-    NvTest {
-        /// TPM kernel character device (default /dev/tpm0).
-        #[arg(long, default_value = "/dev/tpm0")]
-        device: PathBuf,
-        /// NV index name algorithm (hex u16; default 0x0b SHA256).
-        #[arg(long, default_value = "0b")]
-        name_alg: String,
-        /// TPMA_NV attribute bits (hex u32; default 0x40004 auth-read|auth-write).
-        #[arg(long, default_value = "40004")]
-        attrs: String,
-        /// Data area size (bytes; default 8192).
-        #[arg(long, default_value_t = 8192)]
-        size: u16,
-        /// NV auth value (hex; omit for NULL auth).
-        #[arg(long)]
-        auth: Option<String>,
-        /// NV index handle (hex u32; default 0 = TPM-assigned).
-        #[arg(long, default_value = "0")]
-        index: String,
-        /// Replicate the platform tpm2-tools exact command sequence.
-        #[arg(long)]
-        mimic: bool,
-        /// Undefine the given raw NV indices (comma-separated hex).
-        #[arg(long)]
-        undefine: Option<String>,
-        /// Try several NV_DefineSpace session/no-session forms.
-        #[arg(long)]
-        forms: bool,
-        /// Sequence bisection for the define session failure.
-        #[arg(long)]
-        seq: bool,
-        /// Undefine handle-base/entity matrix for a single raw index.
-        #[arg(long)]
-        umatrix: Option<String>,
-        /// Send a raw hex command verbatim and print rc + response.
-        #[arg(long)]
-        raw: Option<String>,
-        /// Connect via tpm-bridge TCP endpoint (host:port) instead of the
-        /// char device.
-        #[arg(long)]
-        tcp: Option<String>,
-        /// Replay platform-captured SAS + define hex (two space-separated
-        /// hex strings).
-        #[arg(long)]
-        replay: Option<String>,
-        /// NV read/write handle-pair probe for an existing raw index.
-        #[arg(long)]
-        rw: Option<String>,
-        /// Comma-separated read/write sizes to bisection-test (applies to
-        /// --rw; each size is used for both the NV_Read size and the
-        /// NV_Write data size).
-        #[arg(long, default_value = "4,8,15,16,17,32,57")]
-        rw_sizes: String,
-        /// Run TPM2_Clear against candidate lockout hierarchy handles to
-        /// release DA lockout (0x0921).
-        #[arg(long)]
-        clear: bool,
-    },
-    /// Parse a StageX /provenance.spdx (SPDX 2.3) and check its package
-    /// digests against the published container signatures (local checkout
-    /// of the signatures repo and/or the sigs.stagex.tools lookaside).
-    Provenance {
-        /// Path to the SPDX document (default /provenance.spdx).
-        #[arg(long, default_value = "/provenance.spdx")]
-        path: PathBuf,
-        /// Local checkout of the signatures repo (root containing
-        /// stagex/, or the dir with the `<name>@sha256=.../` entries).
-        #[arg(long)]
-        sigs: Option<PathBuf>,
-        /// Lookaside base URL (e.g. https://sigs.stagex.tools).
-        #[arg(long)]
-        lookaside: Option<String>,
-        /// PGP keyring to verify found signatures against (in-process, rPGP).
-        #[arg(long)]
-        keyring: Option<PathBuf>,
-        /// Print every package line, not just a summary.
-        #[arg(long)]
-        all: bool,
-        /// JSON output.
-        #[arg(long)]
-        json: bool,
-        /// Max packages to query for the remote lookaside check.
-        #[arg(long, default_value_t = 500)]
-        max: usize,
-        /// A locally REGENERATED provenance document (after rebuilding at
-        /// the pinned commit): compare its per-package digests against
-        /// --path. Exit 3 when they differ.
-        #[arg(long)]
-        compare: Option<PathBuf>,
-    },
-}
-
-/// `dmext` operations: seal a volume key under a PCR policy (+ optional
-/// SEV-SNP gate), or unseal it when both proofs pass.
-#[derive(Subcommand)]
-enum DmextOp {
-    /// Seal a volume key into a TPM2 data object bound to a PCR policy.
-    Seal {
-        /// TPM kernel character device (default /dev/tpm0).
-        #[arg(long, default_value = "/dev/tpm0")]
-        device: PathBuf,
-        /// Comma-separated PCR indices to bind (default 4,5,7,9).
-        #[arg(long, default_value = "4,5,7,9")]
-        pcrs: String,
-        /// The volume key to seal: raw base64/hex, `@<file>`, or
-        /// `-` to read from stdin.
-        data: String,
-        /// Where to write the sealed blob (JSON).
-        #[arg(long, default_value = "/run/dmext.sealed.json")]
-        out: PathBuf,
-        /// Also EvictControl the object to this persistent handle (hex u32,
-        /// e.g. 0x81010200) so it survives reboots and is visible to
-        /// tpm2-tools. The blob is still written to `--out`.
-        #[arg(long)]
-        persistent: Option<String>,
-    },
-    /// Unseal a volume key (gated on the SEV-SNP proof and the PCR policy).
-    Unseal {
-        /// TPM kernel character device (default /dev/tpm0).
-        #[arg(long, default_value = "/dev/tpm0")]
-        device: PathBuf,
-        /// The sealed blob (JSON file). Ignored when `--handle` is given.
-        #[arg(long, default_value = "/run/dmext.sealed.json")]
-        blob: PathBuf,
-        /// Unseal the persistent-handle data object at this hex u32 (e.g.
-        /// 0x81010200) instead of a blob file — the `tpm2_unseal -c` model.
-        /// Requires `--pcrs`.
-        #[arg(long)]
-        handle: Option<String>,
-        /// PCR indices for the `--handle` path (comma-separated; no default —
-        /// be explicit about the policy).
-        #[arg(long)]
-        pcrs: Option<String>,
-        /// Skip the SEV-SNP gate (TPM PCR policy only). Fails closed
-        /// otherwise; use only where the enclave proof is not available.
-        #[arg(long)]
-        tpm_only: bool,
-        /// Print the key to stdout (raw bytes). Default: write to `--out`
-        /// and print a summary.
-        #[arg(long)]
-        print: bool,
-        /// Where to write the unsealed key (ignored with `--print`).
-        #[arg(long, default_value = "/run/dmext.key")]
-        out: PathBuf,
-    },
-    /// Re-seal one persistent object under a different PCR policy: unseal
-    /// `--from` (PCR policy `--from-pcrs`) and EvictControl the result to
-    /// `--to` (PCR policy `--to-pcrs`). The key bytes never leave this
-    /// process (no `--print`, no file, no shell).
-    ///
-    /// Idempotent: if `--to` already holds a persistent object, this is a
-    /// no-op success (a previous boot already migrated).
-    Migrate {
-        /// TPM kernel character device (default /dev/tpm0).
-        #[arg(long, default_value = "/dev/tpm0")]
-        device: PathBuf,
-        /// Source persistent handle (hex u32, e.g. 0x81010200).
-        from: String,
-        /// PCR policy the source object was sealed with (comma-separated).
-        #[arg(long)]
-        from_pcrs: String,
-        /// Destination persistent handle (hex u32, e.g. 0x81010201).
-        to: String,
-        /// PCR policy to seal the destination object with (comma-separated).
-        #[arg(long)]
-        to_pcrs: String,
-        /// Skip the SEV-SNP gate (TPM PCR policy only).
-        #[arg(long)]
-        tpm_only: bool,
-    },
-}
-
-/// `unseal` operations: release a sealed value, or open a LUKS disk end-to-end
-/// (LUKS2 -> dm-crypt -> ext4 -> mount) in pure Rust, gated on dual attestation.
-#[derive(Subcommand)]
-enum UnsealOp {
-    /// Release a sealed value (identical to `dmext unseal`).
-    Value {
-        /// TPM kernel character device (default /dev/tpm0).
-        #[arg(long, default_value = "/dev/tpm0")]
-        device: PathBuf,
-        /// The sealed blob (JSON file).
-        #[arg(long, default_value = "/run/dmext.sealed.json")]
-        blob: PathBuf,
-        /// Skip the SEV-SNP gate (TPM PCR policy only).
-        #[arg(long)]
-        tpm_only: bool,
-        /// Print the key to stdout (raw bytes). Default: write to `--out`.
-        #[arg(long)]
-        print: bool,
-        /// Where to write the unsealed key (ignored with `--print`).
-        #[arg(long, default_value = "/run/unseal.key")]
-        out: PathBuf,
-    },
-    /// Open a LUKS disk: dual gate -> keyfile -> LUKS2 master key -> dm-crypt
-    /// -> (optional) ext4 mount. Pure Rust, no cryptsetup/mount/losetup.
-    Disk {
-        /// TPM kernel character device (default /dev/tpm0).
-        #[arg(long, default_value = "/dev/tpm0")]
-        device: PathBuf,
-        /// The sealed blob (JSON file). Ignored when `--handle` is given.
-        #[arg(long, default_value = "/run/dmext.sealed.json")]
-        blob: PathBuf,
-        /// Unseal the persistent-handle data object at this hex u32 (e.g.
-        /// 0x81010200) instead of a blob file. Requires `--pcrs`.
-        #[arg(long)]
-        handle: Option<String>,
-        /// PCR indices for the `--handle` path (comma-separated; no default).
-        #[arg(long)]
-        pcrs: Option<String>,
-        /// The LUKS2 block device (whole disk, not a partition).
-        disk: PathBuf,
-        /// dm-crypt device name (default: home).
-        #[arg(long, default_value = "home")]
-        name: String,
-        /// Mount the opened device as ext4 at this path (default: no mount).
-        #[arg(long)]
-        mount: Option<PathBuf>,
-        /// Skip the SEV-SNP gate (TPM PCR policy only).
-        #[arg(long)]
-        tpm_only: bool,
-    },
 }
 
 fn parse_pcrs(s: &Option<String>) -> Option<Vec<u8>> {
@@ -493,45 +140,6 @@ fn parse_pcrs(s: &Option<String>) -> Option<Vec<u8>> {
 
 fn hex_str(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
-/// Decode a hex or base64 string into bytes (hex wins on even-length input).
-fn decode_b64_or_hex(s: &str) -> anyhow::Result<Vec<u8>> {
-    let t = s.trim();
-    if t.len() % 2 == 0 && !t.is_empty() && t.chars().all(|c| c.is_ascii_hexdigit()) {
-        return hex_to_bytes(t);
-    }
-    Ok(base64::engine::general_purpose::STANDARD
-        .decode(t)
-        .map_err(|e| anyhow::anyhow!("base64: {e}"))?)
-}
-
-fn hex_to_bytes(s: &str) -> anyhow::Result<Vec<u8>> {
-    let b = (0..s.len().div_ceil(2))
-        .map(|i| {
-            u8::from_str_radix(
-                &s[i * 2..i * 2 + 2.min(s.len() - i * 2)],
-                16,
-            )
-        })
-        .collect::<std::result::Result<_, _>>()
-        .map_err(|e| anyhow::anyhow!("hex: {e}"))?;
-    Ok(b)
-}
-
-/// Read the volume key from a `dmext seal` data arg: `-` reads stdin,
-/// `@<path>` reads a file, anything else is base64/hex.
-fn read_key_arg(data: &str) -> anyhow::Result<Vec<u8>> {
-    if data == "-" {
-        use std::io::Read;
-        let mut buf = Vec::new();
-        std::io::stdin().lock().read_to_end(&mut buf)?;
-        return Ok(buf);
-    }
-    if let Some(path) = data.strip_prefix('@') {
-        return Ok(std::fs::read(path)?);
-    }
-    decode_b64_or_hex(data)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -559,6 +167,7 @@ fn main() -> anyhow::Result<()> {
         } => {
             let (mut tpm, source) = match (tcp, unix) {
                 (Some(addr), _) => (
+
                     Tpm::connect_swtpm_tcp_started(&addr)?,
                     format!("swtpm-tcp://{}", addr),
                 ),
@@ -639,65 +248,37 @@ fn main() -> anyhow::Result<()> {
             }
             tpm_probe::run(tpm, parse_pcrs(&pcrs), &source)?;
         }
-        Command::Attest {
-            listen,
-            state,
-            key,
-            metadata,
-            collect_socket,
-            out,
-        } => {
-            // P3 one-shot: write one Bundle to a file and exit (no TLS server).
-            if let Some(path) = out {
-                let node_id = std::fs::read_to_string("/etc/hostname")
-                    .ok()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "node".into());
-                let platform = bootproof::attest::detect_platform();
-                let metadata = match &metadata {
-                    Some(p) => Some(serde_json::from_str(&std::fs::read_to_string(p)?)?),
-                    None => None,
-                };
-                let bundle = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()?
-                    .block_on(bootproof::attest::one_shot(
-                        &node_id,
-                        &platform,
-                        &collect_socket,
-                        metadata,
-                    ));
-                let json = serde_json::to_string_pretty(&bundle)?;
-                std::fs::write(&path, json.as_bytes())?;
-                eprintln!(
-                    "[attest] wrote {} ({} evidence entries) to {}",
-                    json.len(),
-                    bundle.evidence.len(),
-                    path.display()
-                );
-            } else {
-                tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()?
-                    .block_on(bootproof::attest::run(bootproof::attest::Opts {
-                        listen,
-                        state,
-                        key,
-                        metadata,
-                        collect_socket,
-                    }))?;
-            }
-        }
-        Command::Collect { socket, tcp } => {
-            // The SOLE device toucher: build the channel registration once and
-            // run the collect UDS daemon. Runs on the host (outside gVisor),
-            // where /dev/tpm0 and /dev/sev-guest are readable.
-            let channels = std::sync::Arc::new(bootproof::attest::build_channels(tcp.as_deref()));
-            tokio::runtime::Builder::new_multi_thread()
+        Command::Attest { metadata, collect_socket, out } => {
+            // One-shot: write one Bundle to a file and exit (no TLS server).
+            // The node server and collect daemon live in the enclaved daemon
+            // + bootproofd; this CLI only does the file path.
+            let node_id = std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "node".into());
+            let platform = bootproof::attest::detect_platform();
+            let metadata = match &metadata {
+                Some(p) => Some(serde_json::from_str(&std::fs::read_to_string(p)?)?),
+                None => None,
+            };
+            let bundle = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?
-                .block_on(bootproof::collect::serve(socket, channels))?;
+                .block_on(bootproof::attest::one_shot(
+                    &node_id,
+                    &platform,
+                    &collect_socket,
+                    metadata,
+                ));
+            let json = serde_json::to_string_pretty(&bundle)?;
+            std::fs::write(&out, json.as_bytes())?;
+            eprintln!(
+                "[attest] wrote {} ({} evidence entries) to {}",
+                json.len(),
+                bundle.evidence.len(),
+                out.display()
+            );
         }
         Command::Verify {
             target,
@@ -752,457 +333,6 @@ fn main() -> anyhow::Result<()> {
                     })?);
                 }
             }
-        }
-        Command::Decrypt { .. } => {
-            eprintln!("decrypt: not yet implemented");
-            std::process::exit(1);
-        }
-        Command::Sign { .. } => {
-            eprintln!("sign: not yet implemented");
-            std::process::exit(1);
-        }
-        Command::Dmext { op } => match op {
-            DmextOp::Seal { device, pcrs, data, out, persistent } => {
-                let pcr_list: Vec<u8> = pcrs
-                    .split(',')
-                    .map(|x| x.trim().parse::<u8>().map_err(|e| anyhow::anyhow!("bad PCR index {x:?}: {e}")))
-                    .collect::<Result<_, _>>()?;
-                let key = read_key_arg(&data)?;
-                let blob = match &persistent {
-                    Some(h) => {
-                        let handle = u32::from_str_radix(h.trim().trim_start_matches("0x").trim_start_matches("0X"), 16)
-                            .map_err(|e| anyhow::anyhow!("bad persistent handle {h:?}: {e}"))?;
-                        eprintln!("seal: persisting to handle 0x{handle:08x}");
-                        bootproof::dmext::seal_persistent(&device, &pcr_list, &key, handle, &out)?
-                    }
-                    None => bootproof::dmext::seal(&device, &pcr_list, &key, &out)?,
-                };
-                eprintln!(
-                    "seal: wrote {} ({}B key, pcrs {:?}, policy_digest {})",
-                    out.display(),
-                    key.len(),
-                    blob.pcrs,
-                    hex_str(&blob.policy_digest.0)
-                );
-            }
-            DmextOp::Unseal { device, blob: blob_path, handle, pcrs, tpm_only, print, out } => {
-                let key = if let Some(h) = &handle {
-                    let handle = u32::from_str_radix(h.trim().trim_start_matches("0x").trim_start_matches("0X"), 16)
-                        .map_err(|e| anyhow::anyhow!("bad handle {h:?}: {e}"))?;
-                    let pcr_list = parse_pcrs(&pcrs)
-                        .ok_or_else(|| anyhow::anyhow!("--handle requires --pcrs (the sealed PCR selection)"))?;
-                    eprintln!(
-                        "unseal: handle 0x{handle:08x} pcrs {:?} {}",
-                        pcr_list,
-                        if tpm_only { "(tpm-only; SNP gate skipped)" } else { "(snp gate on)" }
-                    );
-                    bootproof::dmext::unseal_persistent_with_pcrs(&device, handle, &pcr_list, tpm_only)?
-                } else {
-                    let blob = bootproof::dmext::SealedBlob::load(&blob_path)?;
-                    eprintln!(
-                        "unseal: blob pcrs {:?} policy_digest {} {}",
-                        blob.pcrs,
-                        hex_str(&blob.policy_digest.0),
-                        if tpm_only { "(tpm-only; SNP gate skipped)" } else { "(snp gate on)" }
-                    );
-                    bootproof::dmext::unseal(&device, &blob, tpm_only)?
-                };
-                if print {
-                    // Raw key bytes to stdout.
-                    use std::io::Write;
-                    std::io::stdout().lock().write_all(&key)?;
-                } else {
-                    std::fs::write(&out, &key)?;
-                    eprintln!(
-                        "unseal: OK, {}B key written to {}",
-                        key.len(),
-                        out.display()
-                    );
-                }
-            }
-            DmextOp::Migrate { device, from, from_pcrs, to, to_pcrs, tpm_only } => {
-                let parse = |s: &String| -> anyhow::Result<Vec<u8>> {
-                    s.split(',')
-                        .map(|x| x.trim().parse::<u8>().map_err(|e| anyhow::anyhow!("bad PCR index {x:?}: {e}")))
-                        .collect::<Result<_, _>>()
-                };
-                let from_p = parse(&from_pcrs)?;
-                let to_p = parse(&to_pcrs)?;
-                let h = |s: &String| {
-                    u32::from_str_radix(s.trim().trim_start_matches("0x").trim_start_matches("0X"), 16)
-                        .map_err(|e| anyhow::anyhow!("bad handle {s:?}: {e}"))
-                };
-                let from_h = h(&from)?;
-                let to_h = h(&to)?;
-                eprintln!(
-                    "migrate: 0x{from_h:08x} (pcrs {:?}) -> 0x{to_h:08x} (pcrs {:?}) {}",
-                    from_p,
-                    to_p,
-                    if tpm_only { "(tpm-only; SNP gate skipped)" } else { "(snp gate on)" }
-                );
-                let migrated = bootproof::dmext::migrate_persistent(&device, from_h, &from_p, to_h, &to_p, tpm_only)?;
-                eprintln!(
-                    "migrate: {} (0x{to_h:08x})",
-                    if migrated { "ok" } else { "already migrated (no-op)" }
-                );
-            }
-        },
-        Command::Unseal { op } => match op {
-            UnsealOp::Value { device, blob: blob_path, tpm_only, print, out } => {
-                let blob = bootproof::dmext::SealedBlob::load(&blob_path)?;
-                eprintln!(
-                    "unseal value: blob pcrs {:?} policy_digest {} {}",
-                    blob.pcrs,
-                    hex_str(&blob.policy_digest.0),
-                    if tpm_only { "(tpm-only; SNP gate skipped)" } else { "(snp gate on)" }
-                );
-                let key = bootproof::unseal::value(&device, &blob, tpm_only)?;
-                if print {
-                    use std::io::Write;
-                    std::io::stdout().lock().write_all(&key)?;
-                } else {
-                    std::fs::write(&out, &key)?;
-                    eprintln!("unseal value: OK, {}B key written to {}", key.len(), out.display());
-                }
-            }
-            UnsealOp::Disk { device, blob: blob_path, handle, pcrs, disk, name, mount, tpm_only } => {
-                let mapped = if let Some(h) = &handle {
-                    let handle = u32::from_str_radix(h.trim().trim_start_matches("0x").trim_start_matches("0X"), 16)
-                        .map_err(|e| anyhow::anyhow!("bad handle {h:?}: {e}"))?;
-                    let pcr_list = parse_pcrs(&pcrs)
-                        .ok_or_else(|| anyhow::anyhow!("--handle requires --pcrs (the sealed PCR selection)"))?;
-                    eprintln!(
-                        "unseal disk: {} handle 0x{handle:08x} pcrs {:?} {}",
-                        disk.display(),
-                        pcr_list,
-                        if tpm_only { "(tpm-only; SNP gate skipped)" } else { "(snp gate on)" }
-                    );
-                    let keyfile = bootproof::dmext::unseal_persistent_with_pcrs(&device, handle, &pcr_list, tpm_only)?;
-                    bootproof::unseal::disk_from_keyfile(&keyfile, &disk, &name, mount.as_deref())?
-                } else {
-                    let blob = bootproof::dmext::SealedBlob::load(&blob_path)?;
-                    eprintln!(
-                        "unseal disk: {} blob pcrs {:?} policy_digest {} {}",
-                        disk.display(),
-                        blob.pcrs,
-                        hex_str(&blob.policy_digest.0),
-                        if tpm_only { "(tpm-only; SNP gate skipped)" } else { "(snp gate on)" }
-                    );
-                    bootproof::unseal::disk(
-                        &device,
-                        &blob,
-                        tpm_only,
-                        &disk,
-                        &name,
-                        mount.as_deref(),
-                    )?
-                };
-                eprintln!("unseal disk: OK, {}", mapped);
-            }
-        },
-        Command::TpmBridge { listen, control, device, log: logpath } => {
-            use std::io::{Read, Write};
-            if let Some(addr) = control {
-                std::thread::spawn(move || {
-                    let l = match std::net::TcpListener::bind(&addr) {
-                        Ok(l) => l,
-                        Err(e) => {
-                            eprintln!("tpm-bridge: control bind {addr}: {e}");
-                            return;
-                        }
-                    };
-                    eprintln!("tpm-bridge: control on {addr}");
-                    for stream in l.incoming() {
-                        let mut s = match stream {
-                            Ok(s) => s,
-                            Err(e) => {
-                                eprintln!("tpm-bridge: control accept ERR {e}");
-                                continue;
-                            }
-                        };
-                        let peer = s.peer_addr().map(|a| a.to_string()).unwrap_or_default();
-                        eprintln!("tpm-bridge: control connect from {peer}");
-                        let _ = s.set_read_timeout(Some(std::time::Duration::from_millis(2000)));
-                        // swtpm control protocol (tcti-swtpm.c): request =
-                        // u32 cmd_code + payload; response = u32 rc (0 = ok).
-                        // The TCTI uses CMD_SET_LOCALITY (0x05, 1 byte) at
-                        // init and CMD_INIT (0x02, 4 bytes) on reset.
-                        loop {
-                            let mut hdr = [0u8; 4];
-                            match s.read_exact(&mut hdr) {
-                                Ok(_) => {}
-                                Err(e) => {
-                                    eprintln!("tpm-bridge: control hdr ERR {e}");
-                                    break;
-                                }
-                            }
-                            let cmd = u32::from_be_bytes(hdr);
-                            let plen = match cmd {
-                                0x02 | 0x12 => 4, // INIT / GET_INFO
-                                0x05 => 1,        // SET_LOCALITY
-                                _ => 0,
-                            };
-                            let mut data = vec![0u8; plen];
-                            if s.read_exact(&mut data).is_err() {
-                                break;
-                            }
-                            eprintln!(
-                                "tpm-bridge: control cmd=0x{cmd:08x}: {}",
-                                hex_str(&data)
-                            );
-                            let wr = s.write_all(&0u32.to_be_bytes()); // rc = success
-                            eprintln!("tpm-bridge: control write {wr:?}");
-                            let _ = s.flush();
-                        }
-                        eprintln!("tpm-bridge: control done {peer}");
-                    }
-                });
-            }
-            let listener = std::net::TcpListener::bind(&listen)?;
-            eprintln!("tpm-bridge: listening on {listen} -> {}", device.display());
-            // Open the TPM once; the swtpm TCTI opens a fresh data socket per
-            // command (and one throwaway connect at init), so per-connection
-            // TPM re-Startup would be wrong.
-            let mut tpm = Tpm::open_started(&device)?;
-            for stream in listener.incoming() {
-                let mut s = stream?;
-                let mut logf = logpath
-                    .as_ref()
-                    .map(|p| std::fs::OpenOptions::new().create(true).append(true).open(p))
-                    .transpose()?;
-                eprintln!("tpm-bridge: connection from {}", s.peer_addr()?);
-                let mut hdr = [0u8; 10];
-                loop {
-                    // A clean EOF (client closed, e.g. the TCTI's init
-                    // sanity-connect) ends this connection, not the bridge.
-                    if s.read_exact(&mut hdr).is_err() {
-                        break;
-                    }
-                    let size = u32::from_be_bytes([hdr[2], hdr[3], hdr[4], hdr[5]]) as usize;
-                    let mut cmd = hdr.to_vec();
-                    cmd.resize(size, 0);
-                    if s.read_exact(&mut cmd[10..]).is_err() {
-                        break;
-                    }
-                    let resp = match tpm.transfer(&cmd) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            eprintln!("tpm-bridge: tpm ERR {e}");
-                            break;
-                        }
-                    };
-                    if let Some(f) = logf.as_mut() {
-                        let _ = writeln!(f, "cmd  ({}B): {}", cmd.len(), hex_str(&cmd));
-                        let _ = writeln!(f, "resp ({}B): {}", resp.len(), hex_str(&resp));
-                    }
-                    if s.write_all(&resp).is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-        Command::Nsi {
-            device,
-            nonce,
-            user_data,
-            public_key,
-            nv_index,
-            tcp,
-        } => {
-            let nv_index = u32::from_str_radix(&nv_index, 16)?;
-            let tpm = match &tcp {
-                Some(addr) => Tpm::connect_swtpm_tcp_started(addr)?,
-                None => Tpm::open_started(&device)?,
-            };
-            let mut tpm = tpm;
-            let nonce = match nonce {
-                Some(s) => decode_b64_or_hex(&s)?,
-                None => tpm.get_random(32)?,
-            };
-            let user_data = user_data.map(|s| decode_b64_or_hex(&s)).transpose()?;
-            let public_key = public_key
-                .map(|p| std::fs::read(&p))
-                .transpose()
-                .map_err(|e| anyhow::anyhow!("public key: {e}"))?;
-            let document = tpm.attestation_document(user_data, Some(nonce), public_key, nv_index)?;
-            println!("{}", base64::engine::general_purpose::STANDARD.encode(&document));
-        }
-        Command::Serve {
-            listen,
-            device,
-            tcp,
-            nv_index,
-        } => {
-            let nv_index = u32::from_str_radix(&nv_index, 16)?;
-            let tpm = match &tcp {
-                Some(addr) => Tpm::connect_swtpm_tcp_started(addr)?,
-                None => Tpm::open_started(&device)?,
-            };
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?
-                .block_on(bootproof::serve::run(bootproof::serve::Opts {
-                    listen,
-                    tpm,
-                    nv_index,
-                }))?;
-        }
-        Command::VerifyNitro {
-            doc,
-            nonce,
-            pcrs,
-            time,
-            emit_pcrs,
-            json,
-        } => {
-            std::process::exit(verify_nitro::run(verify_nitro::Opts {
-                doc,
-                nonce,
-                pcrs,
-                time,
-                emit_pcrs,
-                json,
-            })?);
-        }
-        Command::NvTest {
-            device,
-            name_alg,
-            attrs,
-            size,
-            auth,
-            index,
-            mimic,
-            undefine,
-            forms,
-            seq,
-            umatrix,
-            raw,
-            tcp,
-            replay,
-            rw,
-            rw_sizes,
-            clear,
-        } => {
-            let name_alg = u16::from_str_radix(&name_alg, 16)?;
-            let attrs = u32::from_str_radix(&attrs, 16)?;
-            let index = u32::from_str_radix(&index, 16)?;
-            let auth = auth.map(|s| hex_to_bytes(&s)).transpose()?;
-            let open = || match &tcp {
-                Some(addr) => Tpm::connect_swtpm_tcp_started(addr),
-                None => Tpm::open_started(&device),
-            };
-            let open_raw = || match &tcp {
-                Some(addr) => Tpm::connect_swtpm_tcp(addr),
-                None => Tpm::open(&device),
-            };
-            if clear {
-                let mut tpm = open()?;
-                let candidates = [
-                    0x4000_0009u32,
-                    0x4000_0003,
-                    0x4000_0002,
-                    0x4000_0008,
-                    0x4000_0004,
-                    0x4000_0000,
-                ];
-                for (h, rc) in tpm.tpm_clear_probe(&candidates)? {
-                    println!("0x{h:08x}: rc=0x{rc:04x}");
-                }
-            } else if let Some(idx_s) = rw {
-                let idx = u32::from_str_radix(idx_s.trim(), 16)?;
-                let sizes: Vec<u16> = rw_sizes
-                    .split(',')
-                    .map(|s| s.trim().parse::<u16>().unwrap_or_else(|_| {
-                        eprintln!("[rw] bad size token {s:?}, expected 4..65535");
-                        std::process::exit(2)
-                    }))
-                    .collect();
-                let mut tpm = open()?;
-                for &sz in &sizes {
-                    let (rc_r, body, rc_w) = tpm.nv_rw_probe(idx, sz, sz)?;
-                    println!(
-                        "sz={sz:>4}: read rc=0x{rc_r:04x} ({}B back) write rc=0x{rc_w:04x}",
-                        body
-                    );
-                }
-            } else if let Some(list) = replay {
-                let parts: Vec<&str> = list.split_whitespace().collect();
-                if parts.len() != 3 && parts.len() != 4 {
-                    anyhow::bail!("--replay needs: <sas> <cmd> [area_nonce32 [num_handles]]");
-                }
-                let sas = hex_to_bytes(parts[0])?;
-                let define = hex_to_bytes(parts[1])?;
-                let (an, nh) = match parts.len() {
-                    2 => (None, 1usize),
-                    3 => {
-                        // Short 3rd token = num_handles; long = area nonce.
-                        if parts[2].len() <= 3 {
-                            (None, parts[2].parse::<usize>()?)
-                        } else {
-                            (Some(hex_to_bytes(parts[2])?), 1)
-                        }
-                    }
-                    4 => (Some(hex_to_bytes(parts[2])?), parts[3].parse::<usize>()?),
-                    _ => unreachable!(),
-                };
-                let mut tpm = open()?;
-                for (i, (rc_sas, rc_def)) in tpm.nv_replay(&sas, &define, an.as_deref(), nh)?.iter().enumerate() {
-                    println!("{i}: sas rc=0x{rc_sas:04x} define rc=0x{rc_def:04x}");
-                }
-            } else if let Some(list) = undefine {
-                let mut tpm = open()?;
-                for part in list.split(',') {
-                    let idx = u32::from_str_radix(part.trim(), 16)?;
-                    let rc = tpm.nv_undefine_probe(idx)?;
-                    println!("undefine {idx}: rc=0x{rc:04x}");
-                }
-            } else if forms {
-                let mut tpm = open()?;
-                let (name, rc, handle) = tpm.nv_define_forms(size)?;
-                println!("form={name} rc=0x{rc:04x} handle={handle:?}");
-            } else if seq {
-                let mut tpm = open()?;
-                for (tag, rc) in tpm.nv_seq_test(size)? {
-                    println!("{tag} rc=0x{rc:04x}");
-                }
-            } else if let Some(u) = umatrix {
-                let idx = u32::from_str_radix(u.trim(), 16)?;
-                let mut tpm = open()?;
-                for (tag, rc) in tpm.nv_undefine_matrix(idx)? {
-                    println!("{tag} rc=0x{rc:04x}");
-                }
-            } else if let Some(h) = raw {
-                let mut tpm = open()?;
-                let cmds: Vec<String> = h.split_whitespace().map(|s| s.to_string()).collect();
-                let refs: Vec<&str> = cmds.iter().map(|s| s.as_str()).collect();
-                let results = tpm.raw_replay(&refs)?;
-                for (i, (rc, resp)) in results.iter().enumerate() {
-                    println!("{i}: rc=0x{rc:04x} resp={resp}");
-                }
-            } else if mimic {
-                let mut tpm = open_raw()?;
-                let (rc, handle) = tpm.nv_define_mimic(size)?;
-                println!("rc=0x{rc:04x} handle={handle:?}");
-            } else {
-                let mut tpm = open()?;
-                let (rc, handle) = tpm.nv_define_probe(name_alg, attrs, size, auth.as_deref(), index)?;
-                println!("rc=0x{rc:04x} handle={handle:?}");
-                if let Some(h) = handle {
-                    tpm.flush_context(h).ok();
-                }
-            }
-        }
-        Command::Provenance { path, sigs, lookaside, keyring, all, json, max, compare } => {
-            std::process::exit(bootproof::provenance::run(bootproof::provenance::Opts {
-                path,
-                sigs,
-                lookaside,
-                keyring,
-                all,
-                json,
-                max,
-                compare,
-            })?);
         }
     }
     Ok(())
