@@ -422,3 +422,174 @@ fn now_unix() -> String {
         .map(|d| d.as_secs().to_string())
         .unwrap_or_default()
 }
+
+/// P3 offline verify: read a Bundle (the JSON an `attest --out` wrote, or a
+/// body captured from a live node) and run the same per-channel verification
+/// the remote flow uses, against the file. No network, no pin: the trust
+/// anchor is possession of the file (and whatever the channel evidence
+/// itself binds — the TPM quote nonce, the SNP report, the AK chain).
+///
+/// The bundle's own nonce is the challenge: a replayed file is still verified
+/// against ITS nonce, so a captured bundle verifies cleanly — that is the
+/// intended meaning of "verify a file" (a point-in-time snapshot), distinct
+/// from `verify <remote>` which is fresh.
+pub fn run_offline(path: &str, json: bool) -> anyhow::Result<i32> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("read bundle {path}: {e}"))?;
+    let bundle: Bundle =
+        serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("bundle parse: {e}"))?;
+    if bundle.v != crate::wire::BUNDLE_V {
+        anyhow::bail!("unsupported bundle version {}", bundle.v);
+    }
+    let nonce: [u8; 32] = {
+        let v: Vec<u8> = bundle.nonce.0.clone();
+        if v.len() != 32 {
+            anyhow::bail!("bundle nonce is not 32 bytes");
+        }
+        let mut n = [0u8; 32];
+        n.copy_from_slice(&v);
+        n
+    };
+
+    let mut all_facts: Vec<Fact> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    for ev in &bundle.evidence {
+        let verifier: &dyn Verifier = match ev.channel.as_str() {
+            "tpm2" => &Tpm2Verifier,
+            "snp" => &crate::verify::snp::SnpVerifier,
+            other => {
+                errors.push(format!("no verifier for channel {other}"));
+                continue;
+            }
+        };
+        match verifier.verify(ev, &nonce, &bundle) {
+            Ok(v) => all_facts.extend(verifier.facts(&v)),
+            Err(e) => {
+                errors.push(format!("{}: {e}", ev.channel));
+                if let Some(f) = verifier.failed_fact(ev, &e) {
+                    all_facts.push(f);
+                }
+            }
+        }
+    }
+    let has_snp = bundle.evidence.iter().any(|ev| ev.channel == "snp");
+    if !has_snp {
+        all_facts.push(Fact {
+            name: "memory_encryption".into(),
+            value: "not proven: the bundle has no SEV-SNP evidence".into(),
+            anchors: vec![],
+            status: Status::NotProven,
+        });
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "source": format!("bundle-file:{path}"),
+                "node": &bundle.node,
+                "bundle": &bundle,
+                "facts": all_facts,
+                "errors": errors,
+            })
+        );
+    } else {
+        println!("\nbootproof verify {path} (node {})\n", bundle.node.id);
+        println!("{}", render_table(&all_facts));
+        if !errors.is_empty() {
+            println!("\nERRORS:");
+            for e in &errors {
+                println!("  {e}");
+            }
+        }
+    }
+    Ok(if errors.is_empty() { 0 } else { 1 })
+}
+
+#[cfg(test)]
+mod offline_tests {
+    use super::*;
+    use crate::wire::B64;
+
+    fn write_bundle(tmp: &std::path::Path, bundle: &Bundle) {
+        let json = serde_json::to_string(bundle).unwrap();
+        std::fs::write(tmp.join("bundle.json"), json).unwrap();
+    }
+
+    /// A bundle with no evidence is a valid snapshot: run_offline exits 0 and
+    /// reports the honest "no SEV-SNP evidence" fact instead of erroring.
+    #[test]
+    fn offline_empty_bundle_exits_zero() {
+        let tmp = std::env::temp_dir().join(format!("bp-offline-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut nonce = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut nonce);
+        let bundle = Bundle {
+            v: crate::wire::BUNDLE_V,
+            nonce: B64::new(nonce.to_vec()),
+            node: crate::wire::Node {
+                id: "offline-test".into(),
+                platform: "baremetal".into(),
+            },
+            evidence: vec![],
+            keys: None,
+            metadata: None,
+        };
+        write_bundle(&tmp, &bundle);
+        let path = tmp.join("bundle.json");
+        let rc = run_offline(&path.to_string_lossy(), false).unwrap();
+        assert_eq!(rc, 0);
+        let rc_json = run_offline(&path.to_string_lossy(), true).unwrap();
+        assert_eq!(rc_json, 0);
+    }
+
+    /// A bundle carrying an unknown channel errors out with rc 1 (the channel
+    /// is reported, never silently dropped).
+    #[test]
+    fn offline_unknown_channel_errors() {
+        let tmp = std::env::temp_dir().join(format!("bp-offline-uc-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let bundle = Bundle {
+            v: crate::wire::BUNDLE_V,
+            nonce: B64::new(vec![0u8; 32]),
+            node: crate::wire::Node {
+                id: "offline-test".into(),
+                platform: "baremetal".into(),
+            },
+            evidence: vec![crate::wire::Evidence {
+                channel: "warp-drive".into(),
+                doc: B64::new(vec![]),
+                anchors: BTreeMap::new(),
+            }],
+            keys: None,
+            metadata: None,
+        };
+        write_bundle(&tmp, &bundle);
+        let path = tmp.join("bundle.json");
+        let rc = run_offline(&path.to_string_lossy(), false).unwrap();
+        assert_eq!(rc, 1);
+    }
+
+    /// A wrong bundle version is rejected before any channel runs.
+    #[test]
+    fn offline_bad_version_rejected() {
+        let tmp = std::env::temp_dir().join(format!("bp-offline-bv-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut bundle = Bundle {
+            v: crate::wire::BUNDLE_V,
+            nonce: B64::new(vec![0u8; 32]),
+            node: crate::wire::Node {
+                id: "offline-test".into(),
+                platform: "baremetal".into(),
+            },
+            evidence: vec![],
+            keys: None,
+            metadata: None,
+        };
+        bundle.v = crate::wire::BUNDLE_V + 1;
+        write_bundle(&tmp, &bundle);
+        let path = tmp.join("bundle.json");
+        let err = run_offline(&path.to_string_lossy(), false).unwrap_err();
+        assert!(err.to_string().contains("version"), "{err}");
+    }
+}

@@ -71,6 +71,12 @@ enum Command {
         /// degrades to no hardware evidence (NOT PROVEN), never a device read.
         #[arg(long, default_value = "/run/bootproof/collect.sock")]
         collect_socket: PathBuf,
+        /// P3 one-shot mode: instead of serving the TLS node, collect one
+        /// Bundle from the collect daemon and write its JSON to this file,
+        /// then exit. Pairs with `bootproof verify <file>` for offline
+        /// attestation.
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     /// Run the collect daemon: the SOLE process that touches the
     /// attestation hardware (/dev/tpm0, /dev/sev-guest). Listens on a Unix
@@ -639,17 +645,49 @@ fn main() -> anyhow::Result<()> {
             key,
             metadata,
             collect_socket,
+            out,
         } => {
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?
-                .block_on(bootproof::attest::run(bootproof::attest::Opts {
-                    listen,
-                    state,
-                    key,
-                    metadata,
-                    collect_socket,
-                }))?;
+            // P3 one-shot: write one Bundle to a file and exit (no TLS server).
+            if let Some(path) = out {
+                let node_id = std::fs::read_to_string("/etc/hostname")
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "node".into());
+                let platform = bootproof::attest::detect_platform();
+                let metadata = match &metadata {
+                    Some(p) => Some(serde_json::from_str(&std::fs::read_to_string(p)?)?),
+                    None => None,
+                };
+                let bundle = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(bootproof::attest::one_shot(
+                        &node_id,
+                        &platform,
+                        &collect_socket,
+                        metadata,
+                    ));
+                let json = serde_json::to_string_pretty(&bundle)?;
+                std::fs::write(&path, json.as_bytes())?;
+                eprintln!(
+                    "[attest] wrote {} ({} evidence entries) to {}",
+                    json.len(),
+                    bundle.evidence.len(),
+                    path.display()
+                );
+            } else {
+                tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(bootproof::attest::run(bootproof::attest::Opts {
+                        listen,
+                        state,
+                        key,
+                        metadata,
+                        collect_socket,
+                    }))?;
+            }
         }
         Command::Collect { socket, tcp } => {
             // The SOLE device toucher: build the channel registration once and
@@ -694,8 +732,11 @@ fn main() -> anyhow::Result<()> {
                         min_level,
                     })?);
                 }
-                // Remote client flow.
+                // Remote client flow, or an offline bundle file (P3).
                 Some(target) => {
+                    if std::path::Path::new(&target).is_file() {
+                        std::process::exit(bootproof::verify::run_offline(&target, json)?);
+                    }
                     if roots.is_some() {
                         eprintln!("verify: --roots is accepted but embedded roots only, for now");
                     }

@@ -233,7 +233,7 @@ fn make_cert(secret: &[u8; 48], node_id: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 /// Detect the platform: "aws" if IMDS answers, else "baremetal".
-fn detect_platform() -> String {
+pub fn detect_platform() -> String {
     use std::io::{Read, Write};
     use std::net::TcpStream;
     let ok = match TcpStream::connect_timeout(
@@ -489,6 +489,52 @@ pub async fn run(opts: Opts) -> anyhow::Result<()> {
                 .serve_connection_with_upgrades(stream, hyper_service)
                 .await;
         });
+    }
+}
+
+/// P3 one-shot attest: generate a fresh nonce, collect evidence from the
+/// hardware owner over the collect socket (degrading honestly to NOT PROVEN
+/// if unreachable), and return the Bundle for `attest --out <file>` to write.
+/// Mirrors exactly what the `/attestation` handler does per request, minus
+/// the HTTP server — same challenge expansion, same UDS routing, same
+/// honest-degrade semantics.
+pub async fn one_shot(
+    node_id: &str,
+    platform: &str,
+    collect_socket: &std::path::Path,
+    metadata: Option<serde_json::Value>,
+) -> Bundle {
+    let mut nonce = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rng(), &mut nonce);
+    let challenge = challenge_from_nonce(&nonce);
+
+    let collected: Option<Vec<Collected>> = match collect_request(collect_socket, &challenge).await {
+        Ok(cols) => Some(cols),
+        Err(e) => {
+            warn!(%e, "collect daemon unreachable; serving with no hardware evidence (NOT PROVEN)");
+            None
+        }
+    };
+
+    let mut evidence = Vec::new();
+    let mut keys = None;
+    if let Some(cols) = collected {
+        for col in cols {
+            keys = keys.or(col.keys);
+            evidence.push(col.evidence);
+        }
+    }
+
+    Bundle {
+        v: BUNDLE_V,
+        nonce: B64::new(nonce.to_vec()),
+        node: crate::wire::Node {
+            id: node_id.to_string(),
+            platform: platform.to_string(),
+        },
+        evidence,
+        keys,
+        metadata,
     }
 }
 
