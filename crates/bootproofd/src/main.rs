@@ -1,181 +1,118 @@
-//! bootproof daemon
+//! bootproofd — the enclave's network-facing attestation face.
+//!
+//! Thin CLI over `bootproof::attest`: the ONLY process in the enclave that
+//! knows HTTP. It runs inside the gVisor sandbox and holds NO channels and
+//! opens NO devices — every attestation challenge is routed to the enclaved
+//! evidence daemon's Unix socket (`--socket`, the SOLE device owner) over the
+//! frozen Phase-0 collect protocol. When the daemon is unreachable, the
+//! Bundle degrades honestly to no hardware evidence (NOT PROVEN), never a 500.
 
-use std::sync::{Arc, Mutex};
-use tokio::net::TcpListener;
+use clap::Parser;
 
-use axum::{
-    Router,
-    http::{Method, header::CONTENT_TYPE},
-    routing,
-};
-use tower_http::cors::{Any, CorsLayer};
-use tracing::debug;
+/// The enclave's network-facing attestation face.
+#[derive(Parser)]
+#[command(
+    name = "bootproofd",
+    version,
+    about = "Serves TLS /health, /info, /attestation; routes every challenge to the enclaved evidence daemon's Unix socket"
+)]
+struct Cli {
+    /// Listen address for the TLS attestation API.
+    #[arg(long, default_value = "0.0.0.0:443")]
+    listen: String,
 
-mod attestation;
-mod error_handling;
-mod routes;
-mod versioned_json_file;
+    /// Identity dir: the image keeps the TLS identity + TPM keys there for
+    /// pin stability.
+    #[arg(long, default_value = "/home/bootproof")]
+    state: std::path::PathBuf,
 
-use versioned_json_file::VersionedJsonFile;
+    /// The enclaved evidence daemon's Unix socket (the SOLE device owner).
+    #[arg(long, default_value = "/run/enclaved/sock")]
+    socket: std::path::PathBuf,
 
-#[derive(Debug)]
-struct AppState {
-    metadata: Mutex<Option<VersionedJsonFile>>,
-    manifest: Mutex<VersionedJsonFile>,
+    /// Static TLS key (PEM PKCS8 P-384). If set, used in place of the
+    /// state-dir identity (for reproducible images).
+    #[arg(long)]
+    key: Option<std::path::PathBuf>,
+
+    /// Optional metadata JSON file.
+    #[arg(long)]
+    metadata: Option<std::path::PathBuf>,
 }
 
-// NOTE: Once execd supports checking that manifest.json and optionally metadata.json exist
-// before starting bootproofd, these values should be once cell'd.
-static MANIFEST_FILE: &str = "/manifest.json";
-static METADATA_FILE: &str = "/metadata.json";
+fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
-fn attestation_cors() -> CorsLayer {
-    // Attestations are public, cryptographically authenticated evidence. Allow browser-based
-    // verifiers to fetch them without enabling CORS on any application route.
-    CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods([Method::POST])
-        .allow_headers([CONTENT_TYPE])
-}
+    // Must precede any rustls config the node builds (ring provider).
+    bootproof::attest::install_crypto_provider();
 
-// TODO: move this into AppState?
-// it's currently being called in main() and generate_nonced_attestation(), which is not the best.
-// or we can just delay until we ship execd they're OnceCell'd.
-fn get_metadata() -> Result<Option<VersionedJsonFile>, versioned_json_file::VersionedJsonFileError>
-{
-    match VersionedJsonFile::new(METADATA_FILE) {
-        Ok(vjf) => Ok(Some(vjf)),
-        Err(e) => {
-            if e.kind == versioned_json_file::VersionedJsonFileErrorKind::Io
-                && let Some(io_error) = e.source.downcast_ref::<std::io::Error>()
-                && io_error.kind() == std::io::ErrorKind::NotFound
-            {
-                debug!("no metadata found, will use empty object");
-                Ok(None)
-            } else {
-                Err(e)
-            }
-        }
-    }
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
-
-    debug!("reading metadata");
-    let metadata = get_metadata()?;
-
-    debug!("reading manifest");
-    let manifest = VersionedJsonFile::new(MANIFEST_FILE)?;
-
-    debug!("setting up app state");
-    let app_state = AppState {
-        metadata: Mutex::new(metadata),
-        manifest: Mutex::new(manifest),
+    let cli = Cli::parse();
+    let opts = bootproof::attest::Opts {
+        listen: cli.listen,
+        state: cli.state,
+        key: cli.key,
+        metadata: cli.metadata,
+        collect_socket: cli.socket,
     };
 
-    debug!("launching bootproofd");
-    run_basic_server(app_state)?;
+    tracing::info!(
+        listen = %opts.listen,
+        socket = %opts.collect_socket.display(),
+        "bootproofd: launching attest node"
+    );
 
-    Ok(())
-}
-
-#[tokio::main]
-async fn run_basic_server(app_state: AppState) -> Result<(), Box<dyn std::error::Error>> {
-    let state = Arc::new(app_state);
-
-    let app = Router::new()
-        .route("/health", routing::get(routes::health::health))
-        .route(
-            "/attestation",
-            routing::post(routes::nonced_attestation::generate_nonced_attestation)
-                .layer(attestation_cors()),
-        )
-        .layer(axum::middleware::from_fn(
-            error_handling::error_logger_middleware,
-        ))
-        .layer(tower_http::trace::TraceLayer::new_for_http())
-        .with_state(state);
-
-    let listen_addr =
-        std::env::var("BOOTPROOFD_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:49502".into());
-    debug!(%listen_addr, "binding listener");
-    let listener = TcpListener::bind(&listen_addr).await?;
-
-    debug!("serving single-attestation server");
-    axum::serve(listener, app).await?;
-
-    Ok(())
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    if let Err(e) = rt.block_on(bootproof::attest::run(opts)) {
+        eprintln!("bootproofd: {e:?}");
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{
-        body::Body,
-        http::{Method, Request, StatusCode, header},
-    };
-    use tower::ServiceExt;
 
-    fn test_router() -> Router {
-        Router::new()
-            .route(
-                "/attestation",
-                routing::post(|| async { StatusCode::NO_CONTENT }),
-            )
-            .layer(attestation_cors())
+    #[test]
+    fn cli_defaults_match_the_image_contract() {
+        let cli = Cli::try_parse_from(["bootproofd"]).unwrap();
+        assert_eq!(cli.listen, "0.0.0.0:443");
+        assert_eq!(cli.state, std::path::PathBuf::from("/home/bootproof"));
+        assert_eq!(cli.socket, std::path::PathBuf::from("/run/enclaved/sock"));
+        assert!(cli.key.is_none());
+        assert!(cli.metadata.is_none());
     }
 
-    #[tokio::test]
-    async fn attestation_preflight_allows_browser_verifiers() {
-        let response = test_router()
-            .oneshot(
-                Request::builder()
-                    .method(Method::OPTIONS)
-                    .uri("/attestation")
-                    .header(header::ORIGIN, "https://verifier.example")
-                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
-                    .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
+    #[test]
+    fn cli_accepts_all_flags() {
+        let cli = Cli::try_parse_from([
+            "bootproofd",
+            "--listen",
+            "127.0.0.1:8443",
+            "--state",
+            "/tmp/state",
+            "--socket",
+            "/tmp/evid.sock",
+            "--key",
+            "/tmp/key.pem",
+            "--metadata",
+            "/tmp/meta.json",
+        ])
+        .unwrap();
+        assert_eq!(cli.listen, "127.0.0.1:8443");
+        assert_eq!(cli.state, std::path::PathBuf::from("/tmp/state"));
+        assert_eq!(cli.socket, std::path::PathBuf::from("/tmp/evid.sock"));
+        assert_eq!(cli.key.as_deref(), Some(std::path::Path::new("/tmp/key.pem")));
         assert_eq!(
-            response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
-            Some(&header::HeaderValue::from_static("*"))
-        );
-        assert_eq!(
-            response.headers().get(header::ACCESS_CONTROL_ALLOW_METHODS),
-            Some(&header::HeaderValue::from_static("POST"))
-        );
-        assert_eq!(
-            response.headers().get(header::ACCESS_CONTROL_ALLOW_HEADERS),
-            Some(&header::HeaderValue::from_static("content-type"))
-        );
-    }
-
-    #[tokio::test]
-    async fn attestation_post_is_readable_cross_origin() {
-        let response = test_router()
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/attestation")
-                    .header(header::ORIGIN, "https://verifier.example")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        assert_eq!(
-            response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
-            Some(&header::HeaderValue::from_static("*"))
+            cli.metadata.as_deref(),
+            Some(std::path::Path::new("/tmp/meta.json"))
         );
     }
 }
