@@ -35,7 +35,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, info, warn};
 
 use crate::channel::{challenge_from_nonce, Channel, Collected};
-use crate::collect::request as collect_request;
+use crate::collect::Transport;
 use crate::spki::pin_of_cert;
 use crate::wire::{B64, Bundle, Info, BUNDLE_V};
 
@@ -54,11 +54,13 @@ pub struct Opts {
     pub key: Option<std::path::PathBuf>,
     /// Optional metadata JSON file.
     pub metadata: Option<std::path::PathBuf>,
-    /// Unix domain socket of the host-side collect daemon (the SOLE device
-    /// owner). Every attestation challenge is routed here; the node itself
-    /// never opens /dev/tpm0 or /dev/sev-guest. Unreachable = the Bundle
-    /// degrades to no hardware evidence (NOT PROVEN), never a device read.
-    pub collect_socket: std::path::PathBuf,
+    /// The transport that carries every challenge to the host-side evidence
+    /// collector: the collect daemon UDS (default) or the file bridge
+    /// (gVisor-isolated sandboxes that cannot reach the UDS). The node
+    /// itself never opens /dev/tpm0 or /dev/sev-guest. Unreachable = the
+    /// Bundle degrades to no hardware evidence (NOT PROVEN), never a device
+    /// read.
+    pub transport: Transport,
 }
 
 /// Install the ring crypto provider as the rustls default.
@@ -265,9 +267,9 @@ struct App {
     identity: Arc<Identity>,
     node_id: String,
     platform: String,
-    /// The collect daemon socket every challenge is routed to (the node
-    /// itself holds NO channels: it has no devices in its sandbox).
-    collect_socket: std::path::PathBuf,
+    /// The transport every challenge is routed over (UDS or file bridge;
+    /// the node itself holds NO channels: it has no devices in its sandbox).
+    transport: Transport,
     /// The channels the collect daemon serves, probed at startup (drives
     /// /info). Empty when the daemon was unreachable at startup.
     channels: Vec<String>,
@@ -323,14 +325,14 @@ async fn attestation(
     // byte-for-byte unchanged.
     let challenge = challenge_from_nonce(&nonce);
 
-    // Route the challenge to the host-side collect daemon over the UDS. The
-    // node holds no channels and opens no devices: the daemon is the SOLE
-    // device owner. If the daemon is unreachable, this is an HONEST BOUNDARY,
-    // not an error: the Bundle degrades to no hardware evidence (the
-    // verifier will show the node's HW channels as NOT PROVEN for this
-    // request) and the request still succeeds.
-    let socket = app.collect_socket.clone();
-    let collected: Option<Vec<Collected>> = match collect_request(&socket, &challenge).await {
+    // Route the challenge to the host-side evidence collector (UDS or file
+    // bridge). The node holds no channels and opens no devices. If the
+    // collector is unreachable, this is an HONEST BOUNDARY, not an error:
+    // the Bundle degrades to no hardware evidence (the verifier will show
+    // the node's HW channels as NOT PROVEN for this request) and the
+    // request still succeeds.
+    let transport = app.transport.clone();
+    let collected: Option<Vec<Collected>> = match transport.collect(&challenge).await {
         Ok(cols) => Some(cols),
         Err(e) => {
             warn!(%e, "collect daemon unreachable; serving with no hardware evidence (NOT PROVEN)");
@@ -427,13 +429,13 @@ pub async fn run(opts: Opts) -> anyhow::Result<()> {
     };
 
     // The node holds NO channels in-process: it routes every challenge to
-    // the host-side collect daemon over the UDS (the daemon is the SOLE
-    // device owner; the node runs sandboxed and must not read devices).
-    // Probe the daemon once at startup so /info advertises the channels it
-    // actually serves (best-effort: if the daemon is not up yet, /info
-    // reports none and /attestation keeps retrying the UDS per request).
+    // the host-side evidence collector (UDS or file bridge; the collector is
+    // the SOLE device owner and the node runs sandboxed).
+    // Probe the collector once at startup so /info advertises the channels
+    // it actually serves (best-effort: if it is not up yet, /info reports
+    // none and /attestation keeps retrying the transport per request).
     let probe = [0u8; 64];
-    let channels = match collect_request(&opts.collect_socket, &probe).await {
+    let channels = match opts.transport.clone().collect(&probe).await {
         Ok(cols) => {
             let mut names: Vec<String> = cols.iter().map(|c| c.evidence.channel.clone()).collect();
             names.sort();
@@ -451,7 +453,7 @@ pub async fn run(opts: Opts) -> anyhow::Result<()> {
         identity,
         node_id,
         platform,
-        collect_socket: opts.collect_socket,
+        transport: opts.transport,
         channels,
         metadata,
     });
@@ -501,14 +503,14 @@ pub async fn run(opts: Opts) -> anyhow::Result<()> {
 pub async fn one_shot(
     node_id: &str,
     platform: &str,
-    collect_socket: &std::path::Path,
+    transport: &Transport,
     metadata: Option<serde_json::Value>,
 ) -> Bundle {
     let mut nonce = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rng(), &mut nonce);
     let challenge = challenge_from_nonce(&nonce);
 
-    let collected: Option<Vec<Collected>> = match collect_request(collect_socket, &challenge).await {
+    let collected: Option<Vec<Collected>> = match transport.collect(&challenge).await {
         Ok(cols) => Some(cols),
         Err(e) => {
             warn!(%e, "collect daemon unreachable; serving with no hardware evidence (NOT PROVEN)");
@@ -609,7 +611,7 @@ mod tests {
             identity,
             node_id: "e2e".into(),
             platform: "baremetal".into(),
-            collect_socket: socket,
+            transport: Transport::Socket(socket),
             channels,
             metadata: None,
         })

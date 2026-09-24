@@ -186,7 +186,7 @@ async fn run_case(
                 state,
                 key: None,
                 metadata: None,
-                collect_socket: socket,
+                transport: bootproof::collect::Transport::Socket(socket),
             })
             .await
         }

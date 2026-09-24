@@ -9,7 +9,7 @@
 
 mod tpm_probe;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
@@ -48,8 +48,8 @@ enum Command {
         #[arg(long)]
         create_ek: bool,
     },
-    /// One-shot attest: collect one Bundle from the host-side collect
-    /// daemon and write its JSON to this file, then exit. Pairs with
+    /// One-shot attest: collect one Bundle from the host-side evidence
+    /// collector and write its JSON to this file, then exit. Pairs with
     /// `bootproof verify <file>` for offline attestation. (The TLS node
     /// server and the collect daemon have moved to the enclaved daemon /
     /// bootproofd; this CLI only does the one-shot path.)
@@ -66,6 +66,13 @@ enum Command {
         /// degrades to no hardware evidence (NOT PROVEN), never a device read.
         #[arg(long, default_value = "/run/bootproof/collect.sock")]
         collect_socket: PathBuf,
+        /// File-bridge directory (bind-mounted into the sandbox): instead of
+        /// the socket, the challenge/response ride `evidence.challenge` /
+        /// `evidence.response` files. Use when the sandbox cannot reach the
+        /// host UDS (gVisor). Mutually exclusive with an explicit
+        /// `--collect-socket`.
+        #[arg(long)]
+        bridge_dir: Option<PathBuf>,
     },
     /// Verify and print the trust tree (no target), or challenge a remote
     /// node (with target), verify its proof offline, and print the facts table.
@@ -248,10 +255,23 @@ fn main() -> anyhow::Result<()> {
             }
             tpm_probe::run(tpm, parse_pcrs(&pcrs), &source)?;
         }
-        Command::Attest { metadata, collect_socket, out } => {
+        Command::Attest { metadata, collect_socket, bridge_dir, out } => {
             // One-shot: write one Bundle to a file and exit (no TLS server).
             // The node server and collect daemon live in the enclaved daemon
             // + bootproofd; this CLI only does the file path.
+            // Exactly one transport: an explicit --collect-socket XOR
+            // --bridge-dir (neither = the default socket). The socket flag
+            // has a default, so the argv presence scan tells us it was typed.
+            let argv: Vec<String> = std::env::args().collect();
+            let transport = bootproof::collect::transport_from_args(
+                &argv,
+                "--collect-socket",
+                "--bridge-dir",
+                Path::new("/run/bootproof/collect.sock"),
+                &collect_socket,
+                bridge_dir.as_deref(),
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
             let node_id = std::fs::read_to_string("/etc/hostname")
                 .ok()
                 .map(|s| s.trim().to_string())
@@ -268,7 +288,7 @@ fn main() -> anyhow::Result<()> {
                 .block_on(bootproof::attest::one_shot(
                     &node_id,
                     &platform,
-                    &collect_socket,
+                    &transport,
                     metadata,
                 ));
             let json = serde_json::to_string_pretty(&bundle)?;

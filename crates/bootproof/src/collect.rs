@@ -32,6 +32,118 @@ use tracing::{debug, info};
 
 use crate::channel::{collect_all, Channel, Collected};
 
+/// The two transports that move a 64-byte challenge to the measured host-side
+/// evidence collector and back: the Unix domain socket (the default, the
+/// sandbox can reach the host UDS) or the file bridge (the sandbox is
+/// gVisor-isolated from the UDS, so the round trip rides regular files in a
+/// bind-mounted directory). The two are byte-identical at the frame level:
+/// both produce/consume the SAME `[status, 4-byte BE len, payload]` stream
+/// that `crate::protocol::write_frame` emits, and both parse it through the
+/// same `parse_response`. `collect` is the single dispatch the node uses.
+#[derive(Clone, Debug)]
+pub enum Transport {
+    /// The default: a Unix domain socket to the host-side collect daemon.
+    Socket(PathBuf),
+    /// The file bridge: a bind-mounted directory carrying the
+    /// `evidence.challenge` / `evidence.response` files.
+    Bridge(PathBuf),
+}
+
+impl Transport {
+    /// Collect evidence for one 64-byte challenge over whichever transport
+    /// this is. Returns the parsed `Vec<Collected>` (the framing is opaque to
+    /// the caller — both paths go through `parse_response`).
+    pub async fn collect(&self, challenge: &[u8; CHALLENGE_LEN]) -> anyhow::Result<Vec<Collected>> {
+        match self {
+            Transport::Socket(sock) => request(sock, challenge).await,
+            Transport::Bridge(dir) => {
+                let frame = crate::bridge::collect_via_bridge(
+                    dir,
+                    challenge,
+                    crate::bridge::DEFAULT_POLL_INTERVAL,
+                    crate::bridge::DEFAULT_TIMEOUT,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("collect: {e}"))?;
+                parse_response(&frame)
+            }
+        }
+    }
+}
+
+/// Resolve the CLI's transport flags into exactly one transport.
+///
+/// `default_socket` is the socket flag's default value; `explicit_socket` is
+/// `Some(path)` only when the operator actually typed the socket flag (a
+/// flag with a default is indistinguishable from the default in the parsed
+/// value alone, so the CLI passes the value_source result through here);
+/// `bridge_dir` is the optional `--bridge-dir`. Rules:
+/// - neither flag typed            -> `Socket(default_socket)` (the default
+///   path, byte-identical to the pre-bridge behavior);
+/// - only the socket flag typed    -> `Socket(that socket)`;
+/// - only `--bridge-dir` typed     -> `Bridge(that dir)`;
+/// - both typed                    -> error (exactly one transport).
+///
+/// Pure and total: the only failure is the "both" case, so it is testable
+/// without any hardware or I/O.
+pub fn resolve_transport(
+    default_socket: &Path,
+    explicit_socket: Option<&Path>,
+    bridge_dir: Option<&Path>,
+) -> Result<Transport, String> {
+    match (explicit_socket, bridge_dir) {
+        (None, None) => Ok(Transport::Socket(default_socket.to_path_buf())),
+        (Some(sock), None) => Ok(Transport::Socket(sock.to_path_buf())),
+        (None, Some(dir)) => Ok(Transport::Bridge(dir.to_path_buf())),
+        (Some(_), Some(_)) => Err(
+            "exactly one transport: set --bridge-dir OR an explicit \
+             --collect-socket, not both"
+                .to_string(),
+        ),
+    }
+}
+
+/// Resolve the transport from a raw argv plus the already-parsed flag
+/// values. `socket_flag` / `bridge_flag` are the long flag names of the
+/// calling CLI (e.g. `--collect-socket` + `--bridge-dir` for the
+/// `bootproof attest` subcommand, `--socket` + `--bridge-dir` for
+/// bootproofd). A flag counts as present in either form: bare `--flag` or
+/// `--flag=value`.
+///
+/// Why argv scanning: both CLIs give the socket flag a `default_value`, so
+/// the parsed value alone cannot tell "operator typed it" from "the default
+/// filled it in" (clap 4.5 has no `value_source`). The argv scan is the
+/// version-independent way to get that signal.
+///
+/// Pure: takes the argv as a slice, so tests pass literal arg lists without
+/// touching the process environment.
+pub fn transport_from_args(
+    argv: &[String],
+    socket_flag: &str,
+    bridge_flag: &str,
+    default_socket: &Path,
+    parsed_socket: &Path,
+    parsed_bridge: Option<&Path>,
+) -> Result<Transport, String> {
+    let present = |flag: &str| {
+        argv.iter().any(|a| {
+            a == flag
+                || a.strip_prefix(flag)
+                    .map_or(false, |rest| rest.starts_with('='))
+        })
+    };
+    let sock = present(socket_flag);
+    let bridge = present(bridge_flag);
+    resolve_transport(
+        default_socket,
+        sock.then(|| parsed_socket),
+        bridge.then(|| {
+            parsed_bridge
+                .expect("bridge flag present in argv implies the parsed value is Some")
+        }),
+    )
+}
+
 /// Default socket path. `/run` is a boot-cleared tmpfs; the daemon creates the
 /// directory if it is absent. Overridable via `--socket`.
 pub const DEFAULT_SOCKET: &str = "/run/bootproof/collect.sock";
@@ -122,6 +234,31 @@ async fn handle_conn(
     }
 }
 
+/// Parse a framed response stream into the collected evidence. This is the
+/// SINGLE shared parse for both transports: the UDS path hands over the
+/// exact frame bytes it read (`read_frame`), and the file bridge hands over
+/// the exact `evidence.response` file bytes. Both are the same `[status,
+/// 4-byte BE len, payload]` stream `write_frame` emits, so both go through
+/// this one function and can never drift on status handling.
+///
+/// The response bytes are opaque to the caller: only this understands the
+/// status byte (RESP_OK -> `Vec<Collected>` JSON, RESP_ERR -> error).
+pub fn parse_response(frame: &[u8]) -> anyhow::Result<Vec<Collected>> {
+    // `decode` is the in-memory twin of `read_frame`: same `[tag, len, payload]`
+    // shape and the same `MAX_PAYLOAD` cap.
+    let (status, buf) = crate::protocol::decode(frame)
+        .map_err(|e| anyhow::anyhow!("collect: {e}"))?;
+
+    match status {
+        RESP_OK => Ok(serde_json::from_slice(&buf)?),
+        RESP_ERR => {
+            let msg = String::from_utf8_lossy(&buf);
+            anyhow::bail!("collect daemon error: {msg}")
+        }
+        other => anyhow::bail!("collect daemon unknown status byte: {other}"),
+    }
+}
+
 /// Client: connect to the collect daemon, send one 64-byte challenge, and
 /// receive the collected evidence. Single attempt (a connect failure means the
 /// daemon is not up; the caller — the `attest` node — decides whether to fall
@@ -139,14 +276,10 @@ pub async fn request(socket: &Path, challenge: &[u8; CHALLENGE_LEN]) -> anyhow::
         .await
         .map_err(|e| anyhow::anyhow!("collect: {e}"))?;
 
-    match status {
-        RESP_OK => Ok(serde_json::from_slice(&buf)?),
-        RESP_ERR => {
-            let msg = String::from_utf8_lossy(&buf);
-            anyhow::bail!("collect daemon error: {msg}")
-        }
-        other => anyhow::bail!("collect daemon unknown status byte: {other}"),
-    }
+    // Reassemble the exact framed bytes the daemon wrote and run the SAME
+    // parse the file bridge uses, so the two transports cannot diverge.
+    let frame = crate::protocol::encode(status, &buf);
+    parse_response(&frame)
 }
 
 #[cfg(test)]
@@ -327,5 +460,95 @@ mod tests {
         assert_eq!(out[1].evidence.channel, "tpm2");
         assert_eq!(&out[0].evidence.doc.0[..], b"snp-doc");
         assert_eq!(&out[1].evidence.doc.0[..], b"tpm2-doc");
+    }
+
+    #[test]
+    fn resolve_transport_neither_flag_defaults_to_socket() {
+        // Neither transport flag typed: the default socket path, exactly the
+        // pre-bridge behavior (byte-identical default).
+        match resolve_transport(Path::new("/run/bootproof/collect.sock"), None, None).unwrap() {
+            Transport::Socket(s) => assert_eq!(s, Path::new("/run/bootproof/collect.sock")),
+            other => panic!("default must be the socket transport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_transport_explicit_socket_only() {
+        match resolve_transport(
+            Path::new("/run/bootproof/collect.sock"),
+            Some(Path::new("/tmp/other.sock")),
+            None,
+        )
+        .unwrap()
+        {
+            Transport::Socket(s) => assert_eq!(s, Path::new("/tmp/other.sock")),
+            other => panic!("explicit socket flag must select the socket transport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_transport_bridge_dir_only() {
+        match resolve_transport(
+            Path::new("/run/bootproof/collect.sock"),
+            None,
+            Some(Path::new("/run/enclaved")),
+        )
+        .unwrap()
+        {
+            Transport::Bridge(d) => assert_eq!(d, Path::new("/run/enclaved")),
+            other => panic!("bridge flag must select the bridge transport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_transport_rejects_both_transports() {
+        // Exactly-one-transport: an explicit socket AND a bridge dir is a
+        // configuration error, never a silent choice of one.
+        let err = resolve_transport(
+            Path::new("/run/bootproof/collect.sock"),
+            Some(Path::new("/tmp/other.sock")),
+            Some(Path::new("/run/enclaved")),
+        )
+        .err()
+        .expect("both transports must be rejected");
+        assert!(err.contains("exactly one transport"), "error: {err}");
+    }
+
+    #[test]
+    fn parse_response_ok_frame_matches_udsemantics() {
+        // The same framed bytes the UDS path produces go through the SAME
+        // parse for both transports: build the exact frame the daemon writes
+        // for an OK response and run the shared parse.
+        let payload = serde_json::to_vec(&[Collected {
+            evidence: Evidence {
+                channel: "snp".into(),
+                doc: B64::new(b"x".to_vec()),
+                anchors: BTreeMap::new(),
+            },
+            keys: None,
+        }])
+        .unwrap();
+        let frame = crate::protocol::encode(RESP_OK, &payload);
+        let parsed = parse_response(&frame).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].evidence.channel, "snp");
+    }
+
+    #[test]
+    fn parse_response_err_frame_is_an_error() {
+        // A RESP_ERR frame surfaces as an error naming the daemon message
+        // (identical for both transports).
+        let frame = crate::protocol::encode(RESP_ERR, b"tpm busy");
+        let err = parse_response(&frame).err().expect("RESP_ERR must be an error");
+        let msg = err.to_string();
+        assert!(msg.contains("collect daemon error"), "error: {msg}");
+        assert!(msg.contains("tpm busy"), "error: {msg}");
+    }
+
+    #[test]
+    fn parse_response_rejects_truncated_frame() {
+        // A short/oversized frame is rejected with the same cap the UDS
+        // read path enforces.
+        assert!(parse_response(&[0x00, 0x00]).is_err(), "frame too short");
     }
 }
