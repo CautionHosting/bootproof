@@ -203,8 +203,8 @@ impl VerifiableSignedAttestationFormat for Nitro {
 impl Nitro {
     /// Verify a persisted attestation at its signed generation timestamp.
     ///
-    /// This proves historical provenance, not freshness. Callers must check the
-    /// returned `user_data` against the expected artifact and apply their policy
+    /// This proves historical provenance, not freshness. The signed `user_data`
+    /// must exactly match `expected_user_data`. Callers must apply their policy
     /// to the authenticated timestamp. Use `verify` with a fresh challenge for
     /// live attestation.
     ///
@@ -215,12 +215,41 @@ impl Nitro {
     /// # Errors
     ///
     /// Returns an error for an invalid timestamp, certificate chain, signature,
-    /// PCRs, or nonce. No payload is returned before all checks succeed.
+    /// PCRs, nonce, or user data. No payload is returned before all checks succeed.
+    #[tracing::instrument(skip_all)]
     pub fn verify_at_attestation_time(
         &self,
-        expected_nonce: Option<&dyn AsNonce>,
+        expected_user_data: &[u8],
+        expected_nonce: Option<&[u8]>,
     ) -> Result<Value> {
-        self.verify_with_root(None, expected_nonce, AWS_NITRO_ROOT_CA_DER)
+        self.verify_at_attestation_time_with_root(
+            expected_user_data,
+            expected_nonce,
+            AWS_NITRO_ROOT_CA_DER,
+        )
+    }
+
+    fn verify_at_attestation_time_with_root(
+        &self,
+        expected_user_data: &[u8],
+        expected_nonce: Option<&[u8]>,
+        root: &[u8],
+    ) -> Result<Value> {
+        let expected_nonce = expected_nonce.as_ref().map(|nonce| nonce as &dyn AsNonce);
+        let payload = self.verify_with_root(None, expected_nonce, root)?;
+
+        debug!("verifying user data");
+        if let Value::Map(map) = &payload
+            && let Some(Value::Bytes(user_data)) = map.get(&Value::Text("user_data".into()))
+        {
+            if user_data != expected_user_data {
+                return Err(Error::InvalidAAD("user_data".into()));
+            }
+        } else {
+            return Err(Error::MissingData("cose.payload.user_data".into()));
+        }
+
+        Ok(payload)
     }
 
     // Only production entry points choose the AWS root. Tests use a local root
@@ -317,7 +346,7 @@ impl Nitro {
             (Some(_), Some(Value::Bytes(_))) => return Err(Error::InvalidNonce),
             (Some(_), _) => return Err(Error::MissingData("cose.payload.nonce".into())),
             (None, None | Some(Value::Null)) => {}
-            (None, _) => return Err(Error::InvalidNonce),
+            (None, _) => return Err(Error::UnexpectedNonce),
         }
 
         Ok(payload)
@@ -356,11 +385,11 @@ mod tests {
     // A time shortly after a valid attestation was generated.
     pub(super) const CBOR_DATA: &'static [u8] = include_bytes!("data/aws-test.cbor");
     const VALID_DURATION: std::time::Duration = std::time::Duration::from_secs(1766510416);
-    pub(super) const NONCE: LazyLock<Vec<u8>> = LazyLock::new(|| {
+    pub(super) static NONCE: LazyLock<Vec<u8>> = LazyLock::new(|| {
         hex::decode("d041b23bce8678bbc7c174bd8494c4f9759386eec963ec69bfd45c1452b10636").unwrap()
     });
 
-    pub(super) const PCRS: LazyLock<NitroPcrs> = LazyLock::new(|| {
+    pub(super) static PCRS: LazyLock<NitroPcrs> = LazyLock::new(|| {
         let hex0 = hex::decode("ef093e4c1fd13878956589833c0e396b935cdf5ae45c1cc595e1a19a6da5812850f0ef3e77df918cb2a86d88ddf9cc03").unwrap();
         let hex1 = hex::decode("ef093e4c1fd13878956589833c0e396b935cdf5ae45c1cc595e1a19a6da5812850f0ef3e77df918cb2a86d88ddf9cc03").unwrap();
         let hex2 = hex::decode("21b9efbc184807662e966d34f390821309eeac6802309798826296bf3e8bec7c10edb30948c90ba67310f7b964fc500a").unwrap();

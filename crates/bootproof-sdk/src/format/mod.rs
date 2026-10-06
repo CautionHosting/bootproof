@@ -28,6 +28,9 @@ pub enum Error {
 
     #[error("The provided nonce did not match the signed nonce")]
     InvalidNonce,
+
+    #[error("The signed payload contains a nonce, but none was expected")]
+    UnexpectedNonce,
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;

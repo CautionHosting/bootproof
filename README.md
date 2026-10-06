@@ -74,16 +74,16 @@ Development fixtures and synthetic evidence must not be accepted as production t
 
 ### Persisted Nitro proofs
 
-`Nitro::verify_at_attestation_time(expected_nonce)` verifies the AWS certificate
-chain at the attestation's signed generation timestamp, without clock-skew
-adjustment. It still verifies the COSE signature and expected PCRs before
+`Nitro::verify_at_attestation_time(expected_user_data, expected_nonce)` verifies
+the AWS certificate chain at the attestation's signed generation timestamp,
+without clock-skew adjustment. It still verifies the COSE signature, expected
+PCRs, and an exact `user_data` match (e.g. the expected artifact hash) before
 returning the payload. Certificate expiry at a later wall-clock time does not
 invalidate that historical proof.
 
 Use `Some(&nonce)` to require an exact nonce match (at least 12 bytes), or `None`
 to require an absent/null nonce, as used by stored public-certificate proofs.
-Callers must compare the verified `user_data` to the expected artifact hash and
-apply their policy to the authenticated timestamp. This API establishes
+Callers must apply their policy to the authenticated timestamp. This API establishes
 historical provenance, not freshness or current user authorization. A
 content-derived deterministic nonce also does not establish freshness.
 
