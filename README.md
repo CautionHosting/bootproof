@@ -1,3 +1,5 @@
+This repository may be mirrored on other Git forges. The [canonical repository](https://git.caution.co/public/bootproof) is hosted on git.caution.co. Please open issues and pull requests there.
+
 # Bootproof
 
 Bootproof is a Rust toolkit and daemon for collecting and verifying remote-attestation evidence across confidential-computing platforms.
