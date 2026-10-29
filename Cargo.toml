@@ -5,4 +5,5 @@ members = [
     "crates/bootproof-sdk",
     "crates/bootproof-tpm",
     "crates/bootproofd",
+    "crates/bootproof-platform-wardend",
 ]

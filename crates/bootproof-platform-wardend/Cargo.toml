@@ -1,0 +1,26 @@
+[package]
+name = "bootproof-platform-wardend"
+version = "0.1.0"
+edition = "2024"
+description = "The wardend platform layer: the wardend fact schemas + the wardend Verifier modules (seal state, the hash-chained state log, the PCR policy, unit health, LUKS, key ACLs, retry counters). Evidence-driven: the engine runs this verifier only when the bundle carries the wardend evidence channel."
+
+[lib]
+name = "bootproof_platform_wardend"
+path = "src/lib.rs"
+
+[dependencies]
+# The generic engine (the Verifier trait, the wire contract, the chained-log
+# mechanism). This platform layer depends ONLY on the generic layer — never
+# on `seal` (no layering inversion). The wardend fact schemas + hash policy
+# are defined here; the generic mechanism is consumed from bootproof.
+bootproof = { path = "../bootproof" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The wardend state-log hash policy (SHA-256) + the P-256 sign-key verify.
+# Pure-Rust (the same primitives the seal crate uses; no OpenSSL).
+sha2 = "0.10"
+p256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
+# The ECDSA pre-hash verify (the seald HSM signs the entry hash, a SHA-256
+# digest; the standard Verifier::verify would hash it again). The `hazmat`
+# feature exposes the `verify_prehashed` free function.
+ecdsa = { version = "0.16", features = ["hazmat"] }

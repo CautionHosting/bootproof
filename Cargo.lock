@@ -460,6 +460,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bootproof-platform-wardend"
+version = "0.1.0"
+dependencies = [
+ "bootproof",
+ "ecdsa",
+ "p256",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "bootproof-sdk"
 version = "0.1.0"
 dependencies = [
