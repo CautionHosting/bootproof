@@ -1,0 +1,13 @@
+cargo:rerun-if-changed=../bootproof-tpm/trampoline.c
+cargo:rustc-link-arg=/src/target-test/release/build/bootproof-0565c216fc328753/out/trampoline.o
+cargo:rustc-link-arg=-L/usr/lib
+cargo:rustc-link-arg=-L/lib
+cargo:rustc-link-arg=-ldevmapper
+cargo:rustc-link-arg=-ltss2-esys
+cargo:rustc-link-arg=-lcrypto
+cargo:rustc-link-arg=-ltss2-rc
+cargo:rustc-link-arg=-ltss2-sys
+cargo:rustc-link-arg=-ltss2-tcti-device
+cargo:rustc-link-arg=-ltss2-tctildr
+cargo:rustc-link-arg=-ltss2-mu
+cargo:rerun-if-changed=build.rs

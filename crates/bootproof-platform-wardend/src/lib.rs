@@ -293,11 +293,14 @@ impl Verifier for WardendVerifier {
         let doc: WardendDoc = serde_json::from_slice(&ev.doc.0)
             .map_err(|e| format!("wardend: malformed evidence doc: {e}"))?;
 
-        // 1. The seal state (the latch posture + the state hash). A corrupt
-        //    / missing seal state is an Err (fail-closed).
+        // 1. The seal state (the latch posture + the state hash). A
+        //    SEALED latch with an empty state is corrupt (a sealed latch
+        //    must anchor to a non-empty state). A malleable (fresh,
+        //    unsealed) latch with an empty state is legitimate — the
+        //    state is not frozen yet, so there is nothing to anchor.
         if let Some(seal) = &doc.seal_state {
-            if seal.state.is_empty() {
-                return Err("wardend: the seal state is empty (corrupt)".to_string());
+            if seal.posture == LatchPosture::Sealed && seal.state.is_empty() {
+                return Err("wardend: the sealed state is empty (corrupt)".to_string());
             }
         }
 
@@ -769,6 +772,44 @@ mod tests {
         assert!(
             verifier.verify(&ev, &nonce, &bundle).is_err(),
             "an empty seal state is an error"
+        );
+    }
+
+    // (j) a malleable (fresh, unsealed) latch with an empty state is
+    // legitimate — the state is not frozen yet, so there is nothing to
+    // anchor; the check is posture-aware (only sealed + empty is corrupt).
+    #[test]
+    fn a_malleable_empty_seal_state_is_not_an_error() {
+        let (_sk, point) = test_signer_key();
+        let doc = WardendDoc {
+            seal_state: Some(SealState {
+                posture: LatchPosture::Malleable,
+                state: Vec::new(), // malleable: not frozen yet (legitimate)
+            }),
+            state_log: Vec::new(),
+            pcr_policy: None,
+            units: Vec::new(),
+            luks: None,
+            key_acls: Vec::new(),
+            retry: None,
+        };
+        let ev = build_wardend_evidence(&doc, &point).unwrap();
+        let verifier = WardendVerifier;
+        let nonce = [0x42u8; 32];
+        let bundle = bootproof::wire::Bundle {
+            v: bootproof::wire::BUNDLE_V,
+            nonce: B64::new(nonce.to_vec()),
+            node: bootproof::wire::Node {
+                id: "wardend-test".into(),
+                platform: "baremetal".into(),
+            },
+            evidence: vec![ev.clone()],
+            keys: None,
+            metadata: None,
+        };
+        assert!(
+            verifier.verify(&ev, &nonce, &bundle).is_ok(),
+            "a malleable latch with an empty state is legitimate (not corrupt)"
         );
     }
 }
