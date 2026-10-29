@@ -5,6 +5,7 @@ pub mod channel;
 pub mod collect;
 pub mod dns;
 pub mod dmext;
+pub mod engine;
 pub mod facts;
 pub mod format;
 pub mod protocol;

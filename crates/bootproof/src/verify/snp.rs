@@ -171,6 +171,20 @@ impl Verifier for SnpVerifier {
             status: Status::NotProven,
         })
     }
+
+    // memory_encryption is also the fact this channel owns when it is
+    // REQUIRED but ABSENT from the bundle: NOT PROVEN "absent", never
+    // silently dropped (a node that does not serve the snp channel at all).
+    fn required_absent_fact(&self) -> Option<Fact> {
+        Some(Fact {
+            name: "memory_encryption".into(),
+            value: "not proven: the node does not serve a SEV-SNP channel \
+                     (no /dev/sev-guest at the node)"
+                .into(),
+            anchors: vec!["snp".into()],
+            status: Status::NotProven,
+        })
+    }
 }
 
 #[cfg(test)]

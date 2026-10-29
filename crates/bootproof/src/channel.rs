@@ -206,4 +206,14 @@ pub trait Verifier {
         let _ = reason;
         None
     }
+
+    /// A fact this channel OWNS when it is REQUIRED by the verification
+    /// policy but its evidence is ABSENT from the bundle: rendered as NOT
+    /// PROVEN "absent". Honest degradation: a required channel the node
+    /// does not serve is never silently dropped (the snp channel:
+    /// `memory_encryption` "absent"). A channel that is not a required
+    /// fact-owner returns `None`.
+    fn required_absent_fact(&self) -> Option<Fact> {
+        None
+    }
 }
