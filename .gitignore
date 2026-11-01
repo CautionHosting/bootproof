@@ -4,3 +4,7 @@ cap3.txt
 px3.log
 seq_esys.txt
 trace
+target-test3/
+target-test4/
+target-test5/
+out/
