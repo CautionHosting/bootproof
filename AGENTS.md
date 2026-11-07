@@ -120,6 +120,9 @@ Remaining deltas (the actual work):
   (must be green, no hang). The `system-health` feature adds no deps (statics
   only), so it is cheap to build: `cargo test -p bootproof --features
   system-health`.
+- If `target/` is root-owned (an old root cargo build left root-owned dirs
+  under `target/debug/.fingerprint`), do NOT chmod them; build into an isolated
+  dir instead: `export CARGO_TARGET_DIR="$HOME/.crow/scratch/bootproof-target"`.
 - Platform plugin tests: `cargo test -p bootproof-platform-wardend`.
 - Do NOT run `cargo fmt`; format by hand to match the surrounding style.
 - Default feature is `platform-aws`; keep the core free of platform-specific
