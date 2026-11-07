@@ -11,6 +11,8 @@ pub mod format;
 pub mod protocol;
 pub mod provenance;
 pub mod serve;
+#[cfg(feature = "system-health")]
+pub mod system_health;
 pub mod snp;
 pub mod spki;
 pub mod trust;

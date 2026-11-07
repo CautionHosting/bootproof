@@ -6,6 +6,12 @@ edition = "2024"
 [features]
 default = ["platform-aws"]
 platform-aws = ["dep:aws-nitro-enclaves-nsm-api", "dep:serde_bytes"]
+# `system-health` embeds the browser-verified attestation bundle (the System
+# Health HTML shell + the service-worker verifier) with include_str! so the
+# browser verifier ships from THIS crate alongside the Rust verifier it mirrors
+# (drift becomes a compile-time/test failure, never a live security bug). No
+# extra deps - just statics. bastion enables it to serve the bytes on :443.
+system-health = []
 
 [dependencies]
 # `attest` = the NitroTPM NSM vendor command (raw, no tss2). `esys` = the
