@@ -141,6 +141,55 @@ Remaining deltas (the actual work):
   identity only (`Lance R. Vick <lance@distrust.co>`); never an agent identity.
   Do not `git push` without explicit operator authorization.
 
+## The CLI layering + neutrality principle (the client side)
+
+There is a strict, one-directional CLI layering, and it encodes the product
+goal: **verify anything we can, about our own ecosystem AND other people's.**
+
+```
+future operator CLI  ->  wardenctl (wardend superset)  ->  bootproof (library)
+                                                       ->  bootproof CLI
+                                                          (the generic
+                                                           remote attester)
+```
+
+- **bootproof CLI = the generic, neutral, UNAUTHENTICATED remote attester.**
+  It must be able to point at ANY server and verify whatever the bundle proves,
+  with NO credentials and NO assumption the server is a wardend/stagex node. It
+  is the reference client for the whole ecosystem and every third party's:
+  - our own `seald` / `bootproofd` attestation faces (the wardend + stagex
+    platforms),
+  - turnkey TEE-as-a-Service / TVC servers,
+  - `caution.co`, `tinfoil`, and other verifiable-compute vendors,
+  - any future platform that emits a `bootproof::wire::Bundle`.
+  The CLI runs the generic `engine::verify_bundle` against whatever channels
+  the fetched bundle actually carries (the registry is evidence-driven, so a
+  bundle from ANY platform verifies its own channels + honest `NOT PROVEN` for
+  what it lacks). Fetching a bundle over the network is the delta to add: a
+  client that takes a URL/socket, speaks the `protocol` frame (or the
+  `attest`/`serve` HTTP face), pulls the bundle, and verifies it. It must never
+  hard-require a wardend/stagex channel — a turnkey TVC bundle with only SNP is
+  a VALID bundle to verify, just a smaller one.
+- **wardenctl = the wardend superset.** It wraps bootproof-as-a-library
+  (`engine::verify_bundle` + the `bootproof-platform-wardend` verifier — already
+  true in `wardenctl/src/verify.rs`) and ADDS wardend-specific behavior: the
+  admin-frame/OP_ATTEST round-trip, the HSM/seal-state/unit/LUKS/PCR sections,
+  the ACME-leaf identity link, the posternd proxy path. Everything generic
+  lives in bootproof; wardenctl only adds wardend meaning. A future operator CLI
+  wraps wardenctl-as-a-library the same way, so it inherits bootproof's generic
+  reach *and* wardend's depth.
+- **Directionality is enforced by the layering, not just convention:** the CLI
+  depends on wardenctl depends on bootproof. bootproof must never depend on
+  wardend (the wardend platform code lives in the separate
+  `bootproof-platform-wardend` plugin crate, which *is* allowed to know about
+  wardend). This keeps bootproof shippable to a client that only ever attests
+  third-party vendors.
+- **Net effect on design choices:** any feature that only makes sense for our
+  own daemons (seal state, unit health, the posternd proxy) belongs in the
+  wardend plugin or wardenctl, NOT in the bootproof core or the generic CLI. If
+  adding it to the core would require a wardend concept, it is in the wrong
+  layer.
+
 ## Validation strategy (the acceptance gate)
 
 The contract is validated by agreement, not by assertion of a single verifier:
