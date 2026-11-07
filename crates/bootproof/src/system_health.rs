@@ -1,11 +1,13 @@
-//! system_health: the embedded browser verifier bundle (System Health
-//! contract v4). The HTML shell + service-worker verifier are statics
-//! embedded with include_str! so the browser verifier ships from THIS crate
-//! alongside the Rust verifier it mirrors; a test pins the SW bytes' hash.
+//! system_health: the embedded browser verifier bundle (the System Health
+//! contract, docs/system-health.md v4). The HTML shell + the service-worker
+//! verifier are committed statics embedded with include_str! so the browser
+//! verifier ships from THIS crate alongside the Rust verifier it mirrors -
+//! the two cannot drift (a test pins the SW bytes' hash).
 
 /// The System Health HTML shell (title "System Health"; registers /verify.js).
 pub const SHELL: &str = include_str!("assets/system_health/shell.html");
-/// The service-worker verifier source (baked into the binary, immutable).
+/// The service-worker verifier source (application/javascript; the bytes
+/// baked into the binary, immutable).
 pub const SW: &str = include_str!("assets/system_health/verify.js");
 /// Hex SHA-256 of SW's bytes; a test recomputes and asserts this.
 pub const SW_SHA256: &str = "d021c94ce2b8f2806ff4969aa24a70097f3d373430acd044b4c179944671c11e";

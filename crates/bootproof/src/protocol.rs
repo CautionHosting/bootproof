@@ -10,9 +10,11 @@
 //! *operation* on the wire from client->server, a *status* on the wire from
 //! server->client):
 //!
-//!     byte 0     : u8  (op on request, status on response)
-//!     byte 1..5  : u32 big-endian payload length
-//!     byte 5..   : payload (exactly `length` bytes)
+//! ```text
+//! byte 0     : u8  (op on request, status on response)
+//! byte 1..5  : u32 big-endian payload length
+//! byte 5..   : payload (exactly `length` bytes)
+//! ```
 //!
 //! One request/response per connection is the current convention (the socket
 //! is simple and the challenge is the whole request); the framing does not

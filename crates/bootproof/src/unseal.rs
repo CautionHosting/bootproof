@@ -6,8 +6,10 @@
 //! volume by hand with `cryptsetup luksOpen --key-file <keyfile> <disk>`), and
 //! the dm-crypt table line is the standard kernel `crypt` target line:
 //!
-//!     params = <cipher_spec> <hex(master_key)> <iv_offset> <dev> \
-//!              <data_offset_sectors> [allow_discards] [1 sector_size:<bytes>]
+//! ```text
+//! params = <cipher_spec> <hex(master_key)> <iv_offset> <dev> \
+//!          <data_offset_sectors> [allow_discards] [1 sector_size:<bytes>]
+//! ```
 //!
 //! verified against both the live kernel's accepted line (dm-crypt v1.29.0)
 //! and cryptsetup 2.8.7's own table construction (lib/libdevmapper.c).
