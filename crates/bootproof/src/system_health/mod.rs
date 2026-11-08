@@ -10,9 +10,12 @@ pub const SHELL: &str = include_str!("../assets/system_health/shell.html");
 /// baked into the binary, immutable).
 pub const SW: &str = include_str!("../assets/system_health/verify.js");
 /// Hex SHA-256 of SW's bytes; a test recomputes and asserts this.
-/// (2026-11-08: rebumped for the result.html contract fix; the previous
-/// value was 5b270efc267e01b12d5145c94a508895381c1da57aabad18555c91f57ca23ad5.)
-pub const SW_SHA256: &str = "b5f422f43d2ce451315ac877666342e6494fd4e0a47352bd42122a4a19ee9843";
+/// (2026-11-08 I-2b: rebumped for the whole-doc-signature gate + the
+/// token-safe canonical_doc_digest mirror (the u64-precision-safe parse);
+/// previous value b5f422f43d2ce451315ac877666342e6494fd4e0a47352bd42122a4a
+/// 19ee9843 was the result.html contract fix, and before that
+/// 5b270efc267e01b12d5145c94a508895381c1da57aabad18555c91f57ca23ad5.)
+pub const SW_SHA256: &str = "4f19d4fbb0fb2403f0a3940d51569664e7d33ce68af9f557589b00ebca0f5686";
 
 pub mod schema;
 

@@ -265,3 +265,94 @@ fn an_unsigned_doc_is_rejected_fail_closed() {
         "an unsigned doc must never PROVEN the state chain: {rust:?}"
     );
 }
+
+/// The JS sub-checks by name (the raw statuses, matching the raw-status
+/// js_facts above: FAILED stays FAILED here, no mapping). Used to pin the
+/// specific wardend.doc_signature sub the doc gate adds.
+fn js_subs(fixture: &Path) -> BTreeMap<String, String> {
+    let out = Command::new("node")
+        .arg(fixtures_dir().join("harness.js"))
+        .arg(fixture)
+        .output()
+        .expect("node runs the harness");
+    assert!(out.status.success(), "harness failed: {}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("harness JSON");
+    let mut map = BTreeMap::new();
+    for s in v.get("subs").and_then(|a| a.as_array()).expect("subs") {
+        map.insert(
+            s.get("name").and_then(|n| n.as_str()).expect("name").to_string(),
+            s.get("status").and_then(|s| s.as_str()).expect("status").to_string(),
+        );
+    }
+    map
+}
+
+/// I-2b (browser-side unsigned-doc reject): the SAME golden.unsigned-doc
+/// fixture that `an_unsigned_doc_is_rejected_fail_closed` pins on the Rust
+/// side must ALSO fail closed on the JS side, with the identical verdict.
+/// This is the cross-verifier witness that the browser rejects an unsigned
+/// doc the same way the plugin does: an absent doc_signature anchor makes
+/// the whole wardend channel NOT PROVEN (never PROVEN), and the honest
+/// cause is the missing doc-signature sub. One bundle, two verifiers, the
+/// same rejection.
+#[test]
+fn the_unsigned_doc_is_rejected_by_the_browser_too() {
+    let g = fixtures_dir().join("golden.unsigned-doc.json");
+    let js = js_facts(&g);
+    assert_eq!(
+        js.get("wardend_state_chain").map(String::as_str),
+        Some("NOT PROVEN"),
+        "the browser must NOT PROVEN an unsigned doc (mirrors the Rust fail-closed): {js:?}"
+    );
+    let subs = js_subs(&g);
+    assert_eq!(
+        subs.get("wardend.doc_signature").map(String::as_str),
+        Some("NOT PROVEN"),
+        "the honest JS cause is the missing doc_signature sub (not a broken chain): {subs:?}"
+    );
+}
+
+/// I-2b (browser-side doc-digest parity + negative twin): the shipped
+/// verify.js canonicalizer, driven by fixtures/system_health/docsig_parity.js
+/// against the committed golden doc, must reproduce the SAME digest the Rust
+/// canonical_doc_digest produces (the cross-implementation witness), while
+/// the naive Number parse of the SAME bytes diverges (the u64-precision
+/// false-red the token path closes). The harness reads the pin from
+/// golden.meta.json; the pin's own agreement with the Rust literal is pinned
+/// in the_doc_digest_parity_pin_rust_equals_js.
+#[test]
+fn the_browser_doc_digest_matches_rust_and_the_naive_path_diverges() {
+    let out = Command::new("node")
+        .arg(fixtures_dir().join("docsig_parity.js"))
+        .output()
+        .expect("node runs the doc-digest parity harness (node is part of the test env)");
+    assert!(
+        out.status.success(),
+        "the doc-digest parity harness failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("parity JSON");
+    let g = |k: &str| v.get(k).and_then(|x| x.as_bool()).unwrap_or(false);
+    assert!(
+        g("token_safe_matches_pin"),
+        "the shipped canonicalizer over the token-safe parse must equal the committed pin \
+         (the SAME digest Rust canonical_doc_digest produces): {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        !g("naive_matches_pin"),
+        "the negative twin is NOT diverging: the naive Number parse must produce a DIFFERENT \
+         digest than the pin (that divergence is the u64-precision hazard the token path \
+         closes; if it matches, either the fixture lost its >2^53 handle or the canonicalizer \
+         stopped depending on the parse): {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    // The two paths must actually differ (a belt-and-suspenders re-state that
+    // the divergence is real, not a harness artifact of both being wrong).
+    let tok = v.get("token_safe").and_then(|x| x.as_str()).unwrap_or("");
+    let naive = v.get("naive").and_then(|x| x.as_str()).unwrap_or("");
+    assert!(
+        !tok.is_empty() && tok != naive,
+        "token-safe and naive digests must both be present AND differ: tok={tok:?} naive={naive:?}"
+    );
+}

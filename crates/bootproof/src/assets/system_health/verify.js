@@ -845,6 +845,180 @@ function TPM_HEX(v) { return ("0000" + v.toString(16)).slice(-4); }
 function pad2(n) { return n < 10 ? "0" + n : "" + n; }
 
 // -----------------------------------------------------------------------------
+// The wardend whole-doc signature (I-2b): the browser mirror of the plugin's
+// canonical_doc_digest. The doc signature (anchor "doc_signature") is an
+// ECDSA-P256/SHA-256 over SHA-256(DOC_DIGEST_PREFIX || the canonical bytes of
+// EVERY WardendDoc field), verified under the SAME hsm_public the state log
+// already uses. It gates the WHOLE wardend channel: a doc byte flip, a stale
+// signature, or a missing signature makes EVERY doc-derived fact unanchored
+// (never PROVEN), exactly the Rust WardendVerifier::verify order (the doc
+// signature is checked BEFORE any field). Rust authority:
+// bootproof-platform-wardend::canonical_doc_digest (the signing side; the
+// browser must reproduce ITS bytes, never the reverse).
+//
+// THE U64 PRECISION RULE (the false-red class this lane was built to kill):
+// the canonical digest is over u64 bytes (key handle, state-log timestamp,
+// unit heartbeat, luks marker, retry counters). A handle is the first 8 bytes
+// of a SHA-256, so REAL handles routinely exceed 2^53, and JSON.parse coerces
+// such a bare number through JS Number, DROPPING the low bits: the browser
+// would then digest a DIFFERENT byte stream than the HSM signed and FALSE-RED
+// an honest doc. So the digest inputs come from a TOKEN-SAFE parse: the six
+// u64 object-member fields are captured as their DIGIT TOKEN STRING (fed to
+// BigInt below), never a parsed Number. A reviver CANNOT do this (it receives
+// the value AFTER coercion); the only safe path is to read the token before
+// coercion. Arrays of bytes/u32 and every other value keep the ordinary
+// Number path (byte-exact through Uint8Array), so this stays a strict
+// superset of the existing JSON.parse view used by the chain loop.
+// -----------------------------------------------------------------------------
+
+const DOC_DIGEST_PREFIX = "wardend/platform-doc-digest/v1";
+
+// The six fields the Rust canonical_doc_digest feeds through digest_u64. Only
+// these object-member integers are captured as digit-token strings; every
+// other number (byte-array elements, pcr u32s) is a plain Number.
+const DOC_U64_MEMBERS = {
+  handle: true, timestamp: true, heartbeat: true,
+  marker_counter: true, warden_respawn: true, watchdog_reboot_guard: true,
+};
+
+// A context-aware JSON parse that keeps the six u64 object-member integers as
+// digit TOKENS (strings) and everything else exactly as JSON.parse would
+// (arrays of numbers stay numbers; absent Options stay null). Position-free:
+// each number is decided by its OWN member name, so the serde key sort order
+// (which differs from the digest field order) and the present-vs-null Option
+// shape both stay correct. Fails closed: any parse error throws to the
+// caller, which turns it into an honest FAILED (never a silent drop).
+function parseDocTokens(text) {
+  const S = String(text);
+  let i = 0;
+  function ws() { while (i < S.length && (S[i] === " " || S[i] === "\t" || S[i] === "\n" || S[i] === "\r")) i++; }
+  function val(memberName) {
+    ws();
+    const c = S[i];
+    if (c === "{") return obj();
+    if (c === "[") return arr();
+    if (c === "\"") return str();
+    if (S.startsWith("true", i)) { i += 4; return true; }
+    if (S.startsWith("false", i)) { i += 5; return false; }
+    if (S.startsWith("null", i)) { i += 4; return null; }
+    const m = S.slice(i).match(/^-?\d+(?:[.eE][-+]?\d+)?/);
+    if (!m) throw new Error("parseDocTokens: unexpected byte at " + i);
+    i += m[0].length;
+    // Only an integer object-member whose NAME is a u64 field keeps the raw
+    // digit token; a float/exponent (never a u64) and every array element go
+    // through Number exactly as JSON.parse would.
+    if (memberName && DOC_U64_MEMBERS[memberName] && /^-?\d+$/.test(m[0])) return m[0];
+    return Number(m[0]);
+  }
+  function str() {
+    let s = ""; i++; // opening quote
+    while (i < S.length && S[i] !== "\"") {
+      if (S[i] === "\\") { s += S[i] + S[i + 1]; i += 2; }
+      else { s += S[i]; i += 1; }
+    }
+    i++; // closing quote
+    return JSON.parse('"' + s + '"');
+  }
+  function obj() {
+    const o = {}; i++; ws();
+    if (S[i] === "}") { i++; return o; }
+    for (;;) {
+      ws();
+      const k = str();
+      ws(); i++; // colon
+      o[k] = val(k);
+      ws();
+      if (S[i] === ",") { i++; continue; }
+      if (S[i] === "}") { i++; break; }
+      throw new Error("parseDocTokens: expected , or } at " + i);
+    }
+    return o;
+  }
+  function arr() {
+    const a = []; i++; ws();
+    if (S[i] === "]") { i++; return a; }
+    for (;;) {
+      a.push(val(null)); // array elements are NEVER u64 members
+      ws();
+      if (S[i] === ",") { i++; continue; }
+      if (S[i] === "]") { i++; break; }
+      throw new Error("parseDocTokens: expected , or ] at " + i);
+    }
+    return a;
+  }
+  const out = val(null);
+  ws();
+  if (i !== S.length) throw new Error("parseDocTokens: trailing bytes at " + i);
+  return out;
+}
+
+// u64 big-endian bytes from a digit-token STRING, a Number, or a BigInt (all
+// via BigInt, so the >2^53 token stays exact). This is digest_u64.
+function u64beBig(v) {
+  let x = BigInt(v);
+  const out = new Uint8Array(8);
+  for (let k = 7; k >= 0; k--) { out[k] = Number(x & 0xffn); x >>= 8n; }
+  return out;
+}
+// A 1-byte presence tag (digest_opt): null/undefined -> 0x00 and NOTHING
+// after (None feeds nothing, so None != Some(empty)); otherwise 0x01 + f(v).
+function dOpt(v, f) { return (v === null || v === undefined) ? new Uint8Array([0]) : concat(new Uint8Array([1]), f(v)); }
+function dBool(v) { return new Uint8Array([v ? 1 : 0]); }
+// A raw byte array (no length prefix): mirrors Buffer.from(prev_hash).
+function dRaw(v) { return Uint8Array.from(v || []); }
+// A length-prefixed byte string (digest_bytes), from a byte array OR a string.
+function dBytes(b) {
+  const raw = (typeof b === "string") ? new TextEncoder().encode(b) : Uint8Array.from(b || []);
+  return concat(u32be(raw.length), raw);
+}
+// A length-prefixed list of u32 (the PCR sets): digest_u32s.
+function dU32s(arr) { return concat.apply(null, [u32be((arr || []).length)].concat((arr || []).map(u32be))); }
+
+// The canonical whole-doc bytes (UNHASHED): DOC_DIGEST_PREFIX || every field
+// in the Rust fixed order (seal_state, state_log, pcr_policy, units, luks,
+// key_acls, retry). WebCrypto's hash-mode verify hashes exactly these with
+// SHA-256, producing the SAME digest the HSM signed (canonical_doc_digest).
+function canonicalDocBytes(doc) {
+  const d = doc || {};
+  const log = d.state_log || [];
+  const logParts = [u32be(log.length)];
+  for (const e of log) {
+    logParts.push(concat(dRaw(e.prev_hash), dRaw(e.new_state_hash), dBytes(e.operation), u64beBig(e.timestamp), dBytes(e.signature)));
+  }
+  const units = d.units || [];
+  const unitParts = [u32be(units.length)];
+  for (const u of units) unitParts.push(concat(dBytes(u.name), dBool(u.up), dOpt(u.heartbeat, u64beBig)));
+  const acls = d.key_acls || [];
+  const aclParts = [u32be(acls.length)];
+  for (const k of acls) {
+    const ops = k.operations || [];
+    aclParts.push(concat(u64beBig(k.handle), concat.apply(null, [u32be(ops.length)].concat(ops.map(dBytes))), dU32s(k.pcr_policy)));
+  }
+  const pcr = d.pcr_policy;
+  return concat(
+    new TextEncoder().encode(DOC_DIGEST_PREFIX),
+    dOpt(d.seal_state, (s) => concat(new Uint8Array([s.posture === "sealed" ? 1 : 0]), dBytes(s.state))),
+    concat.apply(null, logParts),
+    dOpt(pcr, (p) => {
+      const keys = Object.keys(p.values || {}).map(Number).sort((a, b) => a - b);
+      const vparts = [u32be(keys.length)];
+      for (const k of keys) vparts.push(concat(u32be(k), dBytes((p.values || {})[String(k)])));
+      return concat(dU32s(p.expected), dBytes(p.pcr_select), concat.apply(null, vparts));
+    }),
+    concat.apply(null, unitParts),
+    dOpt(d.luks, (l) => concat(dBytes(l.device), dBool(l.open), dU32s(l.pcr_policy), dOpt(l.marker_counter, u64beBig))),
+    concat.apply(null, aclParts),
+    dOpt(d.retry, (r) => concat(u64beBig(r.warden_respawn), u64beBig(r.watchdog_reboot_guard))),
+  );
+}
+// The hex canonical digest (SHA-256 of the canonical bytes). Exposed on the
+// test seam so the parity pin is driven by THIS mirror against the committed
+// fixture, and the naive Number path is shown to diverge (the negative twin).
+function canonicalDocDigestHex(doc) {
+  return crypto.subtle.digest("SHA-256", canonicalDocBytes(doc)).then(bufToHex);
+}
+
+// -----------------------------------------------------------------------------
 // The wardend state-log signatures (contract step 3's wardend channel).
 // Rust side: verify_chained_log + P256Signer (prehashed ECDSA over the
 // wardend entry hash SHA-256(prev||new||op||timestamp_be)).
@@ -862,28 +1036,75 @@ async function checkStateLog(env) {
   try {
     const raw = wireBytes(ev.doc);
     if (!raw) return finishFact("wardend_state_chain", [sub("wardend.evidence", FAILED, "the wardend doc is not a base64 string")], "");
-    doc = JSON.parse(new TextDecoder().decode(raw));
+    const text = new TextDecoder().decode(raw);
+    // The chain loop / metadata keep the ordinary parsed view; the doc
+    // digest additionally uses the TOKEN-SAFE parse so a >2^53 u64 keeps
+    // its low bits (see the precision rule above).
+    doc = JSON.parse(text);
+    doc.__docDigest = canonicalDocBytes(parseDocTokens(text));
   } catch (e) {
     return finishFact("wardend_state_chain", [sub("wardend.evidence", FAILED, "the wardend evidence doc is not decodable JSON: " + e)], "");
   }
   const log = doc.state_log || [];
   const subs = [];
-  if (log.length === 0) {
-    subs.push(sub("wardend.seal_state", doc.seal_state ? PROVEN : NOT_PROVEN,
-      doc.seal_state ? "seal state published: " + j(doc.seal_state) : "the doc carries no seal state"));
-    subs.push(sub("wardend.state_chain", NOT_PROVEN, "the state log is empty: no signature to verify"));
-    return finishFact("wardend_state_chain", subs, "");
-  }
+  // The HSM public-key anchor is resolved FIRST (both the doc signature and
+  // the state log verify under it; the Rust verifier resolves it before the
+  // doc-signature leg too).
   const anchorKey = ev.anchors && (ev.anchors.hsm_public || ev.anchors.seald_public);
   if (!anchorKey) {
     return finishFact("wardend_state_chain",
-      [sub("wardend.state_chain", NOT_PROVEN, "no seald HSM public key anchor in the bundle: the state log cannot be verified")], "");
+      [sub("wardend.state_chain", NOT_PROVEN, "no seald HSM public key anchor in the bundle: the doc signature and state log cannot be verified")], "");
   }
   const point = wireBytes(anchorKey);
   const spki = spkiFromPoint(point);
   if (!spki) {
     return finishFact("wardend_state_chain",
       [sub("wardend.state_chain", FAILED, "the HSM anchor is not the 65-byte uncompressed P-256 point")], "");
+  }
+  // The whole-doc signature gate (Rust authority: the doc signature is
+  // verified BEFORE any field, and it fails the WHOLE wardend channel). An
+  // absent signature is the honest NOT PROVEN (nothing to anchor the bytes);
+  // a present-but-wrong one is FAILED (tamper / stale signature). Either
+  // way, EVERY doc-derived fact is unanchored: the channel must never
+  // PROVEN. The empty log is NOT a pass: an unsigned doc is unverified.
+  const docSig = ev.anchors ? ev.anchors.doc_signature : undefined;
+  if (docSig === undefined || docSig === null) {
+    return finishFact("wardend_state_chain",
+      [sub("wardend.doc_signature", NOT_PROVEN, "the wardend doc carries no doc_signature anchor: the whole-doc byte attestation is missing (an unsigned doc is unverified, not healthy)")], "");
+  }
+  const docSigBytes = wireBytes(docSig);
+  let docSigOk = false;
+  try {
+    docSigOk = docSigBytes && docSigBytes.length === 64
+      ? await verifyEcdsa("P-256", "SHA-256", spki, docSigBytes, doc.__docDigest)
+      : false;
+  } catch (e) {
+    docSigOk = false;
+  }
+  if (!docSigOk) {
+    return finishFact("wardend_state_chain",
+      [sub("wardend.doc_signature", docSigBytes && docSigBytes.length === 64 ? FAILED : NOT_PROVEN,
+        docSigBytes && docSigBytes.length === 64
+          ? "the whole-doc ECDSA signature does NOT verify under the pinned HSM key (tampered or stale doc bytes)"
+          : "the doc_signature anchor is not a 64-byte P-256 signature")], "");
+  }
+  subs.push(sub("wardend.doc_signature", PROVEN,
+    "the whole-doc signature verifies under the pinned HSM key (SHA-256 over the canonical bytes of every doc field)"));
+  // The seal-state companion: the doc is byte-attested, so publishing a seal
+  // state is a PROVEN fact; absent is an honest NOT PROVEN (NOT a healthy
+  // default). This is the real leak I-2b closes: seal_state is doc content,
+  // and only the doc signature anchors it.
+  subs.push(sub("wardend.seal_state", doc.seal_state ? PROVEN : NOT_PROVEN,
+    doc.seal_state ? "seal state published (byte-attested by the doc signature): " + j(doc.seal_state)
+                   : "the byte-attested doc carries no seal state"));
+  // The empty log now only means "no per-entry signatures to walk", NOT
+  // "unverified": the doc signature already byte-attests every field
+  // (including an empty state_log). The chain sub is the honest NOT PROVEN
+  // here, so the roll (PROVEN iff EVERY sub is PROVEN) stays NOT PROVEN,
+  // matching the Rust channel (an empty log emits no chain fact).
+  if (log.length === 0) {
+    subs.push(sub("wardend.state_chain", NOT_PROVEN, "the state log is empty: no entry signature to verify"));
+    return finishFact("wardend_state_chain", subs, "");
   }
   // The identity cross-check: the HSM SPKI we are about to trust must pin
   // to the same key the identity section publishes (both sides of the
@@ -1250,5 +1471,14 @@ try {
       const ders = pemToDer(pem);
       return ders.length ? sha256Hex(derCertsParts(ders[0]).spki) : Promise.resolve(null);
     },
+    // The doc-digest parity + negative-twin seam. docDigestTokenSafe runs the
+    // shipped canonicalizer over the TOKEN-SAFE parse (a >2^53 u64 keeps its
+    // low bits, matching Rust canonical_doc_digest); docDigestNaive runs the
+    // SAME canonicalizer over a plain JSON.parse (the >2^53 fields come back
+    // Number-coerced). Same fixture text, two parses, two digests: the pair
+    // witnesses the precision hazard is real AND that the token path is the
+    // one that reproduces the HSM's signature.
+    docDigestTokenSafe: function (text) { return canonicalDocDigestHex(parseDocTokens(text)); },
+    docDigestNaive: function (text) { return canonicalDocDigestHex(JSON.parse(text)); },
   };
 } catch (e) { /* non-browser context without self: fine */ }
