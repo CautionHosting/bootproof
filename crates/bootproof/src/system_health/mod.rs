@@ -5,12 +5,14 @@
 //! the two cannot drift (a test pins the SW bytes' hash).
 
 /// The System Health HTML shell (title "System Health"; registers /verify.js).
-pub const SHELL: &str = include_str!("assets/system_health/shell.html");
+pub const SHELL: &str = include_str!("../assets/system_health/shell.html");
 /// The service-worker verifier source (application/javascript; the bytes
 /// baked into the binary, immutable).
-pub const SW: &str = include_str!("assets/system_health/verify.js");
+pub const SW: &str = include_str!("../assets/system_health/verify.js");
 /// Hex SHA-256 of SW's bytes; a test recomputes and asserts this.
 pub const SW_SHA256: &str = "5b270efc267e01b12d5145c94a508895381c1da57aabad18555c91f57ca23ad5";
+
+pub mod schema;
 
 #[cfg(test)]
 mod tests {
