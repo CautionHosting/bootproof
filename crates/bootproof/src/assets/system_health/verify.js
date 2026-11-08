@@ -1149,14 +1149,20 @@ function render(res) {
 }
 
 async function broadcast(result) {
+  // The contract is a SINGLE field: the page reads d.result.html (and the
+  // sh-ping reply below posts this same lastResult object with no sibling
+  // channel), so the rendered html rides ON result. Pre-fix this posted
+  // {type, result, html} with html as a top-level sibling the shell never
+  // read: the live page hung at "Verifying..." forever while the verdict
+  // sat computed-but-unpainted. One field, both post sites.
   lastResult = result;
   // The page is a dumb renderer: it receives the SW's own escaped HTML (all
   // envelope bytes already went through esc()), never raw data. One
   // renderer for the browser twin - the markup and the verdicts cannot
   // diverge because the SAME function produced both.
-  const html = render(result);
+  result.html = render(result);
   const list = await self.clients.matchAll({ includeUncontrolled: true, type: "window" });
-  for (const c of list) c.postMessage({ type: "system-health", result: result, html: html });
+  for (const c of list) c.postMessage({ type: "system-health", result: result });
 }
 
 let lastResult = null;
@@ -1232,6 +1238,7 @@ self.addEventListener("fetch", function (e) {
 // gets nothing extra; the service worker itself ignores this.
 try {
   self.__bootproof_verifier__ = {
+    broadcast: broadcast,
     runVerification: runVerification,
     checkIdentity: checkIdentity,
     checkSnp: checkSnp,
