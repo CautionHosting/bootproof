@@ -15,7 +15,7 @@ pub const SW: &str = include_str!("../assets/system_health/verify.js");
 /// previous value b5f422f43d2ce451315ac877666342e6494fd4e0a47352bd42122a4a
 /// 19ee9843 was the result.html contract fix, and before that
 /// 5b270efc267e01b12d5145c94a508895381c1da57aabad18555c91f57ca23ad5.)
-pub const SW_SHA256: &str = "4f19d4fbb0fb2403f0a3940d51569664e7d33ce68af9f557589b00ebca0f5686";
+pub const SW_SHA256: &str = "fbd2bbb07d892c7f98ccf2b0899eac82e3ba965d5849c71408d8279a09f4967e";
 
 pub mod schema;
 

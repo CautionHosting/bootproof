@@ -237,9 +237,12 @@ pub fn verify_bundle(
                     }
                     Err(e) => {
                         errors.push(format!("{}: {e}", ev.channel));
-                        if let Some(f) = verifier.failed_fact(ev, &e) {
-                            facts.push(f);
-                        }
+                        // All facts the channel owns are NOT PROVENS on
+                        // its failure (the default wraps the singular
+                        // failed_fact, so single-fact channels are
+                        // unchanged; snp owns memory_encryption + the
+                        // AMI-2 identity rows).
+                        facts.extend(verifier.failed_facts(ev, &e));
                         present.push(ev.channel.clone());
                     }
                 }
@@ -256,9 +259,7 @@ pub fn verify_bundle(
     for req in &policy.required_channels {
         if !present.iter().any(|p| p == req) {
             if let Some(v) = verifiers.get(req) {
-                if let Some(f) = v.required_absent_fact() {
-                    facts.push(f);
-                }
+                facts.extend(v.required_absent_facts());
             }
         }
     }

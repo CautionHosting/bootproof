@@ -62,6 +62,17 @@
 //                   fact vs JS's honest NOT_PROVEN). The tpm fold also
 //                   breaks (other docs changed): BOTH verifiers reject
 //                   tpm_quote, loudly, for the same reason.
+//   * chip-tamper:  (AMI-2) one CHIP_ID byte flipped @0x1A0 -- inside the
+//                   VLEK-SIGNED prefix but OUTSIDE report_data, so the
+//                   nonce binding stays green and ONLY the report
+//                   signature dies. This is the identity-rows failure
+//                   leg: Rust's failed_facts() must emit THREE NOT
+//                   PROVEN facts (memory_encryption + both identity
+//                   rows); the JS gate must say NOT PROVEN on both rows
+//                   for the same reason (the signature the rows ride
+//                   failed). An attacker rewriting the chip serial is
+//                   rejected by both verifiers through the SAME gate the
+//                   rows are eligible under.
 //
 // No dependencies. Deterministic: fixed keys, fixed nonce source, RFC 6979
 // ECDSA inside Node's sign. Outputs (same directory):
@@ -620,6 +631,14 @@ const tSnap = clone(envelope);   // snp-tamper: flip one report_data byte.
   tSnap.bundle.evidence[0].doc = doc.toString('base64');
 }
 
+const tChip = clone(envelope);   // chip-tamper (AMI-2): flip one CHIP_ID byte.
+{
+  const doc = Buffer.from(tChip.bundle.evidence[0].doc, 'base64');
+  doc[0x1a0] ^= 0x01;            // inside the signed prefix, OUTSIDE
+                                 // report_data: the signature dies alone
+  tChip.bundle.evidence[0].doc = doc.toString('base64');
+}
+
 const tLog = clone(envelope);    // log-tamper: flip a byte in entry 1's op.
 {
   const docStr = Buffer.from(tLog.bundle.evidence[2].doc, 'base64').toString();
@@ -646,6 +665,7 @@ const tNoSig = clone(envelope);  // unsigned-doc: the doc signature dropped
 const write = (name, obj) => fs.writeFileSync(path.join(OUT, name), JSON.stringify(obj, null, 1) + '\n');
 write('golden.json', envelope);
 write('golden.snp-tamper.json', tSnap);
+write('golden.chip-tamper.json', tChip);
 write('golden.log-tamper.json', tLog);
 write('golden.missing-snp.json', tNoSnp);
 write('golden.unsigned-doc.json', tNoSig);

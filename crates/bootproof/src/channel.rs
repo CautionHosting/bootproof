@@ -216,4 +216,25 @@ pub trait Verifier {
     fn required_absent_fact(&self) -> Option<Fact> {
         None
     }
+
+    /// All failure-time facts this channel owns, when its evidence is
+    /// present but verification failed. The default wraps the singular
+    /// `failed_fact`, so every existing channel is byte-identical. A
+    /// channel that owns MORE than one fact (snp: `memory_encryption`
+    /// plus the AMI-2 identity rows) overrides this, so one verification
+    /// failure NOT PROVENS every fact it owns -- the state the JS
+    /// verifier shows on the same bundle (two verifiers, one verdict).
+    fn failed_facts(&self, ev: &Evidence, reason: &str) -> Vec<Fact> {
+        self.failed_fact(ev, reason).into_iter().collect()
+    }
+
+    /// All required-absent facts. The default wraps the singular
+    /// `required_absent_fact`. Deliberately NOT overridden by snp: an
+    /// ABSENT report has no bytes to display, so the identity rows do
+    /// not exist on absence in either verifier (absence is honest
+    /// silence on those rows; tampering is a present row saying NOT
+    /// PROVEN -- the two states must stay distinguishable).
+    fn required_absent_facts(&self) -> Vec<Fact> {
+        self.required_absent_fact().into_iter().collect()
+    }
 }

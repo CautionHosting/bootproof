@@ -69,14 +69,25 @@ const OID = {
 const SNP = {
   LEN: 1184,
   VERSION: 0x00,        // u32 LE, must be 5
+  SVN: 0x04,            // guest_svn, u32 LE (AMI-2: the CPU-identity row)
   POLICY: 0x08,         // u64 LE (bit19 debug, bit25 page-swap-disable)
   VMPL: 0x30,           // u32 LE, must be 0
   SIG_ALGO: 0x34,       // u32 LE, 1 == ECDSA P-384 / SHA-384
+  KEY_INFO: 0x48,       // u32 LE; bits 4-5 MASK_CHIPID (AMI-2)
   REPORT_DATA: 0x50,    // 64 bytes: front 32 echo the challenge nonce
+  REPORTED_TCB: 0x180,  // 8 raw bytes: the TCB the VLEK was derived at (AMI-2)
+  CPUID: 0x188,         // family, model, stepping: the CPU identity (AMI-2)
+  CHIP_ID: 0x1a0,       // 64 bytes: the chip identity (AMI-2); sev 8.0.0's
+                        // own constant CHIP_ID_RANGE = 0x1a0..0x1e0 is the
+                        // positive source for this span.
   SIG: 0x2a0,           // the signature field: 144 bytes, r LE (72) || s LE
                         // (72), 48 significant bytes each, then 368 reserved
                         // zero bytes to the end of the 1184-byte report.
   MEASURABLE: 0x2a0,    // the firmware signs bytes [0, 0x2a0) with the VLEK
+                        // -- so SVN/KEY_INFO/REPORTED_TCB/CPUID/CHIP_ID are
+                        // ALL inside the signed prefix: once snp.report_sig
+                        // proves the signature, the AMI-2 identity rows are
+                        // tamper-evident by construction.
 };
 const SNP_POLICY_DEBUG_BIT = 19;        // must be 0 (policy & 0x80000 == 0)
 const SNP_POLICY_PAGESWAP_BIT = 25;     // must be 1 (bit 25 set)
@@ -493,6 +504,16 @@ async function checkIdentity(env, host) {
   subs.push({ name: "identity_link.san", status: sanOk ? PROVEN : FAILED,
     why: sanOk ? "leaf covers " + h : "leaf SANs [" + leaf.dnsNames.join(" ") + "] do not cover " + h });
   const ok = linkOk && anchored && validOk && sanOk;
+  // Display-of-verified (AMI-2 scope 2c): the leaf's identity material in
+  // full, shown once the four checks above ran. The subs above prove the
+  // link; this row names WHAT was linked: the complete SPKI pin, the DER
+  // fingerprint, and the validity window against this browser's clock.
+  // Display tier: it rides ok's verdict, never overrides it (a FAILED
+  // leaf is still shown -- seeing the key of a failed link is the point).
+  const isoOf = function (ms) { return ms == null ? "null" : new Date(ms).toISOString().replace("T", " ").slice(0, 19) + " UTC"; };
+  subs.push(sub("identity.leaf_identity", linkOk ? PROVEN : FAILED,
+    "display of verified: TLS leaf SPKI-SHA256 " + leaf.spkiPin + ", DER fingerprint " + leaf.fingerprint +
+    ", valid " + isoOf(leaf.notBefore) + " .. " + isoOf(leaf.notAfter) + " (browser clock)"));
   if (!ok && linkOk) why.push("link proven but chain/validity/SAN failed");
   if (!linkOk) why.push("TLS key != attestation signer key: a different server or a stripped re-issue");
   return { status: ok ? PROVEN : FAILED, why: why.length ? why.join("; ") : "leaf key == signer key, ISRG-anchored, valid, covers host", subs: subs, certs: certs };
@@ -508,14 +529,33 @@ function snpParse(doc) {
   return {
     doc: doc,
     version: leU32(doc, SNP.VERSION),
+    svn: leU32(doc, SNP.SVN),
+    keyInfo: leU32(doc, SNP.KEY_INFO),
     policyLo: leU64Lo(doc, SNP.POLICY),
     policyHi: leU64Hi(doc, SNP.POLICY),
     vmpl: leU32(doc, SNP.VMPL),
     sigAlgo: leU32(doc, SNP.SIG_ALGO),
     reportData: doc.subarray(SNP.REPORT_DATA, SNP.REPORT_DATA + 64),
+    reportedTcb: doc.subarray(SNP.REPORTED_TCB, SNP.REPORTED_TCB + 8),
+    cpuid: doc.subarray(SNP.CPUID, SNP.CPUID + 3),
+    chipId: doc.subarray(SNP.CHIP_ID, SNP.CHIP_ID + 64),
     // r/s: 72-byte little-endian fields, 48 significant bytes each.
     sig: doc.subarray(SNP.SIG, SNP.SIG + 144),
   };
+}
+
+// The AMI-2 chip-identity decision rule: PROVEN iff the 64-byte CHIP_ID is
+// non-zero. The BYTES are always attested (they ride the VLEK signature --
+// never in question once snp.report_sig proves); what all-zero withholds is
+// the IDENTITY CLAIM: a green row reading "identity = 0000..." names no
+// chip -- it is the absence of an identity, not one. Milan-generation
+// firmware is known to emit zeros even with mask_chipid == 0 (witnessed on
+// the captured live report). The byte-for-byte mirror of the Rust
+// chip_identity_proven in verify/snp.rs; the golden fixtures pin both
+// sides to the same verdicts.
+function chipIdentityProven(chipId) {
+  for (let i = 0; i < chipId.length; i++) { if (chipId[i] !== 0) return true; }
+  return false;
 }
 function leToBe(bytes) {
   const out = new Uint8Array(bytes.length);
@@ -549,19 +589,57 @@ async function certEdgeOk(signerCert, signeeCert) {
   return null; // not an ECDSA edge: the pin-equality path decides
 }
 
+// The AMI-2 identity facts ride the SAME finish: the JS fact-level verdict
+// stays the worst-of roll of the snp CHECK subs (memory_encryption is
+// unchanged), while the two identity rows ship as sibling subs on the same
+// result so the harness parity map sees them by name. sigOk gating: the
+// rows are PROVEN-eligible ONLY after snp.report_sig proves the VLEK
+// signed the bytes they read (the same gate the Rust facts() path gets by
+// construction -- facts() runs only after verify_snp_with_vmpl). Before
+// that gate every failure path says NOT PROVEN with the reason, mirroring
+// the Rust failed_facts() override: one verification failure, every owned
+// fact NOT PROVEN (two verifiers, one verdict). ABSENT evidence is the
+// documented exception on BOTH sides (the Rust required_absent_facts
+// default deliberately emits no identity rows): no bytes, no row -- an
+// honest silence, distinct from a present-but-unverified row saying NOT
+// PROVEN. `emitIdentity` is false only on the absent channel.
+function snpIdentitySubs(subs, r) {
+  const roll = subs.some(function (x) { return x.name === "snp.report_sig" && x.status === PROVEN; });
+  if (!r) {
+    const why = "snp report NOT verified (identity bytes unattested)";
+    return [sub("snp.cpu_identity", NOT_PROVEN, why), sub("snp.chip_identity", NOT_PROVEN, why)];
+  }
+  if (!roll) {
+    const why = "snp report signature NOT proven: identity bytes unattested";
+    return [sub("snp.cpu_identity", NOT_PROVEN, why), sub("snp.chip_identity", NOT_PROVEN, why)];
+  }
+  const cpu = "CPUID family " + r.cpuid[0] + " model " + r.cpuid[1] + " stepping " + r.cpuid[2] +
+    "; guest_svn " + r.svn + "; reported_tcb " + bufToHex(r.reportedTcb) + " (bytes @0x180)";
+  const chipHex = bufToHex(r.chipId);
+  const chipOk = chipIdentityProven(r.chipId);
+  const chipWhy = chipOk
+    ? "CHIP_ID " + chipHex + " (64 bytes @0x1A0, VLEK-signed)"
+    : "firmware reports CHIP_ID as zero (mask_chipid=" + ((r.keyInfo >> 4) & 3) +
+      "): chip identity not reportable on this firmware generation";
+  return [sub("snp.cpu_identity", PROVEN, cpu), sub("snp.chip_identity", chipOk ? PROVEN : NOT_PROVEN, chipWhy)];
+}
+function finishSnp(subs, r, emitIdentity) {
+  const fact = finishFact("memory_encryption", subs, "");
+  return { name: fact.name, status: fact.status, why: fact.why,
+           subs: emitIdentity ? subs.concat(snpIdentitySubs(subs, r)) : subs };
+}
+
 async function checkSnp(ev, nonceHex) {
   const subs = [];
   if (!ev) {
-    return finishFact("memory_encryption",
-      [sub("snp.evidence", NOT_PROVEN, "no snp evidence in the bundle (non-SNP host, or /dev/sev-guest was absent at produce time)")], "");
+    return finishSnp([sub("snp.evidence", NOT_PROVEN, "no snp evidence in the bundle (non-SNP host, or /dev/sev-guest was absent at produce time)")], null, false);
   }
   const r = snpParse(ev.doc);
   if (!r) {
-    return finishFact("memory_encryption",
-      [sub("snp.evidence", FAILED, "snp doc is " + (ev.doc ? ev.doc.length : 0) + " bytes, expected the full 1184-byte v5 report")], "");
+    return finishSnp([sub("snp.evidence", FAILED, "snp doc is " + (ev.doc ? ev.doc.length : 0) + " bytes, expected the full 1184-byte v5 report")], null, true);
   }
   if (r.version !== 5) {
-    return finishFact("memory_encryption", [sub("snp.evidence", FAILED, "snp report version " + r.version + ", expected 5")], "");
+    return finishSnp([sub("snp.evidence", FAILED, "snp report version " + r.version + ", expected 5")], null, true);
   }
   // 1. Nonce binding: report_data[0..32] echoes OUR fresh nonce.
   const nonceOk = bufToHex(r.reportData.subarray(0, 32)) === nonceHex;
@@ -583,13 +661,23 @@ async function checkSnp(ev, nonceHex) {
   if (!vlekDer || vlekDer.length === 0) {
     subs.push(sub("snp.vlek", NOT_PROVEN, "no VLEK anchor bundled (firmware did not provision one)"));
     subs.push(sub("snp.report_sig", NOT_PROVEN, "cannot check without the VLEK"));
-    return finishFact("memory_encryption", subs, "");
+    return finishSnp(subs, r, true);
   }
   const vlek = await decodeCert(vlekDer);
-  if (!vlek) return finishFact("memory_encryption", [sub("snp.vlek", FAILED, "VLEK DER walk failed")], "");
+  if (!vlek) return finishSnp([sub("snp.vlek", FAILED, "VLEK DER walk failed")].concat(subs), r, true);
   const vlekCurve = spkiCurveIs(vlek.spkiDer, OID.CURVE_P384);
   subs.push(sub("snp.vlek", vlekCurve ? PROVEN : FAILED,
     vlekCurve ? "VLEK is an EC P-384 key" : "VLEK SPKI is not id-ecPublicKey/P-384"));
+  // Display-of-verified (AMI-2 scope 2a): the VLEK's own identity material,
+  // shown so an operator can cross-check WHICH key the report was verified
+  // under (the CLI prints the same SPKI pin against the baked ASVK chain;
+  // the subject-DN rendering needs a DER Name walker the browser does not
+  // carry -- flagged, the pin is the load-bearing half). Tier distinct from
+  // the identity rows above: nothing here is a new check, it displays what
+  // the checks consumed.
+  subs.push(sub("snp.vlek_identity", PROVEN,
+    "display of verified: bundled VLEK SPKI-SHA256 " + vlek.spkiPin.slice(0, 16) + "\u2026, DER fingerprint " +
+    vlek.fingerprint.slice(0, 16) + "\u2026 (the key the report signature was checked under)"));
   // 5. VLEK signed the report (the report signature under the VLEK key).
   const sigOk = vlekCurve ? await snpReportSigOk(r, vlek.spkiDer) : false;
   subs.push(sub("snp.report_sig", sigOk ? PROVEN : FAILED,
@@ -633,7 +721,7 @@ async function checkSnp(ev, nonceHex) {
         "the ASVK -> VLEK edge is RSA-PSS/SHA-384 (WebCrypto has no RSA-PSS): wardenctl verifies it under the pinned ASVK key"));
     }
   }
-  return finishFact("memory_encryption", subs, "");
+  return finishSnp(subs, r, true);
 }
 function spkiCurveIs(spkiDer, curveOidHex) {
   const spki = derTlv(spkiDer, 0);
@@ -1090,6 +1178,16 @@ async function checkStateLog(env) {
   }
   subs.push(sub("wardend.doc_signature", PROVEN,
     "the whole-doc signature verifies under the pinned HSM key (SHA-256 over the canonical bytes of every doc field)"));
+  // Display-of-verified (AMI-2 scope 2b): WHICH HSM key verified the doc.
+  // The pin is the same SPKI-SHA256 the identity cross-check keys on; the
+  // row shows it so the operator can NAME the key rather than trust that
+  // "a" key verified. Placed after the doc-signature gate on purpose: a
+  // key whose signature failed is not a verified key, and the failure
+  // paths build their own sub lists, so this row only exists on the lane
+  // where the verification actually ran.
+  subs.push(sub("wardend.hsm_key_identity", PROVEN,
+    "display of verified: HSM doc-signing key SPKI-SHA256 " + (await sha256Hex(spki)).slice(0, 16) +
+    "\u2026 (65-byte P-256 point anchor; the doc signature and every state-log entry verify under this key)"));
   // The seal-state companion: the doc is byte-attested, so publishing a seal
   // state is a PROVEN fact; absent is an honest NOT PROVEN (NOT a healthy
   // default). This is the real leak I-2b closes: seal_state is doc content,
@@ -1217,14 +1315,18 @@ async function runVerification(origin) {
                       : "bundle.nonce does not match our 32-byte challenge"));
   }
 
-  // 4. The bundle's channels: what the browser verifies itself.
+  // 4. The bundle's channels: what the browser verifies itself. The
+  //    channel subs flatten into their own rows exactly like the identity
+  //    subs above (the fact row stays first so the rollup in step 6 finds
+  //    it by name; the AMI-2 identity + display rows are the subs).
   const bundle = env.bundle || {};
   const evs = bundle.evidence || [];
   const snpEv = decodeEvidence(evs.find(function (e) { return e.channel === "snp"; }));
   const tpmEv = decodeEvidence(evs.find(function (e) { return e.channel === "tpm2"; }));
-  checks.push(await checkSnp(snpEv, nonceHex));
-  checks.push(await checkTpm2(tpmEv, nonceHex, bundle));
-  checks.push(await checkStateLog(env));
+  for (const r of [await checkSnp(snpEv, nonceHex), await checkTpm2(tpmEv, nonceHex, bundle), await checkStateLog(env)]) {
+    checks.push({ name: r.name, status: r.status, why: r.why });
+    for (const s of r.subs || []) checks.push(s);
+  }
 
   // 5. The server's own verdicts, rendered VERBATIM as published (the
   //    server-asserted layer: the seald-side verify_bundle output). Every

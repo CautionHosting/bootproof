@@ -213,6 +213,13 @@ fn golden_two_verifiers_agree() {
         ("sign_key", "tpm.sign_key"),
         ("ek_cert", "tpm.ek_cert"),
         ("pcr_state", "tpm.pcr_state"),
+        // AMI-2: the snp identity rows are Rust FACTS and JS SUBs over
+        // the same bundle -- the same fact-vs-sub crosswalk algebra the
+        // tpm rows use, now covering the hardware-identity pair
+        // (browser-side checks, gated on the report signature on both
+        // sides).
+        ("snp_cpu_identity", "snp.cpu_identity"),
+        ("snp_chip_identity", "snp.chip_identity"),
     ];
     for (rfact, jsub) in pairs {
         let r = rust.get(rfact).unwrap_or_else(|| panic!("rust emitted no {rfact} fact"));
@@ -226,6 +233,14 @@ fn golden_two_verifiers_agree() {
     assert_eq!(rust.get("slot_link").map(String::as_str), Some("PROVEN"));
     assert_eq!(rust.get("sign_key").map(String::as_str), Some("PROVEN"));
     assert_eq!(rust.get("ek_cert").map(String::as_str), Some("DEGRADED"));
+    // AMI-2 positive-first on the live Milan-generation report: the CPU
+    // identity PROVENs (the model number is real) and the chip identity
+    // says NOT PROVEN through the zero-rule (the firmware reports 64
+    // zero bytes). Both statuses agree across the verifiers through the
+    // crosswalk above; these literals pin WHICH side of the zero-rule
+    // the golden lands on, so a generator change cannot quietly flip it.
+    assert_eq!(rust.get("snp_cpu_identity").map(String::as_str), Some("PROVEN"));
+    assert_eq!(rust.get("snp_chip_identity").map(String::as_str), Some("NOT PROVEN"));
     // The JS-only fact the core does not own here (wardend): must be
     // PROVEN on the JS side of the golden (the plugin test proves the
     // Rust side; the envelope-level fact must not diverge once the
@@ -314,12 +329,27 @@ fn missing_snp_exact_not_proven_agreement() {
         .find(|f| f.name == "memory_encryption")
         .expect("the required-absent fact is reported, never silently dropped");
     assert_eq!(me.status, Status::NotProven, "required-absent snp is NOT PROVEN");
+    // AMI-2 absence silence: an absent report has NO bytes to display, so
+    // neither verifier emits an identity row (the required_absent_facts
+    // default deliberately stays silent -- absence is honest silence, not
+    // a row saying NOT PROVEN; tampering is the present-row-not-proven
+    // state the chip-tamper test pins). This pair keeps the two states
+    // distinguishable in the contract, tested.
+    assert!(
+        !vf.facts.iter().any(|f| f.name == "snp_cpu_identity" || f.name == "snp_chip_identity"),
+        "an absent snp channel emits NO identity rows: {vf:?}"
+    );
 
     let js = js_facts(&g);
     assert_eq!(
         js.get("memory_encryption").map(String::as_str),
         Some("NOT PROVEN"),
         "exact agreement: both verifiers spell the dropped channel NOT PROVEN"
+    );
+    let js_subs = js_subs(&g);
+    assert!(
+        !js_subs.contains_key("snp.cpu_identity") && !js_subs.contains_key("snp.chip_identity"),
+        "the JS side stays silent on the identity rows for an absent channel (the mirrored exception): {js_subs:?}"
     );
     // The fold broke (the dropped doc is missing from the fold input):
     // Rust errors the whole tpm2 channel with no tpm facts; JS rolls
@@ -334,6 +364,68 @@ fn missing_snp_exact_not_proven_agreement() {
         "a rejected tpm2 channel emits no tpm facts"
     );
     assert_eq!(js.get("tpm_quote").map(String::as_str), Some("FAILED (mapped)"));
+}
+
+/// Tamper (chip-tamper, AMI-2): one CHIP_ID byte flipped @0x1A0, inside
+/// the VLEK-signed prefix but OUTSIDE report_data -- the nonce binding
+/// stays green and ONLY the report signature dies. This is the identity
+/// rows' failure leg and the failed_facts() override's whole point:
+///   * Rust: THREE NOT PROVEN facts (memory_encryption + snp_cpu_identity
+///     + snp_chip_identity) from the ONE failure -- the plural contract.
+///     The CPU row that PROVENs on the golden must flip here: an attacker
+///     rewriting the chip serial also invalidates the model row, because
+///     the bytes it reads are no longer attested.
+///   * JS: memory_encryption FAILED; both identity SUBs NOT PROVEN with
+///     the unattested-bytes reason (the exact-status vocabulary the
+///     engine's own failed_facts/required_absent path uses on the Rust
+///     side -- a JS FAILED would overclaim: the rows are unattested, not
+///     proven-false).
+/// The tpm fold breaks on both sides like every snp-doc tamper.
+#[test]
+fn chip_tamper_not_provens_the_identity_rows_on_both() {
+    let g = fixture("golden.chip-tamper.json");
+    let (rust, errors) = rust_facts(&g);
+    assert!(
+        errors.iter().any(|e| e.starts_with("snp:")),
+        "rust must error the tampered snp channel: {errors:?}"
+    );
+    for name in ["memory_encryption", "snp_cpu_identity", "snp_chip_identity"] {
+        assert_eq!(
+            rust.get(name).map(String::as_str),
+            Some("NOT PROVEN"),
+            "one report-signature failure NOT PROVENS every fact the snp channel owns ({name})"
+        );
+    }
+    assert!(
+        errors.iter().any(|e| e.starts_with("tpm2:")),
+        "the flipped doc is fold input: the tpm2 channel must error too: {errors:?}"
+    );
+
+    let js = js_facts(&g);
+    let js_subs = js_subs(&g);
+    assert_eq!(js.get("memory_encryption").map(String::as_str), Some("FAILED (mapped)"));
+    for jsub in ["snp.cpu_identity", "snp.chip_identity"] {
+        assert_eq!(
+            js_subs.get(jsub).map(String::as_str),
+            Some("NOT PROVEN"),
+            "the JS identity row {jsub} must be NOT PROVEN on a broken signature, not FAILED: {js_subs:?}"
+        );
+    }
+    // Positive-first control on the SAME run: the tamper left the nonce
+    // binding green (0x1A0 is outside report_data), so the rows' gate --
+    // not the binding -- is what failed. If the fixture ever drifts and
+    // the binding also breaks, this trips and the test's premise is
+    // re-examined rather than silently weakened.
+    assert_eq!(
+        js_subs.get("snp.nonce_binding").map(String::as_str),
+        Some("PROVEN"),
+        "chip-tamper must kill ONLY the signature leg: the binding stays green"
+    );
+    assert_eq!(
+        js_subs.get("snp.report_sig").map(String::as_str),
+        Some("FAILED (mapped)"),
+        "the report signature is the leg that dies"
+    );
 }
 
 /// Tamper 3 (log-tamper) in CORE scope: the flipped wardend doc must not
