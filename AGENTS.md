@@ -49,13 +49,20 @@ platform plugin instead.
 - `serve` — the reference HTTP face: `POST /attest {nonce?, user_data?,
   public_key?}` → the bundle+facts. The template for any HTTP attestation proxy.
 - `proxy` — the client side of the attestation ADMIN FACE (a daemon's
-  nonce→envelope listener): `ProxyPolicy`, `parse_hex_nonce`,
-  `attest_roundtrip`, `ProxyError` (+ `status`/`json`), `json_error`. The
-  len-first round-trip a wire owner (bastiond's `/health/api`, the generic
-  CLI) calls instead of hand-rolling the codec. Stops BELOW HTTP (frames +
+  nonce→envelope listener): `ProxyPolicy`, `parse_hex_nonce`, `query_param`,
+  `attest_roundtrip` (TCP: `host:port` + `policy.max_frame`),
+  `attest_roundtrip_uds` (`#[cfg(unix)]`: a socket path + a per-face
+  `max_payload` param, capped by `protocol::MAX_PAYLOAD`, enforced before the
+  body allocation so a face's own tighter frame contract survives
+  consolidation onto the shared transport), `ProxyError` (+ `status`/`json`),
+  `json_error`, `utf8_envelope`. The len-first round-trip a wire owner
+  (bastiond's `/health/api` + attestation page, the generic CLI) calls instead
+  of hand-rolling the codec. Stops BELOW HTTP (frames +
   nonce + errors + status-as-data; the wire owner renders HTTP bytes). A
   deliberate byte pipe: it never verifies the envelope. Sync, std-only, no
-  tokio.
+  tokio. The TCP reason strings are the frozen wardend contract (the
+  equivalence test reproduces wardend's original `health.rs` side by side);
+  the UDS sibling carries its own tests, same reason shapes.
 - `bridge` — the gVisor file-transport (challenge/response files) for a
   sandboxed collector that cannot reach the host UDS.
 - `spki` — `spki_der`, `spki_raw_key`, `spki_pin`, `pin_of_cert`: the bounded
@@ -90,7 +97,7 @@ platform plugin instead.
   path physically terminates at `bastiond` (the only wire owner) and is bridged
   to posternd; the *bytes and their meaning* are bootproof's either way.
 
-## Status vs the end goal (verified 2026-11-07)
+## Status vs the end goal (verified 2026-11-08)
 
 Already true (committed):
 - `seald` produces bundles via `engine::produce` + the wardend plugin, and
@@ -102,6 +109,27 @@ Already true (committed):
   requirement is the design, not a TODO).
 - The `system-health` feature seam is in (`Cargo.toml` + gated `pub mod`),
   commit `cf576e9`.
+- The HTTP attest proxy seam is LANDED and LIVE-PROVEN (delta 3, closed):
+  `bootproof::proxy` owns both admin-face transports (TCP + UDS) with the
+  wardend-byte-identical failure contract, and wardend's consumers are
+  consolidated onto it (`bastion/src/health.rs` + `bastion/src/attest_page.rs`
+  call `attest_roundtrip_uds` with their per-face `max_payload`; no hand-rolled
+  OP_ATTEST codec remains in wardend). QEMU-gate proven: five-green on the
+  distro-only disk, the `/health/api` envelope byte-exact through the live
+  VM curls with the nonce double-echo, and the UDS seam clean under 5x
+  parallel contention on the real cross-sandbox topology.
+- The generic remote attester CLI is in: `bootproof attest-fetch`
+  (`crates/bootproof/src/attest_fetch.rs`) fetches a Bundle from a framed
+  admin face (`--frame host:port`, the len-first OP_ATTEST protocol over an
+  unauthenticated transport meant for an ssh -L tunnel) or an HTTP(S) bundle
+  face (`--url`) and verifies it through the evidence-driven registry. The
+  neutrality is MANDATED by test: `registry_drives_channels_not_fixture_names`
+  proves the registry (not a hardcoded name match) selects verifiers, an
+  unknown channel is reported LOUD (never a silent drop), and swapping in a
+  registry that knows the channel verifies the same bundle with ZERO core
+  code changed. Exit codes: 0 = no FAILED channel (absent channels are an
+  honest NOT PROVEN), 1 = a FAILED/absent-required channel, 2 =
+  transport/parse/nonce error.
 - The golden-fixture two-verifiers-agree gate is in:
   `fixtures/system_health/` (`gen_golden.js` regenerates
   `golden.json` + the three tamper fixtures deterministically via RFC
@@ -130,29 +158,28 @@ Already true (committed):
   key assert is the load-bearing half; Value-level-only consumption once
   let a fixture omit the field unnoticed).
 
-Remaining deltas (the actual work):
-1. **Move the System Health envelope *presentation* schema** (the
-   `metadata`/`identity` section shapes now built in
-   `wardend/seal/src/attest_envelope.rs`) INTO bootproof so the browser, the
-   CLI, and any future client render one schema from one owner. Keep it
-   platform-agnostic: sections are keyed slots that a platform fills, so a
-   non-wardend platform reuses the same envelope shape. seald keeps only the
-   *file/device reads* (the platform's evidence source) and hands values to the
-   bootproof schema builder.
-2. **The browser verifier bundle** (`system_health.rs` +
-   `assets/system_health/*`): shell + service worker + `SW_SHA256` + the
-   drift-killer test + the golden fixture + the `verify_bundle`-agreement test.
-3. **The HTTP attest proxy: design resolved, bootproof seam landed, the
-   wardend swap is the open increment.** The AGENTS.md either/or
+The original four deltas are CLOSED (each verified against source):
+1. **The System Health envelope *presentation* schema** lives in bootproof:
+   `system_health/schema.rs` owns `Envelope`/`Identity`/`Metadata` as the
+   single contract, sections are keyed slots a platform fills
+   (`build_envelope`, schema.rs). wardend's `seal/src/attest_envelope.rs` is
+   now only the *file/device reads*: its builders return bootproof's schema
+   types directly and `admin.rs` composes via `schema::build_envelope`.
+2. **The browser verifier bundle** is shipped: `system_health/mod.rs` embeds
+   `assets/system_health/shell.html` + `verify.js` with `include_str!`, the
+   `SW_SHA256` pin, the drift-killer test (JS anchors == Rust `trust`/`snp`
+   constants), and the golden fixture + agreement tests below.
+3. **The HTTP attest proxy: design resolved, seam landed, wardend
+   consolidated, gate-proven.** The AGENTS.md either/or
    (bastiond-bridged-to-posternd vs posternd-HTTP-bridged-by-bastiond) was a
    false dichotomy: posternd owns :22 only (`proxy_wardenctl` is a frame pipe
    INSIDE an authenticated SSH session; there is no TCP listener), so a
    browser cannot reach it and an unauthenticated posternd HTTP face would
    duplicate the SSH-gated admin path. RESOLVED: HTTP terminates at `bastiond`
-   (the only wire owner) as today, and the proxy LOGIC (frame codec, nonce
-   parser, timeouts, error/status mapping) moves INTO bootproof. `bootproof::proxy`
-   now owns the round-trip: `ProxyPolicy` + `parse_hex_nonce` +
-   `attest_roundtrip` + `ProxyError` (+ `error_json`/`status`), failure
+   (the only wire owner), and the proxy LOGIC (frame codec, nonce
+   parser, timeouts, error/status mapping) lives in `bootproof::proxy`:
+   `ProxyPolicy` + `parse_hex_nonce` + `attest_roundtrip` (TCP) +
+   `attest_roundtrip_uds` (UDS) + `ProxyError` (+ `json`/`status`), failure
    semantics MOVED from wardend's `bastion/src/health.rs` (equivalence tests
    re-run the original code shapes side by side, same inputs -> same reason
    strings). It stops BELOW HTTP: bootproof owns frames/nonce/errors/status-AS-DATA,
@@ -160,9 +187,29 @@ Remaining deltas (the actual work):
    explicit `FrameOrder` (`TagFirst` daemon socket, `LenFirst` admin face) so
    ONE codec owns both orders (no private second framing in a consumer). The
    proxy is a deliberate byte pipe: it never verifies the envelope (a checking
-   proxy is an unpinned third verifier). OPEN: wardend's `health.rs` deletes its
-   hand-rolled codec and calls the seam (byte-identical HTTP responses pinned
-   by the QEMU gate), dispatched as wardend's increment.
+   proxy is an unpinned third verifier). CLOSED: wardend's `health.rs` AND
+   `attest_page.rs` both call `attest_roundtrip_uds` with their own
+   per-face `max_payload` (8 MiB and 1 MiB respectively, each VISIBLE at the
+   call site; no hand-rolled OP_ATTEST codec remains in wardend production
+   code), and the per-face cap is test-pinned so consolidation onto the
+   shared transport cannot silently loosen a face's DoS bound.
+4. **The golden-fixture two-verifiers-agree gate** is in (see the Status
+   section): one bundle, `verify_bundle` in Rust and `verify.js` in node's
+   vm, exact verdict agreement asserted, tamper fixtures must agree on the
+   REJECTION.
+
+Open design threads (documented, not yet code):
+- **Verifier-host binding (#19):** a browser fetches the verifier JS over a
+  same-origin channel that proves nothing about WHO signs; the fix shape is
+  an operator-signed manifest mapping `{hostname ->
+  attest_signer_spki_sha256}` so the identity pin is OUT-OF-BAND and a
+  fresh-but-wrong-target bundle (the confused-deputy swap) fails. Design
+  note: `~/.crow/scratch/number19-verifier-host-design-note.md`.
+- **De-host bastiond (the operator's architectural law):** bastiond hosts
+  nothing and knows nothing about verification; the System Health statics
+  + envelope proxy move off the vhost pre-TLS-peek path (which serves
+  cleartext on :443 before any certificate exists). Design doc with
+  migration sequence; awaiting operator sign-off before any code.
 
 ## Build + test
 
@@ -216,11 +263,13 @@ future operator CLI  ->  wardenctl (wardend superset)  ->  bootproof (library)
   The CLI runs the generic `engine::verify_bundle` against whatever channels
   the fetched bundle actually carries (the registry is evidence-driven, so a
   bundle from ANY platform verifies its own channels + honest `NOT PROVEN` for
-  what it lacks). Fetching a bundle over the network is the delta to add: a
-  client that takes a URL/socket, speaks the `protocol` frame (or the
-  `attest`/`serve` HTTP face), pulls the bundle, and verifies it. It must never
-  hard-require a wardend/stagex channel — a turnkey TVC bundle with only SNP is
-  a VALID bundle to verify, just a smaller one.
+  what it lacks). Fetching a bundle over the network IS in: `attest-fetch`
+  takes a `--frame host:port` (the len-first admin frame) or a `--url` (an
+  HTTP(S) bundle face: POST the base64 nonce, accept a bare Bundle or an
+  envelope carrying one under `"bundle"`), pulls the bundle, and verifies it.
+  It never hard-requires a wardend/stagex channel — a turnkey TVC bundle with
+  only SNP is a VALID bundle to verify, just a smaller one (the registry is
+  the only dispatcher: `registry_drives_channels_not_fixture_names`).
 - **wardenctl = the wardend superset.** It wraps bootproof-as-a-library
   (`engine::verify_bundle` + the `bootproof-platform-wardend` verifier — already
   true in `wardenctl/src/verify.rs`) and ADDS wardend-specific behavior: the
