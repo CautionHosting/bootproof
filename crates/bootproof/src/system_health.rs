@@ -10,7 +10,7 @@ pub const SHELL: &str = include_str!("assets/system_health/shell.html");
 /// baked into the binary, immutable).
 pub const SW: &str = include_str!("assets/system_health/verify.js");
 /// Hex SHA-256 of SW's bytes; a test recomputes and asserts this.
-pub const SW_SHA256: &str = "6d85c497ebd6f9268ec89f9161af200248232f3e6e4cd229b18086b8d9a99f95";
+pub const SW_SHA256: &str = "5b270efc267e01b12d5145c94a508895381c1da57aabad18555c91f57ca23ad5";
 
 #[cfg(test)]
 mod tests {
