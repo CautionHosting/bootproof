@@ -15,7 +15,7 @@
 // FAILED.
 use bootproof::engine::{verify_bundle, VerifierRegistry, VerifyPolicy};
 use bootproof::wire::{Bundle, Status};
-use bootproof_platform_wardend::WardendVerifier;
+use bootproof_platform_wardend::{canonical_doc_digest, WardendVerifier};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -157,5 +157,105 @@ fn log_tamper_rejected_by_both() {
         js.get("wardend_state_chain").map(String::as_str),
         Some("FAILED"),
         "js must roll wardend_state_chain to FAILED on the same tamper"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// I-2: the whole-doc signature legs (byte-attestation of the platform
+// doc). The parity pin (the cross-implementation witness), the
+// signed-golden round trip, and the unsigned-doc fail-closed negative.
+// ---------------------------------------------------------------------------
+
+/// Pull the wardend evidence out of a fixture's bundle.
+fn wardend_evidence(fixture: &Path) -> bootproof::wire::Evidence {
+    let text = std::fs::read_to_string(fixture)
+        .unwrap_or_else(|e| panic!("read {}: {e}", fixture.display()));
+    let env: serde_json::Value = serde_json::from_str(&text).expect("fixture JSON");
+    let bundle: Bundle =
+        serde_json::from_value(env.get("bundle").cloned().expect("bundle")).expect("bundle");
+    bundle
+        .evidence
+        .into_iter()
+        .find(|e| e.channel == "wardend")
+        .expect("the wardend channel")
+}
+
+/// The cross-implementation parity pin: the JS generator computes the
+/// whole-doc digest with its OWN canonicalization (gen_golden.js
+/// canonicalDocDigest) and records it in golden.meta.json; THIS test
+/// recomputes it with the Rust canonical_doc_digest over the fixture's
+/// DECODED doc. Same bytes, two independent implementations, one vector:
+/// if either canonicalization drifts, these two hex values diverge and
+/// this test fails. This is the witness that the JS page and the Rust
+/// verifier agree on WHAT is signed, not just on the signature bytes.
+#[test]
+fn the_doc_digest_parity_pin_rust_equals_js() {
+    let ev = wardend_evidence(&fixtures_dir().join("golden.json"));
+    let doc: bootproof_platform_wardend::WardendDoc =
+        serde_json::from_slice(&ev.doc.0).expect("the wardend doc decodes");
+    let rust = canonical_doc_digest(&doc);
+    let rust_hex: String = rust.iter().map(|b| format!("{b:02x}")).collect();
+    let meta_path = fixtures_dir().join("golden.meta.json");
+    let meta_text = std::fs::read_to_string(&meta_path).expect("read golden.meta.json");
+    let meta: serde_json::Value = serde_json::from_str(&meta_text).expect("meta JSON");
+    let js_hex = meta
+        .get("wardend_doc_digest_hex")
+        .and_then(|v| v.as_str())
+        .expect("golden.meta.json carries wardend_doc_digest_hex (gen_golden.js I-2)");
+    assert_eq!(
+        rust_hex, js_hex,
+        "doc-digest parity FAILED: the Rust canonical_doc_digest over the fixture doc \"{rust_hex}\" \ndrifted from the JS generator's canonicalDocDigest \"{js_hex}\" (same bytes, two implementations)"
+    );
+    // The fixture doc digest is also pinned directly (the coordination
+    // point both lanes and the coordinator recompute independently).
+    assert_eq!(
+        rust_hex, "5df1b76eaeb4b6332e534712a76db6881e6720accdacf42b7d718a55964e9dd2",
+        "the fixture wardend doc digest changed: the canonicalization or the fixture doc drifted"
+    );
+}
+
+/// POSITIVE-FIRST: the signed golden fixture verifies clean through the
+/// Rust wardend verifier (the doc signature leg passes: the fixture's
+/// doc_signature anchor verifies over the recomputed canonical digest).
+/// This is the witness that the unsigned-doc rejection below is rejecting
+/// the missing signature and NOT a broken happy path.
+#[test]
+fn the_signed_golden_doc_verifies_clean() {
+    let (rust, errors) = rust_wardend_facts(&fixtures_dir().join("golden.json"));
+    assert!(
+        errors.is_empty(),
+        "the signed golden wardend channel must verify clean: {errors:?}"
+    );
+    assert_eq!(
+        rust.get("wardend_state_chain").map(String::as_str),
+        Some("PROVEN"),
+        "the signed golden is PROVEN: {rust:?}"
+    );
+}
+
+/// NEGATIVE (asserts FAILURE): the golden doc with its doc_signature
+/// anchor REMOVED (the pre-I-2 shape: a valid, chain-intact doc with no
+/// byte-attestation) must FAIL the wardend channel closed, mapped to the
+/// honest NOT PROVEN failed-fact. An unsigned doc is not a degraded doc,
+/// it is an unverified one. This is the fixture-level witness of the
+/// fail-closed rule the plugin's unit tests pin at the function level.
+#[test]
+fn an_unsigned_doc_is_rejected_fail_closed() {
+    let (rust, errors) = rust_wardend_facts(&fixtures_dir().join("golden.unsigned-doc.json"));
+    assert!(
+        errors.iter().any(|e| e.contains("doc signature")),
+        "the unsigned doc must error the wardend channel on the doc-signature leg: {errors:?}"
+    );
+    assert_eq!(
+        rust.get("wardend").map(String::as_str),
+        Some("NOT PROVEN"),
+        "the failed-fact is the honest NOT PROVEN: {rust:?}"
+    );
+    // The state_chain fact must NOT be PROVEN for an unsigned doc (the
+    // doc signature is the gate on the whole channel, not a companion).
+    assert_ne!(
+        rust.get("wardend_state_chain").map(String::as_str),
+        Some("PROVEN"),
+        "an unsigned doc must never PROVEN the state chain: {rust:?}"
     );
 }

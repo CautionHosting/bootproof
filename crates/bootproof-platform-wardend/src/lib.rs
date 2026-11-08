@@ -44,6 +44,25 @@ pub const ANCHOR_SEALD_PUBLIC: &str = "seald_public";
 /// publishes.
 pub const ANCHOR_HSM_PUBLIC: &str = "hsm_public";
 
+/// The anchor key for the whole-doc signature (the seald HSM's 64-byte
+/// `r || s` ECDSA P-256 signature over `canonical_doc_digest`). I-2: the
+/// signature rides the SAME anchors map the client already reads for
+/// `seald_public`/`hsm_public` (no new container, no wire-format change);
+/// the doc JSON stays byte-pure under the digest. A missing (absent key)
+/// or malformed (non-64-byte) doc signature fails the channel closed:
+/// an unsigned doc is not a degraded doc, it is an unverified one.
+pub const ANCHOR_DOC_SIGNATURE: &str = "doc_signature";
+
+/// The domain-separation prefix for the whole-doc digest
+/// (`canonical_doc_digest`). The same HSM key signs BOTH the state-log
+/// entries and the whole platform doc; the doc signature is over
+/// `SHA-256(DOC_DIGEST_PREFIX || canonical fields)` while an entry
+/// signature is over the bare `entry_hash`, so a signature valid for one
+/// can NEVER verify for the other (the same-key domain-separation rule —
+/// `a_state_log_entry_signature_never_verifies_as_the_doc_signature`
+/// proves it).
+pub const DOC_DIGEST_PREFIX: &[u8] = b"wardend/platform-doc-digest/v1";
+
 // ---------------------------------------------------------------------------
 // The wardend fact schemas (serde: the JSON shape the seald admin face
 // produces; the verifier decodes + verifies them).
@@ -152,6 +171,153 @@ pub struct WardendDoc {
     pub key_acls: Vec<KeyAcl>,
     /// The retry counters (the seald's / warden's retry budgets).
     pub retry: Option<RetryCounters>,
+}
+
+// ---------------------------------------------------------------------------
+// The whole-doc canonical digest (I-2: byte-attestation of the platform
+// doc). ONE implementation, used by BOTH the sign side (the wardend
+// seald admin face, via the `canonical_doc_digest` re-export) and the
+// verify side (`WardendVerifier::verify`). A divergence between two
+// digest implementations is the bug class this single source of truth
+// guards against.
+//
+// The canonicalization discipline MIRRORS the state-log `entry_hash`
+// (domain-separated, fixed field order, no serde): a domain prefix,
+// fields in a FIXED order, a 1-byte presence tag per Optional field
+// (None = 0x00 feeds NOTHING after the tag; Some = 0x01 + the canonical
+// bytes — so None != Some(empty)), a 4-byte BE length per Vec / bytes
+// field (so [a] != [a, b] and a length change can never collide),
+// fixed-width big-endian integers, strings as len-prefixed bytes.
+// ---------------------------------------------------------------------------
+
+/// Feed a fixed-width big-endian integer into the digest.
+fn digest_u64(h: &mut Sha256, v: u64) {
+    h.update(v.to_be_bytes());
+}
+
+/// Feed a length-prefixed byte string (the canonical bytes of a `String`,
+/// `Vec<u8>`, or slice) into the digest.
+fn digest_bytes(h: &mut Sha256, b: &[u8]) {
+    h.update((b.len() as u32).to_be_bytes());
+    h.update(b);
+}
+
+/// Feed a length-prefixed list of u32 (the PCR sets) into the digest.
+fn digest_u32s(h: &mut Sha256, v: &[u32]) {
+    h.update((v.len() as u32).to_be_bytes());
+    for x in v {
+        h.update(x.to_be_bytes());
+    }
+}
+
+/// The canonical bytes of a bool (a fixed single byte, never serde's
+/// `true`/`false`).
+fn digest_bool(h: &mut Sha256, b: bool) {
+    h.update([if b { 1 } else { 0 }]);
+}
+
+/// The canonical bytes of the latch posture (0 = malleable, 1 = sealed).
+fn digest_posture(h: &mut Sha256, p: LatchPosture) {
+    h.update([match p {
+        LatchPosture::Malleable => 0,
+        LatchPosture::Sealed => 1,
+    }]);
+}
+
+/// The canonical bytes of an Option (1-byte presence tag; None feeds
+/// NOTHING after the tag, so None != Some(empty)).
+fn digest_opt<T>(h: &mut Sha256, v: &Option<T>, f: impl Fn(&mut Sha256, &T)) {
+    match v {
+        None => h.update([0u8]),
+        Some(x) => {
+            h.update([1u8]);
+            f(h, x);
+        }
+    }
+}
+
+fn digest_seal_state(h: &mut Sha256, s: &SealState) {
+    digest_posture(h, s.posture);
+    digest_bytes(h, &s.state);
+}
+
+fn digest_pcr_policy(h: &mut Sha256, p: &PcrPolicy) {
+    digest_u32s(h, &p.expected);
+    digest_bytes(h, &p.pcr_select);
+    // The BTreeMap iterates in key order: deterministic by construction.
+    h.update((p.values.len() as u32).to_be_bytes());
+    for (k, v) in &p.values {
+        h.update(k.to_be_bytes());
+        digest_bytes(h, v);
+    }
+}
+
+fn digest_unit_health(h: &mut Sha256, u: &UnitHealth) {
+    digest_bytes(h, u.name.as_bytes());
+    digest_bool(h, u.up);
+    digest_opt(h, &u.heartbeat, |h, v| digest_u64(h, *v));
+}
+
+fn digest_luks(h: &mut Sha256, l: &LuksStatus) {
+    digest_bytes(h, l.device.as_bytes());
+    digest_bool(h, l.open);
+    digest_u32s(h, &l.pcr_policy);
+    digest_opt(h, &l.marker_counter, |h, v| digest_u64(h, *v));
+}
+
+fn digest_key_acl(h: &mut Sha256, k: &KeyAcl) {
+    digest_u64(h, k.handle);
+    h.update((k.operations.len() as u32).to_be_bytes());
+    for op in &k.operations {
+        digest_bytes(h, op.as_bytes());
+    }
+    digest_u32s(h, &k.pcr_policy);
+}
+
+fn digest_retry(h: &mut Sha256, r: &RetryCounters) {
+    digest_u64(h, r.warden_respawn as u64);
+    digest_u64(h, r.watchdog_reboot_guard as u64);
+}
+
+fn digest_state_log_entry(h: &mut Sha256, e: &StateLogEntry) {
+    h.update(e.prev_hash);
+    h.update(e.new_state_hash);
+    digest_bytes(h, &e.operation);
+    digest_u64(h, e.timestamp);
+    // The entry's own signature is bound into the doc digest too: the
+    // doc signature covers the WHOLE doc, every byte of every field.
+    digest_bytes(h, &e.signature);
+}
+
+/// The canonical whole-doc digest: `SHA-256(DOC_DIGEST_PREFIX || the
+/// canonical bytes of every WardendDoc field, in fixed order
+/// (seal_state, state_log, pcr_policy, units, luks, key_acls, retry))`.
+/// `doc_signature` is EXCLUDED (the signed container never includes its
+/// own signature).
+///
+/// This is the single source of truth: seald signs THIS digest (the HSM
+/// sign path, the key never leaves seald) and `WardendVerifier::verify`
+/// recomputes THIS digest from the decoded doc. Never fork this function.
+pub fn canonical_doc_digest(doc: &WardendDoc) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(DOC_DIGEST_PREFIX);
+    digest_opt(&mut h, &doc.seal_state, digest_seal_state);
+    h.update((doc.state_log.len() as u32).to_be_bytes());
+    for e in &doc.state_log {
+        digest_state_log_entry(&mut h, e);
+    }
+    digest_opt(&mut h, &doc.pcr_policy, digest_pcr_policy);
+    h.update((doc.units.len() as u32).to_be_bytes());
+    for u in &doc.units {
+        digest_unit_health(&mut h, u);
+    }
+    digest_opt(&mut h, &doc.luks, digest_luks);
+    h.update((doc.key_acls.len() as u32).to_be_bytes());
+    for k in &doc.key_acls {
+        digest_key_acl(&mut h, k);
+    }
+    digest_opt(&mut h, &doc.retry, digest_retry);
+    h.finalize().into()
 }
 
 /// A state-log entry (the wardend hash-chained log entry: the mechanism is
@@ -293,6 +459,33 @@ impl Verifier for WardendVerifier {
         let doc: WardendDoc = serde_json::from_slice(&ev.doc.0)
             .map_err(|e| format!("wardend: malformed evidence doc: {e}"))?;
 
+        // 0. The whole-doc signature (I-2: byte-attestation of the
+        //    platform doc). FIRST, before any structural check: the
+        //    signature covers every byte of the doc, so it is the
+        //    strongest check and the structural checks below are defense
+        //    in depth. The client re-derives the canonical digest from
+        //    the decoded doc and verifies the HSM signature with the SAME
+        //    anchor key it uses for the state log. An absent anchor, a
+        //    non-64-byte signature, a wrong key, or a byte-flipped doc
+        //    all fail closed.
+        let public = ev
+            .anchors
+            .get(ANCHOR_SEALD_PUBLIC)
+            .or_else(|| ev.anchors.get(ANCHOR_HSM_PUBLIC))
+            .ok_or("wardend: the seald HSM public key is missing (cannot verify the doc signature)")?;
+        let signer = P256Signer::from_uncompressed(&public.0)?;
+        let doc_signature = ev
+            .anchors
+            .get(ANCHOR_DOC_SIGNATURE)
+            .ok_or("wardend: the doc signature is missing (unsigned platform doc)")?;
+        let digest = canonical_doc_digest(&doc);
+        if !signer.verify(&digest, &doc_signature.0) {
+            return Err(
+                "wardend: the doc signature does not verify (tampered or unsigned platform doc)"
+                    .to_string(),
+            );
+        }
+
         // 1. The seal state (the latch posture + the state hash). A
         //    SEALED latch with an empty state is corrupt (a sealed latch
         //    must anchor to a non-empty state). A malleable (fresh,
@@ -306,14 +499,12 @@ impl Verifier for WardendVerifier {
 
         // 2. The state chain (the hash-chained log): every entry's
         //    prev_hash link + every signature, via the seald HSM public
-        //    key. A tampered chain is an Err (fail-closed).
+        //    key. A tampered chain is an Err (fail-closed). (The doc
+        //    signature above already binds every entry byte; the chain
+        //    check is defense in depth — and it is what pins the chain
+        //    LINKS, which the signature proves the bytes of but not the
+        //    sequence semantics.)
         if !doc.state_log.is_empty() {
-            let public = ev
-                .anchors
-                .get(ANCHOR_SEALD_PUBLIC)
-                .or_else(|| ev.anchors.get(ANCHOR_HSM_PUBLIC))
-                .ok_or("wardend: the seald HSM public key is missing (cannot verify the state chain)")?;
-            let signer = P256Signer::from_uncompressed(&public.0)?;
             // The genesis constant: the first entry's prev_hash is the
             // genesis (the seald's StateLog genesis is a fixed constant;
             // here we verify the chain from the first entry's prev_hash,
@@ -457,10 +648,24 @@ fn pcr_policy_covers(pcr_select: &[u8], expected: &[u32]) -> bool {
 /// Build the wardend evidence channel (the seald admin face produces this
 /// in-process: the wardend doc is JSON-encoded into the Evidence.doc, and
 /// the seald HSM's P-256 public key is the anchor).
-pub fn build_wardend_evidence(doc: &WardendDoc, seald_public: &[u8]) -> Result<Evidence, String> {
+///
+/// `doc_signature` is the 64-byte `r || s` HSM signature over
+/// `canonical_doc_digest(doc)`, computed by the CALLER (the seald admin
+/// face, over its own HSM sign path — the key never leaves seald). The
+/// crate stays key-less: it carries + verifies signatures, it never
+/// signs. The signature rides the anchors map (the same structure the
+/// client already reads for the public key): the doc JSON stays byte-pure
+/// under the digest, and there is no new container and no wire-format
+/// change.
+pub fn build_wardend_evidence(
+    doc: &WardendDoc,
+    seald_public: &[u8],
+    doc_signature: Vec<u8>,
+) -> Result<Evidence, String> {
     let bytes = serde_json::to_vec(doc).map_err(|e| format!("wardend: encode: {e}"))?;
     let mut anchors = std::collections::BTreeMap::new();
     anchors.insert(ANCHOR_SEALD_PUBLIC.to_string(), B64::new(seald_public.to_vec()));
+    anchors.insert(ANCHOR_DOC_SIGNATURE.to_string(), B64::new(doc_signature));
     Ok(Evidence {
         channel: WARDEND_CHANNEL.to_string(),
         doc: B64::new(bytes),
@@ -497,6 +702,32 @@ mod tests {
         // RFC6979 nonce).
         let sig: p256::ecdsa::Signature = sk.sign_prehash(hash).unwrap();
         sig.to_bytes().to_vec()
+    }
+
+    /// Build signed wardend evidence (the seald admin face's path: the
+    /// caller computes `canonical_doc_digest`, signs it, and passes the
+    /// signature in). The test stand-in for `wardend_evidence()`.
+    fn build_signed(doc: &WardendDoc, sk: &p256::ecdsa::SigningKey, point: &[u8]) -> Evidence {
+        let digest = canonical_doc_digest(doc);
+        let sig = sign_hash(sk, &digest);
+        build_wardend_evidence(doc, point, sig).unwrap()
+    }
+
+    /// A minimal verification bundle (the wardend channel needs only the
+    /// evidence + the nonce; the core channels are absent = NOT PROVEN,
+    /// which the platform verifier does not consult).
+    fn test_bundle(ev: &Evidence) -> bootproof::wire::Bundle {
+        bootproof::wire::Bundle {
+            v: bootproof::wire::BUNDLE_V,
+            nonce: B64::new([0x42u8; 32].to_vec()),
+            node: bootproof::wire::Node {
+                id: "wardend-test".into(),
+                platform: "baremetal".into(),
+            },
+            evidence: vec![ev.clone()],
+            keys: None,
+            metadata: None,
+        }
     }
 
     // (a) a valid P-256 public key parses (the 65-byte uncompressed point).
@@ -582,7 +813,7 @@ mod tests {
     // (f) the build_wardend_evidence produces a well-formed Evidence.
     #[test]
     fn build_wardend_evidence_produces_a_well_formed_evidence() {
-        let (_sk, point) = test_signer_key();
+        let (sk, point) = test_signer_key();
         let doc = WardendDoc {
             seal_state: Some(SealState {
                 posture: LatchPosture::Malleable,
@@ -595,12 +826,16 @@ mod tests {
             key_acls: Vec::new(),
             retry: None,
         };
-        let ev = build_wardend_evidence(&doc, &point).unwrap();
+        let ev = build_signed(&doc, &sk, &point);
         assert_eq!(ev.channel, WARDEND_CHANNEL);
         assert!(ev.anchors.contains_key(ANCHOR_SEALD_PUBLIC));
         // The doc decodes from the evidence.
         let decoded: WardendDoc = serde_json::from_slice(&ev.doc.0).unwrap();
         assert_eq!(decoded.seal_state.unwrap().posture, LatchPosture::Malleable);
+        // The signature rides the anchors map (the caller's signature is
+        // stamped beside the public key: the structure the client already
+        // reads, 64 bytes r || s).
+        assert_eq!(ev.anchors[ANCHOR_DOC_SIGNATURE].0.len(), 64);
     }
 
     // (g) the wardend verifier verifies a well-formed doc (the seal state
@@ -651,20 +886,10 @@ mod tests {
             key_acls: Vec::new(),
             retry: None,
         };
-        let ev = build_wardend_evidence(&doc, &point).unwrap();
+        let ev = build_signed(&doc, &sk, &point);
         let verifier = WardendVerifier;
         let nonce = [0x42u8; 32];
-        let bundle = bootproof::wire::Bundle {
-            v: bootproof::wire::BUNDLE_V,
-            nonce: B64::new(nonce.to_vec()),
-            node: bootproof::wire::Node {
-                id: "wardend-test".into(),
-                platform: "baremetal".into(),
-            },
-            evidence: vec![ev.clone()],
-            keys: None,
-            metadata: None,
-        };
+        let bundle = test_bundle(&ev);
         assert!(
             verifier.verify(&ev, &nonce, &bundle).is_ok(),
             "a well-formed wardend doc verifies"
@@ -719,20 +944,14 @@ mod tests {
             key_acls: Vec::new(),
             retry: None,
         };
-        let ev = build_wardend_evidence(&doc, &point).unwrap();
+        // Sign the TAMPERED doc (so the doc signature itself is valid):
+        // the chain check must be what rejects it (defense in depth —
+        // the doc signature binds the bytes, the chain check owns the
+        // link semantics).
+        let ev = build_signed(&doc, &sk, &point);
         let verifier = WardendVerifier;
         let nonce = [0x42u8; 32];
-        let bundle = bootproof::wire::Bundle {
-            v: bootproof::wire::BUNDLE_V,
-            nonce: B64::new(nonce.to_vec()),
-            node: bootproof::wire::Node {
-                id: "wardend-test".into(),
-                platform: "baremetal".into(),
-            },
-            evidence: vec![ev.clone()],
-            keys: None,
-            metadata: None,
-        };
+        let bundle = test_bundle(&ev);
         assert!(
             verifier.verify(&ev, &nonce, &bundle).is_err(),
             "a tampered state chain is detected"
@@ -742,7 +961,7 @@ mod tests {
     // (i) an empty seal state is an Err (fail-closed).
     #[test]
     fn an_empty_seal_state_is_an_error() {
-        let (_sk, point) = test_signer_key();
+        let (sk, point) = test_signer_key();
         let doc = WardendDoc {
             seal_state: Some(SealState {
                 posture: LatchPosture::Sealed,
@@ -755,20 +974,10 @@ mod tests {
             key_acls: Vec::new(),
             retry: None,
         };
-        let ev = build_wardend_evidence(&doc, &point).unwrap();
+        let ev = build_signed(&doc, &sk, &point);
         let verifier = WardendVerifier;
         let nonce = [0x42u8; 32];
-        let bundle = bootproof::wire::Bundle {
-            v: bootproof::wire::BUNDLE_V,
-            nonce: B64::new(nonce.to_vec()),
-            node: bootproof::wire::Node {
-                id: "wardend-test".into(),
-                platform: "baremetal".into(),
-            },
-            evidence: vec![ev.clone()],
-            keys: None,
-            metadata: None,
-        };
+        let bundle = test_bundle(&ev);
         assert!(
             verifier.verify(&ev, &nonce, &bundle).is_err(),
             "an empty seal state is an error"
@@ -780,7 +989,7 @@ mod tests {
     // anchor; the check is posture-aware (only sealed + empty is corrupt).
     #[test]
     fn a_malleable_empty_seal_state_is_not_an_error() {
-        let (_sk, point) = test_signer_key();
+        let (sk, point) = test_signer_key();
         let doc = WardendDoc {
             seal_state: Some(SealState {
                 posture: LatchPosture::Malleable,
@@ -793,23 +1002,281 @@ mod tests {
             key_acls: Vec::new(),
             retry: None,
         };
-        let ev = build_wardend_evidence(&doc, &point).unwrap();
+        let ev = build_signed(&doc, &sk, &point);
         let verifier = WardendVerifier;
         let nonce = [0x42u8; 32];
-        let bundle = bootproof::wire::Bundle {
-            v: bootproof::wire::BUNDLE_V,
-            nonce: B64::new(nonce.to_vec()),
-            node: bootproof::wire::Node {
-                id: "wardend-test".into(),
-                platform: "baremetal".into(),
-            },
-            evidence: vec![ev.clone()],
-            keys: None,
-            metadata: None,
-        };
+        let bundle = test_bundle(&ev);
         assert!(
             verifier.verify(&ev, &nonce, &bundle).is_ok(),
             "a malleable latch with an empty state is legitimate (not corrupt)"
+        );
+    }
+
+    // =========================================================================
+    // I-2: the whole-doc signature (byte-attestation of the platform doc).
+    // Positive first, then the negative battery: EVERY negative asserts
+    // verify() FAILS (a passing negative here is a false green).
+    // =========================================================================
+
+    /// The golden doc (every field populated: the canonicalization
+    /// covers all seven fields, all four nested structs, both Option
+    /// arms, and a non-empty BTreeMap). The state-log entry is signed by
+    /// the test key (the chain check still runs, defense in depth; the
+    /// RFC6979 nonce is deterministic, so the golden digest is stable).
+    /// The PCR select is the production 6-byte TPMS_PCR_SELECTION shape
+    /// (hash u16, size u8 = 3, pcrSelect[3]) covering the expected set
+    /// {4,5,7,9,11}: byte 0 bits 4/5/7 = 0xb0, byte 1 bits 1/3 = 0x0a.
+    fn golden_doc() -> WardendDoc {
+        let (sk, _point) = test_signer_key();
+        let mut values = std::collections::BTreeMap::new();
+        values.insert(7u32, vec![0xa7u8; 32]);
+        values.insert(11u32, vec![0xb1u8; 32]);
+        let mut entry = StateLogEntry {
+            prev_hash: [0x57u8; 32],
+            new_state_hash: [0x01u8; 32],
+            operation: b"genesis".to_vec(),
+            timestamp: 1700000000,
+            signature: Vec::new(),
+        };
+        entry.signature = sign_hash(&sk, &entry.entry_hash());
+        WardendDoc {
+            seal_state: Some(SealState {
+                posture: LatchPosture::Sealed,
+                state: b"golden-state".to_vec(),
+            }),
+            state_log: vec![entry],
+            pcr_policy: Some(PcrPolicy {
+                expected: vec![4, 5, 7, 9, 11],
+                pcr_select: vec![0x00, 0x0b, 0x03, 0xb0, 0x0a, 0x00],
+                values,
+            }),
+            units: vec![
+                UnitHealth {
+                    name: "seald".into(),
+                    up: true,
+                    heartbeat: Some(1700000001),
+                },
+                UnitHealth {
+                    name: "keepd".into(),
+                    up: false,
+                    heartbeat: None,
+                },
+            ],
+            luks: Some(LuksStatus {
+                device: "/dev/nvme1n1".into(),
+                open: true,
+                pcr_policy: vec![7, 9],
+                marker_counter: Some(42),
+            }),
+            key_acls: vec![KeyAcl {
+                handle: 0x68736d5f61636c31,
+                operations: vec!["sign".into(), "unseal".into()],
+                pcr_policy: vec![4, 7, 9],
+            }],
+            retry: Some(RetryCounters {
+                warden_respawn: 3,
+                watchdog_reboot_guard: 1,
+            }),
+        }
+    }
+
+    // (k) POSITIVE-FIRST: the golden doc round-trips (signed build ->
+    //     verify Ok). This is the witness that every negative below
+    //     rejects a tamper and NOT a broken happy path.
+    #[test]
+    fn the_golden_signed_doc_verifies() {
+        let (sk, point) = test_signer_key();
+        let doc = golden_doc();
+        let ev = build_signed(&doc, &sk, &point);
+        let bundle = test_bundle(&ev);
+        assert!(
+            WardendVerifier.verify(&ev, &[0x42u8; 32], &bundle).is_ok(),
+            "the golden signed doc verifies"
+        );
+    }
+
+    // (l) the golden digest vector: the parity pin. ONE implementation
+    //     (canonical_doc_digest) is used by BOTH sides (the wardend seal
+    //     crate consumes THIS function — the parity is structural), but
+    //     this vector pins the BYTES: a refactor that silently changes the
+    //     canonicalization changes the digest and fails here. The wardend
+    //     D-cycle records carry the same hex.
+    #[test]
+    fn the_canonical_doc_digest_golden_vector() {
+        let digest = canonical_doc_digest(&golden_doc());
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex, GOLDEN_DIGEST_HEX,
+            "the canonical doc digest changed: the canonicalization must stay pinned (both sign + verify sides consume this single implementation)"
+        );
+    }
+
+    /// The pinned golden digest (computed from canonical_doc_digest over
+    /// golden_doc(), pinned at I-2 landing: 1a6c06ff...4a10).
+    const GOLDEN_DIGEST_HEX: &str = "1a6c06ffdcaf4aec3e22c15a81d076544083007d4406c757585f50bd68884a10";
+
+    // (m) NEGATIVE: flip one byte in units AFTER signing -> verify FAILS.
+    //     (The doc the verifier decodes differs from the doc that was
+    //     signed: the digest differs, the signature does not verify.)
+    #[test]
+    fn a_flipped_unit_byte_after_signing_fails_verification() {
+        let (sk, point) = test_signer_key();
+        let mut doc = golden_doc();
+        let sig = sign_hash(&sk, &canonical_doc_digest(&doc));
+        // Tamper AFTER signing: flip the second unit's up bit.
+        doc.units[1].up = true;
+        let ev = build_wardend_evidence(&doc, &point, sig).unwrap();
+        let bundle = test_bundle(&ev);
+        assert!(
+            WardendVerifier.verify(&ev, &[0x42u8; 32], &bundle).is_err(),
+            "a flipped byte in units after signing must fail the doc signature"
+        );
+    }
+
+    // (m2) NEGATIVE: flip one byte in key_acls AFTER signing -> FAILS
+    //      (the key-ACL table is the table the D-page renders from the
+    //      I-1 fill: it is the fact this increment exists to attest).
+    #[test]
+    fn a_flipped_key_acl_byte_after_signing_fails_verification() {
+        let (sk, point) = test_signer_key();
+        let mut doc = golden_doc();
+        let sig = sign_hash(&sk, &canonical_doc_digest(&doc));
+        doc.key_acls[0].operations.push("decrypt".into());
+        let ev = build_wardend_evidence(&doc, &point, sig).unwrap();
+        let bundle = test_bundle(&ev);
+        assert!(
+            WardendVerifier.verify(&ev, &[0x42u8; 32], &bundle).is_err(),
+            "an appended operation in key_acls after signing must fail the doc signature"
+        );
+    }
+
+    // (n) NEGATIVE: an absent doc_signature anchor -> verify FAILS
+    //     (an unsigned doc is not a degraded doc: it is unverified).
+    #[test]
+    fn an_absent_doc_signature_fails_verification() {
+        let (sk, point) = test_signer_key();
+        let doc = golden_doc();
+        let mut ev = build_signed(&doc, &sk, &point);
+        ev.anchors.remove(ANCHOR_DOC_SIGNATURE);
+        let bundle = test_bundle(&ev);
+        assert!(
+            WardendVerifier.verify(&ev, &[0x42u8; 32], &bundle).is_err(),
+            "an absent doc signature must fail closed"
+        );
+    }
+
+    // (n2) NEGATIVE: an empty doc_signature (Some-shape with zero bytes)
+    //      -> verify FAILS.
+    #[test]
+    fn an_empty_doc_signature_fails_verification() {
+        let (_sk, point) = test_signer_key();
+        let doc = golden_doc();
+        let ev = build_wardend_evidence(&doc, &point, Vec::new()).unwrap();
+        let bundle = test_bundle(&ev);
+        assert!(
+            WardendVerifier.verify(&ev, &[0x42u8; 32], &bundle).is_err(),
+            "an empty doc signature must fail closed"
+        );
+    }
+
+    // (n3) NEGATIVE: a wrong-length doc_signature (63 bytes) -> FAILS.
+    #[test]
+    fn a_wrong_length_doc_signature_fails_verification() {
+        let (sk, point) = test_signer_key();
+        let doc = golden_doc();
+        let mut sig = sign_hash(&sk, &canonical_doc_digest(&doc));
+        sig.truncate(63);
+        let ev = build_wardend_evidence(&doc, &point, sig).unwrap();
+        let bundle = test_bundle(&ev);
+        assert!(
+            WardendVerifier.verify(&ev, &[0x42u8; 32], &bundle).is_err(),
+            "a truncated doc signature must fail closed"
+        );
+    }
+
+    // (o) NEGATIVE: signed by a DIFFERENT key (the anchor key is the real
+    //     one, the signer is an attacker key) -> verify FAILS.
+    #[test]
+    fn a_doc_signature_from_a_different_key_fails_verification() {
+        let (_sk, point) = test_signer_key();
+        // A second key (a different scalar).
+        let mut scalar = [0u8; 32];
+        scalar[31] = 7;
+        let attacker = p256::ecdsa::SigningKey::from_slice(&scalar).unwrap();
+        let doc = golden_doc();
+        let sig = sign_hash(&attacker, &canonical_doc_digest(&doc));
+        let ev = build_wardend_evidence(&doc, &point, sig).unwrap();
+        let bundle = test_bundle(&ev);
+        assert!(
+            WardendVerifier.verify(&ev, &[0x42u8; 32], &bundle).is_err(),
+            "a doc signature from a key that is not the anchor must fail"
+        );
+    }
+
+    // (p) NEGATIVE: None replaced by Some(empty) changes the digest ->
+    //     verify FAILS (the presence-tag binding: 0x00 vs 0x01 + the
+    //     canonical empty bytes must never collide).
+    #[test]
+    fn none_versus_some_empty_changes_the_digest() {
+        let (sk, point) = test_signer_key();
+        // seal_state: None vs Some(malleable + empty state).
+        let mut doc = golden_doc();
+        doc.seal_state = None;
+        let sig = sign_hash(&sk, &canonical_doc_digest(&doc));
+        let mut swapped = golden_doc();
+        swapped.seal_state = Some(SealState {
+            posture: LatchPosture::Malleable,
+            state: Vec::new(),
+        });
+        assert_ne!(
+            canonical_doc_digest(&doc),
+            canonical_doc_digest(&swapped),
+            "None and Some(empty) must never share a digest"
+        );
+        let ev = build_wardend_evidence(&swapped, &point, sig).unwrap();
+        let bundle = test_bundle(&ev);
+        assert!(
+            WardendVerifier.verify(&ev, &[0x42u8; 32], &bundle).is_err(),
+            "a None signed doc presented as Some(empty) must fail verification"
+        );
+        // heartbeat: None vs Some(0) (the per-field presence tag).
+        let mut a = golden_doc();
+        a.units[1].heartbeat = None;
+        let mut b = golden_doc();
+        b.units[1].heartbeat = Some(0);
+        assert_ne!(
+            canonical_doc_digest(&a),
+            canonical_doc_digest(&b),
+            "heartbeat None and Some(0) must never share a digest"
+        );
+    }
+
+    // (q) NEGATIVE (domain separation): a state-log entry signature NEVER
+    //     verifies as the doc signature, and vice versa (the same key
+    //     signs both; the doc digest is prefixed, the entry hash is not).
+    #[test]
+    fn a_state_log_entry_signature_never_verifies_as_the_doc_signature() {
+        let (sk, point) = test_signer_key();
+        let signer = P256Signer::from_uncompressed(&point).unwrap();
+        let doc = golden_doc();
+        let entry = &doc.state_log[0];
+        let doc_digest = canonical_doc_digest(&doc);
+        // Same key, both messages: an entry signature does not verify
+        // over the doc digest...
+        let entry_sig = sign_hash(&sk, &entry.entry_hash());
+        assert!(
+            !signer.verify(&doc_digest, &entry_sig),
+            "a state-log entry signature must NEVER verify as the doc signature"
+        );
+        // ...and the doc signature does not verify over the entry hash.
+        let doc_sig = sign_hash(&sk, &doc_digest);
+        assert!(
+            signer.verify(&doc_digest, &doc_sig),
+            "positive-first: the doc signature verifies over the doc digest"
+        );
+        assert!(
+            !signer.verify(&entry.entry_hash(), &doc_sig),
+            "the doc signature must NEVER verify over an entry hash"
         );
     }
 }

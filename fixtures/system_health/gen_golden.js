@@ -224,6 +224,47 @@ function signDet(pubKey, dBuf, msg) {
   return sig;
 }
 
+// signDetPrehashed: the PREHASHED form of signDet (sign an already-
+// computed 32-byte digest, do NOT hash again). The whole-doc digest is
+// already SHA-256 output, so the doc signature is signDetPrehashed of the
+// digest (the Rust P256Signer verifies it with verify_prehashed over the
+// same digest). Self-checked with a pure-BigInt ECDSA verify (Node's
+// crypto.verify re-hashes for EC and cannot check a prehash signature),
+// so a corrupt prehash signature fails at generation time, never ships.
+function signDetPrehashed(pubKey, dBuf, digest) {
+  const sig = rfc6979Sign(dBuf, digest);
+  const r = BigInt('0x' + sig.subarray(0, 32).toString('hex'));
+  const s = BigInt('0x' + sig.subarray(32, 64).toString('hex'));
+  // Node's crypto.verify re-hashes its input for EC (it is NOT a prehash
+  // API), so it cannot self-check a prehash signature. Verify in pure
+  // BigInt instead, over the public point + the digest directly: the SAME
+  // ECDSA equation the Rust P256Signer runs in verify_prehashed (R =
+  // u1*G + u2*Q, accept iff R.x mod n == r). A corrupt prehash signature
+  // fails here at generation time, never ships.
+  const z = BigInt('0x' + digest.toString('hex'));
+  if (r <= 0n || r >= ECC_N || s <= 0n || s >= ECC_N) {
+    throw new Error('prehash signature: r/s out of range');
+  }
+  const sInv = invMod(s, ECC_N);
+  const u1 = bmod(z * sInv, ECC_N);
+  const u2 = bmod(r * sInv, ECC_N);
+  const G = [ECC_GX, ECC_GY];
+  // The public point from the SEC1 uncompressed encoding (0x04 || x || y).
+  const pub = pubKey; // the KeyObject; use its raw public bytes.
+  const raw = pub.export({ type: 'spki', format: 'der' });
+  // The trailing 65 bytes of the P-256 SPKI are the uncompressed point.
+  const point = raw.subarray(raw.length - 65);
+  if (point[0] !== 0x04) throw new Error('prehash self-check: public point not uncompressed');
+  const qx = BigInt('0x' + point.subarray(1, 33).toString('hex'));
+  const qy = BigInt('0x' + point.subarray(33, 65).toString('hex'));
+  const R = ptAdd(ptMul(u1, G), ptMul(u2, [qx, qy]));
+  if (!R) throw new Error('prehash self-check: R is the point at infinity');
+  if (bmod(R[0], ECC_N) !== r) {
+    throw new Error("RFC 6979 prehashed signature failed the BigInt ECDSA self-check");
+  }
+  return sig;
+}
+
 // A P-256 keypair from a fixed scalar: SEC1 ECPrivateKey -> PKCS8 -> Node
 // KeyObject. Fixed digits of e/pi/sqrt2 as scalars: clearly synthetic.
 function keyFromScalar(hexStr) {
@@ -302,6 +343,82 @@ for (let b = 0; b < 3; b++) for (let i = 0; i < 8; i++) if (SEL_BYTES[b] & (1 <<
 const pcrValues = {};
 for (const i of PCR_INDICES) pcrValues[i] = sha256(Buffer.from('bootproof golden pcr ' + i));
 
+// ---------------------------------------------------------------------------
+// The canonical whole-doc digest (I-2 byte-attestation): the JS mirror of
+// the Rust bootproof_platform_wardend::canonical_doc_digest. ONE wire
+// shape, two implementations pinned against each other by the
+// GOLDEN_DOC_DIGEST_HEX assertion below (the Rust side pins the SAME hex
+// in the plugin crate's tests). If this drifts, generation fails loudly.
+// The discipline mirrors the Rust: domain prefix; fixed field order
+// (seal_state, state_log, pcr_policy, units, luks, key_acls, retry); a
+// 1-byte presence tag per Optional (None = 0x00 + nothing, so None !=
+// Some(empty)); 4-byte BE lengths for bytes/strings/lists; fixed-width BE
+// integers; bools as single bytes.
+// ---------------------------------------------------------------------------
+const DOC_DIGEST_PREFIX = Buffer.from('wardend/platform-doc-digest/v1');
+const dBytes = (b) => Buffer.concat([u32(b.length), Buffer.from(b)]);
+const dU64 = (v) => u64(v);
+const dBool = (b) => Buffer.from([b ? 1 : 0]);
+const dOpt = (v, f) => (v === undefined || v === null ? Buffer.from([0]) : Buffer.concat([Buffer.from([1]), f(v)]));
+const dU32s = (arr) => Buffer.concat([u32(arr.length), ...arr.map((x) => u32(x))])
+const canonicalDocDigest = (doc) => sha256(Buffer.concat([
+  DOC_DIGEST_PREFIX,
+  dOpt(doc.seal_state, (s) => Buffer.concat([
+    Buffer.from([s.posture === 'sealed' ? 1 : 0]),
+    dBytes(s.state),
+  ])),
+  Buffer.concat([
+    u32(doc.state_log.length),
+    ...doc.state_log.map((e) => Buffer.concat([
+      Buffer.from(e.prev_hash),
+      Buffer.from(e.new_state_hash),
+      dBytes(e.operation),
+      dU64(e.timestamp),
+      dBytes(e.signature),
+    ])),
+  ]),
+  dOpt(doc.pcr_policy, (p) => Buffer.concat([
+    dU32s(p.expected),
+    dBytes(p.pcr_select),
+    // JSON object key order: Rust canonicalizes the BTreeMap by ascending
+    // numeric key; sort numerically here to match (a generator with string
+    // insertion order would drift).
+    Buffer.concat([
+      u32(Object.keys(p.values).length),
+      ...Object.keys(p.values)
+        .map(Number)
+        .sort((a, b) => a - b)
+        .flatMap((k) => [u32(k), dBytes(p.values[k])]),
+    ]),
+  ])),
+  Buffer.concat([
+    u32(doc.units.length),
+    ...doc.units.map((u) => Buffer.concat([
+      dBytes(Buffer.from(u.name, 'utf8')),
+      dBool(u.up),
+      dOpt(u.heartbeat, dU64),
+    ])),
+  ]),
+  dOpt(doc.luks, (l) => Buffer.concat([
+    dBytes(Buffer.from(l.device, 'utf8')),
+    dBool(l.open),
+    dU32s(l.pcr_policy),
+    dOpt(l.marker_counter, dU64),
+  ])),
+  Buffer.concat([
+    u32(doc.key_acls.length),
+    ...doc.key_acls.map((k) => Buffer.concat([
+      dU64(k.handle),
+      Buffer.concat([
+        u32(k.operations.length),
+        ...k.operations.map((op) => dBytes(Buffer.from(op, 'utf8'))),
+      ]),
+      dU32s(k.pcr_policy),
+    ])),
+  ]),
+  dOpt(doc.retry, (r) => Buffer.concat([dU64(r.warden_respawn), dU64(r.watchdog_reboot_guard)])),
+]));
+
 const wardendDocObj = {
   seal_state: { posture: 'sealed', state: u8arr(st1) },
   state_log: [log0, log1],
@@ -318,6 +435,30 @@ const wardendDocObj = {
 // The canonical wardend doc bytes: what BOTH verifiers decode, what the
 // fold measures, what a byte-level tamper must break.
 const WARDEND_DOC = Buffer.from(JSON.stringify(wardendDocObj));
+
+// I-2: the whole-doc signature. The HSM signs the canonical digest of
+// THIS doc (every field; never the signature itself: the signature rides
+// the evidence ANCHORS map, so the doc bytes below are byte-pure under
+// the digest and the PCR22 fold input is untouched by construction).
+// The RFC6979 nonce keeps the fixture byte-stable across regenerations.
+const WARDEND_DOC_DIGEST = canonicalDocDigest(wardendDocObj);
+const WARDEND_DOC_SIG = signDetPrehashed(HSM.pub, HSM.d, WARDEND_DOC_DIGEST);
+// The parity pin. This is the digest of THE FIXTURE's wardend doc (not
+// the plugin crate's internal golden-doc vector, which is a different
+// document). Two independent witnesses pin this one value: (1) the JS
+// mirror here (drift fails at generation time), (2) the Rust plugin
+// integration test recomputes canonical_doc_digest over the fixture's
+// DECODED doc and asserts this hex (drift fails at cargo test time). The
+// JS side computing this hex over the fixture doc bytes and the Rust side
+// asserting the same hex IS the cross-implementation parity witness:
+// same bytes, two canonicalizations, one vector.
+const FIXTURE_DOC_DIGEST_HEX = '5df1b76eaeb4b6332e534712a76db6881e6720accdacf42b7d718a55964e9dd2';
+if (hexOf(WARDEND_DOC_DIGEST) !== FIXTURE_DOC_DIGEST_HEX) {
+  throw new Error(
+    'doc-digest parity FAILED: the JS canonicalDocDigest drifted from the pinned vector\n' +
+    '  js:    ' + hexOf(WARDEND_DOC_DIGEST) + '\n  pinned: ' + FIXTURE_DOC_DIGEST_HEX,
+  );
+}
 
 // PCR22 is the fold of the OTHER channels' docs (evidence order snp,
 // wardend): reset to zero, then extended with H(concat).
@@ -395,7 +536,7 @@ const bundle = {
   evidence: [
     { channel: 'snp', doc: b64(REPORT), anchors: { vlek: b64(VLEK_DER), asvk: b64(ASVK_DER), ark: b64(ARK_DER) } },
     { channel: 'tpm2', doc: b64(TPM_DOC), anchors: { ek_cert: b64(EK_BLOB) } },
-    { channel: 'wardend', doc: b64(WARDEND_DOC), anchors: { hsm_public: b64(HSM.point) } },
+    { channel: 'wardend', doc: b64(WARDEND_DOC), anchors: { hsm_public: b64(HSM.point), doc_signature: b64(WARDEND_DOC_SIG) } },
   ],
   keys: { sign: { pub_: b64(signPublic), curve: 'P-256', scheme: 'ecdsa-sha256', pcr_policy: Array.from(PCR_INDICES) } },
 };
@@ -456,6 +597,15 @@ const tLog = clone(envelope);    // log-tamper: flip a byte in entry 1's op.
 const tNoSnp = clone(envelope);  // missing-snp: the channel dropped.
 tNoSnp.bundle.evidence = tNoSnp.bundle.evidence.filter((e) => e.channel !== 'snp');
 
+const tNoSig = clone(envelope);  // unsigned-doc: the doc signature dropped
+{
+  // from the wardend anchors (the doc bytes are the golden's: this is
+  // exactly the pre-I-2 shape — a valid doc with no byte-attestation —
+  // and the Rust verifier must reject it fail-closed).
+  const ev = tNoSig.bundle.evidence.find((e) => e.channel === 'wardend');
+  delete ev.anchors.doc_signature;
+}
+
 // ---------------------------------------------------------------------------
 // Write.
 // ---------------------------------------------------------------------------
@@ -464,6 +614,7 @@ write('golden.json', envelope);
 write('golden.snp-tamper.json', tSnap);
 write('golden.log-tamper.json', tLog);
 write('golden.missing-snp.json', tNoSnp);
+write('golden.unsigned-doc.json', tNoSig);
 write('golden.meta.json', {
   // The harness + tests read the frozen nonce from here. The expected
   // VERDICTS deliberately do NOT live here: they are hardcoded in the
@@ -472,7 +623,14 @@ write('golden.meta.json', {
   // never quietly move the goalposts: a verdict change is a test edit.
   nonce_hex: hexOf(NONCE),
   hsm_spki_pin: HSM_PIN,
+  // I-2: the fixture's wardend doc canonical digest (the JS mirror of
+  // the Rust canonical_doc_digest, pinned twice: here at generation, and
+  // in the plugin's fixture agreement test against the Rust computation
+  // over the decoded fixture doc — the cross-implementation parity pin).
+  wardend_doc_digest_hex: hexOf(WARDEND_DOC_DIGEST),
 });
 console.log('golden fixtures written to', OUT);
 console.log('nonce:', hexOf(NONCE));
 console.log('hsm pin:', HSM_PIN);
+console.log('doc digest:', hexOf(WARDEND_DOC_DIGEST));
+console.log('doc sig:', hexOf(WARDEND_DOC_SIG));
