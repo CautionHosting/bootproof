@@ -35,11 +35,18 @@
 //! future non-HTTP consumer (a WSS tunnel, the CLI's socket mode) reuses the
 //! exact same core.
 //!
-//! Transport is TCP (the documented admin-face decision: the loopback TCP
-//! face is the one the wire owner is guaranteed to reach; a UDS seam stays
-//! open behind this same function shape). Synchronous std-only: no tokio,
-//! so an async consumer calls this through `spawn_blocking` without
-//! bootproof's proxy core gaining a runtime dependency.
+//! Transport is chosen by the caller's face, not baked into the frame:
+//! [`attest_roundtrip`] is TCP (the loopback admin face a shared-netstack
+//! wire owner reaches), and [`attest_roundtrip_uds`] is a Unix-domain socket
+//! (the per-daemon-sandbox layout, where the only reachable admin face is a
+//! filesystem-permission-gated `admin.sock`, not a TCP port). Both speak the
+//! IDENTICAL len-first `[len][opcode][body]` frame with the SAME
+//! [`ProxyError`] reason contract; they differ ONLY in how they connect and
+//! in the per-face frame cap (the UDS sibling takes it as a parameter, so a
+//! face with a tighter contract than the transport default is honored, never
+//! silently loosened). Synchronous std-only: no tokio, so an async consumer
+//! calls this through `spawn_blocking` without bootproof's proxy core gaining
+//! a runtime dependency.
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, SocketAddrV4, TcpStream};
@@ -300,6 +307,123 @@ pub fn attest_roundtrip(
         OP_ATTEST => Ok(body[1..].to_vec()),
         OP_ERROR => Err(ProxyError::Refused(String::from_utf8_lossy(&body[1..]).into_owned())),
         other => Err(ProxyError::BadOpcode(other)),
+    }
+}
+
+/// One `OP_ATTEST` round-trip over a Unix-domain socket: the same frame,
+/// the same codec, the same [`ProxyError`] reason contract as
+/// [`attest_roundtrip`], connected to `path` instead of a `host:port`. This
+/// exists for the per-daemon-sandbox layout, where the admin face is a
+/// filesystem-permission-gated `admin.sock` and the TCP default address is
+/// the wire owner's own (empty) loopback: a real second consumer, not a
+/// speculative seam.
+///
+/// Two honest asymmetries vs TCP, both deliberate:
+///
+/// - **No connect timeout.** [`ProxyPolicy::connect`] is unused here, and
+///   NOT because a UDS connect "cannot block" (it can: `connect(2)` to a
+///   listening SOCK_STREAM whose accept backlog is FULL blocks until a slot
+///   frees). The narrower, true reason: TCP's `connect_timeout` exists for
+///   the blackholed/filtered-host SYN-retransmit hang (minutes), and that
+///   failure mode does not exist on UDS. The realistic UDS connect failures
+///   are `ENOENT` (no socket file) and `ECONNREFUSED` (dead listener), both
+///   instant. The ONE lingering case, a full accept backlog, means the
+///   backend process is up but wedged in accept: a whole-node fault where
+///   nothing on the box works anyway, and it is bounded by the CALLER's
+///   watchdog (the same seam-thread watchdog that covers every other
+///   blocking call into the backend), not by a per-connect knob. A bad or
+///   empty path is a [`ProxyError::Connect`] (there is no UDS analog of the
+///   TCP address-shape [`ProxyError::Addr`]); the reason shape
+///   `connect {target}: {io}` is identical, with `target` = the path.
+///
+/// - **The frame cap is a parameter, not policy-only.** `max_payload`
+///   bounds the declared response length BEFORE allocating the body, capped
+///   additionally by [`crate::protocol::MAX_PAYLOAD`] (the transport's hard
+///   ceiling), so the effective cap is `min(max_payload, MAX_PAYLOAD)`. A
+///   face whose own contract is TIGHTER than the transport default (e.g. a
+///   1 MiB page face on a 16 MiB transport default) MUST pass its cap:
+///   hardcoding the transport default here would silently LOOSEN the face's
+///   DoS bound the moment the face consolidated onto this shared transport.
+///   One transport, per-face policy via argument: the mechanism/policy split
+///   applied inside the function. The read timeout (`policy.read`) is what
+///   turns a declared-but-never-sent oversized frame into a bounded failure
+///   (refused at the cap, or `Timeout` on the silent body), so the elapsed
+///   bound is the policy, never the peer's whim.
+///
+/// Every other phase matches TCP exactly: `policy.write` bounds the request
+/// write, `policy.read` bounds both response reads, the request frame is the
+/// identical len-first `[len][OP_ATTEST][nonce32]`, and the envelope bytes
+/// return UNTOUCHED (pass-through).
+#[cfg(unix)]
+pub fn attest_roundtrip_uds(
+    path: &str,
+    nonce: &[u8; 32],
+    policy: &ProxyPolicy,
+    max_payload: usize,
+) -> Result<Vec<u8>, ProxyError> {
+    // The effective cap: the face's own bound, never above the transport's
+    // hard ceiling. Computed BEFORE connect so a nonsense cap is refused
+    // without touching the socket.
+    let cap = max_payload.min(crate::protocol::MAX_PAYLOAD);
+    let mut stream = match std::os::unix::net::UnixStream::connect(path) {
+        Ok(s) => s,
+        // No is_timeout arm: std gives no connect timeout here and the
+        // failure modes above are instant; anything non-OK is a Connect.
+        Err(e) => return Err(ProxyError::Connect(format!("connect {path}: {e}"))),
+    };
+    // SO_RCVTIMEO/SO_SNDTIMEO apply to AF_UNIX stream sockets; a timed-out
+    // read_exact then reports TimedOut/WouldBlock, which `is_timeout`
+    // already classifies identically to TCP. Set BEFORE the first read so
+    // even the `read response length` phase is bounded.
+    let _ = stream.set_read_timeout(Some(policy.read));
+    let _ = stream.set_write_timeout(Some(policy.write));
+    // The request: identical bytes to the TCP path (one codec, two
+    // transports): `[4-byte BE len][OP_ATTEST][nonce]`.
+    let frame = crate::protocol::encode_len_first(OP_ATTEST, nonce);
+    stream
+        .write_all(&frame)
+        .map_err(|e| ProxyError::WriteFailed(write_reason("write attest request", &e)))?;
+    stream
+        .flush()
+        .map_err(|e| ProxyError::WriteFailed(write_reason("flush attest request", &e)))?;
+    // The response frame, classified through the SAME reason shapes as TCP.
+    let mut len_prefix = [0u8; 4];
+    read_response(&mut stream, &mut len_prefix, "read response length")?;
+    let declared = u32::from_be_bytes(len_prefix) as usize;
+    if declared == 0 || declared > cap {
+        return Err(ProxyError::FrameSize(declared));
+    }
+    let mut body = vec![0u8; declared];
+    read_response(&mut stream, &mut body, "read response body")?;
+    // `declared > 0` is guaranteed above, so body[0] exists.
+    match body[0] {
+        OP_ATTEST => Ok(body[1..].to_vec()),
+        OP_ERROR => Err(ProxyError::Refused(String::from_utf8_lossy(&body[1..]).into_owned())),
+        other => Err(ProxyError::BadOpcode(other)),
+    }
+}
+
+/// The UDS sibling's read+classify, generic over the reader so the
+/// UnixStream path reuses the moved classification without touching the
+/// pinned TCP `read_phase` (which stays typed `&mut TcpStream` so the
+/// equivalence gate keeps comparing the seam against the ORIGINAL, not
+/// against a shared refactor). Identical reason shapes: timeout →
+/// `Timeout`, EOF mid-fill → `ShortFrame`, else `ReadFailed`, each
+/// `{phase}: {io}`. The bound is the socket option set by the caller, not a
+/// parameter here, exactly as in the TCP path.
+#[cfg(unix)]
+fn read_response<R: Read>(
+    stream: &mut R,
+    buf: &mut [u8],
+    phase: &str,
+) -> Result<(), ProxyError> {
+    match stream.read_exact(buf) {
+        Ok(()) => Ok(()),
+        Err(e) if is_timeout(&e) => Err(ProxyError::Timeout(format!("{phase}: {e}"))),
+        Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+            Err(ProxyError::ShortFrame(format!("{phase}: {e}")))
+        }
+        Err(e) => Err(ProxyError::ReadFailed(format!("{phase}: {e}"))),
     }
 }
 
@@ -741,5 +865,308 @@ mod tests {
         assert_eq!(e, ProxyError::NotUtf8);
         assert_eq!(e.status(), 502);
         assert_eq!(e.reason(), "seald returned a non-UTF-8 envelope");
+    }
+
+    /// The UDS sibling's coverage. The TCP path is the equivalence-gated
+    /// one (pinned against wardend's original); this module proves the UDS
+    /// transport speaks the SAME frame + reason contract over a
+    /// `UnixListener` fake admin face, and enforces the per-face
+    /// `max_payload` cap (the mechanism/policy split inside the fn).
+    #[cfg(unix)]
+    mod uds {
+        use super::*;
+        use std::os::unix::net::UnixListener;
+        use std::path::PathBuf;
+
+        /// A unique socket path under the process temp dir (the crate
+        /// convention; no new `tempfile` dep). The `.sock` suffix + pid +
+        /// nanos keeps parallel tests from colliding.
+        fn uds_path(label: &str) -> PathBuf {
+            std::env::temp_dir().join(format!(
+                "bootproof-uds-{label}-{}-{}.sock",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))
+        }
+
+        /// Bind a fake admin face ON THE CALLING THREAD (so the socket file
+        /// exists before any client connects), then answer exactly one
+        /// request frame with `f(request_payload)`. Returns the path; the
+        /// listener is moved into the thread and unlinked on its drop.
+        fn fake_uds_admin<F>(label: &str, f: F) -> PathBuf
+        where
+            F: FnOnce(&[u8]) -> Vec<u8> + Send + 'static,
+        {
+            let path = uds_path(label);
+            let listener = UnixListener::bind(&path).unwrap();
+            std::thread::spawn(move || {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut len = [0u8; 4];
+                    if stream.read_exact(&mut len).is_err() {
+                        return;
+                    }
+                    let n = u32::from_be_bytes(len) as usize;
+                    if n == 0 || n > crate::protocol::MAX_PAYLOAD {
+                        return;
+                    }
+                    let mut req = vec![0u8; n];
+                    if stream.read_exact(&mut req).is_err() {
+                        return;
+                    }
+                    let out = f(&req);
+                    let _ = stream.write_all(&out);
+                    let _ = stream.flush();
+                }
+                // `listener` drops here, unlinking the socket file.
+            });
+            path
+        }
+
+        #[test]
+        fn a_good_uds_round_trip_returns_the_envelope_bytes_untouched() {
+            let envelope = br#"{"bundle":{},"facts":[],"nonce":"ab"}"#.to_vec();
+            let mut payload = vec![OP_ATTEST];
+            payload.extend_from_slice(&envelope);
+            let reply = frame(&payload);
+            let path = fake_uds_admin("good", move |_| reply);
+            let got =
+                attest_roundtrip_uds(path.to_str().unwrap(), &nonce(), &ProxyPolicy::default(), crate::protocol::MAX_PAYLOAD)
+                    .unwrap();
+            assert_eq!(got, envelope);
+        }
+
+        #[test]
+        fn the_uds_request_frame_is_len_first_with_the_nonce_verbatim() {
+            // The fake echoes the nonce bytes back (skipping its opcode), so
+            // the test proves the seam sent `[len=33][OP_ATTEST][nonce32]`
+            // and never re-rolled the nonce, identical to TCP.
+            let path = fake_uds_admin("req", |req| {
+                let mut payload = vec![OP_ATTEST];
+                payload.extend_from_slice(&req[1..]);
+                frame(&payload)
+            });
+            let got = attest_roundtrip_uds(
+                path.to_str().unwrap(),
+                &nonce(),
+                &ProxyPolicy::default(),
+                crate::protocol::MAX_PAYLOAD,
+            )
+            .unwrap();
+            assert_eq!(got, nonce().to_vec());
+        }
+
+        #[test]
+        fn a_uds_refusal_maps_to_refused_with_the_tcp_reason_shape() {
+            let mut payload = vec![OP_ERROR];
+            payload.extend_from_slice(b"attest nonce is 0 bytes, expected 32");
+            let reply = frame(&payload);
+            let path = fake_uds_admin("refused", move |_| reply);
+            let e = attest_roundtrip_uds(
+                path.to_str().unwrap(),
+                &nonce(),
+                &ProxyPolicy::default(),
+                crate::protocol::MAX_PAYLOAD,
+            )
+            .unwrap_err();
+            assert_eq!(
+                e,
+                ProxyError::Refused("attest nonce is 0 bytes, expected 32".to_string())
+            );
+            assert_eq!(e.reason(), "seald refused: attest nonce is 0 bytes, expected 32");
+            assert_eq!(e.status(), 502);
+        }
+
+        #[test]
+        fn a_uds_bad_opcode_maps_to_bad_opcode() {
+            let reply = frame(&[0x77, 0x01, 0x02]);
+            let path = fake_uds_admin("opcode", move |_| reply);
+            let e = attest_roundtrip_uds(
+                path.to_str().unwrap(),
+                &nonce(),
+                &ProxyPolicy::default(),
+                crate::protocol::MAX_PAYLOAD,
+            )
+            .unwrap_err();
+            assert_eq!(e, ProxyError::BadOpcode(0x77));
+            assert_eq!(e.reason(), "unexpected response opcode 119");
+            assert_eq!(e.status(), 502);
+        }
+
+        #[test]
+        fn a_uds_early_eof_maps_to_short_frame() {
+            // Declares a 10-byte body, sends 3, closes.
+            let reply = [0u8, 0, 0, 10, 1, 2, 3].to_vec();
+            let path = fake_uds_admin("eof", move |_| reply);
+            let e = attest_roundtrip_uds(
+                path.to_str().unwrap(),
+                &nonce(),
+                &ProxyPolicy::default(),
+                crate::protocol::MAX_PAYLOAD,
+            )
+            .unwrap_err();
+            assert!(matches!(e, ProxyError::ShortFrame(_)), "{e:?}");
+            assert_eq!(e.status(), 502);
+        }
+
+        #[test]
+        fn a_missing_socket_file_is_connect_not_addr_and_fails_fast() {
+            // A path that does not exist: ENOENT -> Connect (there is no UDS
+            // analog of the TCP Addr shape), and it returns instantly.
+            let path = uds_path("missing");
+            let start = std::time::Instant::now();
+            let e = attest_roundtrip_uds(
+                path.to_str().unwrap(),
+                &nonce(),
+                &ProxyPolicy::default(),
+                crate::protocol::MAX_PAYLOAD,
+            )
+            .unwrap_err();
+            assert!(start.elapsed() < Duration::from_secs(5), "ENOENT is instant");
+            assert!(matches!(e, ProxyError::Connect(_)), "{e:?}");
+            // The reason shape is the TCP connect-failure shape, target=path.
+            assert!(e.reason().starts_with("connect "), "{}", e.reason());
+            assert!(e.reason().contains(path.to_str().unwrap()), "{}", e.reason());
+            assert_eq!(e.status(), 502);
+        }
+
+        #[test]
+        fn a_non_socket_path_is_connect() {
+            // A path that exists but is NOT a listening socket: connect
+            // fails -> Connect (fast). Proves "bad path maps to Connect" for
+            // a non-ENOENT failure mode too.
+            let path = uds_path("notasocket");
+            std::fs::write(&path, b"i am a regular file, not a socket").unwrap();
+            let e = attest_roundtrip_uds(
+                path.to_str().unwrap(),
+                &nonce(),
+                &ProxyPolicy::default(),
+                crate::protocol::MAX_PAYLOAD,
+            )
+            .unwrap_err();
+            assert!(matches!(e, ProxyError::Connect(_)), "{e:?}");
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn a_silent_uds_backend_times_out_not_wedges() {
+            // Reads the request, then never answers: the READ timeout bounds
+            // the wait and classifies as Timeout with the `{phase}: {io}`
+            // shape (identical to the TCP timeout test).
+            let path = uds_path("silent");
+            let listener = UnixListener::bind(&path).unwrap();
+            std::thread::spawn(move || {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut len = [0u8; 4];
+                    if stream.read_exact(&mut len).is_ok() {
+                        let n = u32::from_be_bytes(len) as usize;
+                        let mut req = vec![0u8; n.min(crate::protocol::MAX_PAYLOAD)];
+                        let _ = stream.read_exact(&mut req);
+                        std::thread::sleep(Duration::from_secs(6));
+                    }
+                }
+            });
+            let policy = ProxyPolicy {
+                connect: Duration::from_millis(500), // unused on UDS, documented
+                read: Duration::from_millis(300),
+                write: Duration::from_millis(500),
+                max_frame: DEFAULT_MAX_FRAME,
+            };
+            let start = std::time::Instant::now();
+            let e = attest_roundtrip_uds(
+                path.to_str().unwrap(),
+                &nonce(),
+                &policy,
+                crate::protocol::MAX_PAYLOAD,
+            )
+            .unwrap_err();
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "the read timeout, not the sleep, bounds the wait: {elapsed:?}"
+            );
+            assert!(matches!(e, ProxyError::Timeout(_)), "{e:?}");
+            let r = e.reason();
+            assert!(
+                r.starts_with("read response length: ") || r.starts_with("read response body: "),
+                "the phase-labeled reason: {r}"
+            );
+            assert_eq!(e.status(), 502);
+        }
+
+        #[test]
+        fn a_per_face_max_payload_refuses_a_bigger_declared_frame_fast() {
+            // THE mandated guard: a face whose contract is 1 MiB passes
+            // max_payload = 1<<20. A backend declaring a 2 MiB frame MUST be
+            // refused (FrameSize), and FAST: the refusal is on the declared
+            // length ONLY, before the body is read or allocated, so even the
+            // 60 s default read timeout is never approached. The fake writes
+            // just the 4-byte length then closes (it never sends a 2 MiB
+            // body); a naive reader would block on the missing body, the
+            // cap-first reader refuses immediately.
+            let two_mib = 2u32 * 1024 * 1024;
+            let reply = two_mib.to_be_bytes().to_vec(); // length prefix only; no body
+            let path = fake_uds_admin("bigdeclared", move |_| reply);
+            let start = std::time::Instant::now();
+            let e = attest_roundtrip_uds(
+                path.to_str().unwrap(),
+                &nonce(),
+                &ProxyPolicy::default(), // 60 s read timeout, deliberately
+                1 << 20,                 // the face's 1 MiB cap
+            )
+            .unwrap_err();
+            let elapsed = start.elapsed();
+            assert_eq!(e, ProxyError::FrameSize(two_mib as usize));
+            assert!(
+                elapsed < Duration::from_secs(10),
+                "refused at the cap, never waiting on the read timeout: {elapsed:?}"
+            );
+            assert_eq!(e.status(), 502);
+        }
+
+        #[test]
+        fn a_declared_frame_under_the_face_cap_is_accepted() {
+            // The companion to the guard: under the SAME 1 MiB face cap, a
+            // frame the face accepts (well under 1 MiB) round-trips fine.
+            // Together the two prove the cap is honored as a bound, not a
+            // blanket reject and not the transport default.
+            let envelope = vec![b'x'; 4096];
+            let mut payload = vec![OP_ATTEST];
+            payload.extend_from_slice(&envelope);
+            let reply = frame(&payload);
+            let path = fake_uds_admin("undercap", move |_| reply);
+            let got = attest_roundtrip_uds(
+                path.to_str().unwrap(),
+                &nonce(),
+                &ProxyPolicy::default(),
+                1 << 20, // 1 MiB face cap
+            )
+            .unwrap();
+            assert_eq!(got, envelope);
+        }
+
+        #[test]
+        fn max_payload_above_the_transport_ceiling_is_clamped() {
+            // The effective cap is min(max_payload, MAX_PAYLOAD). Ask for a
+            // 32 MiB cap (> the 16 MiB transport ceiling); a backend
+            // declaring 17 MiB (> 16 MiB but < 32 MiB) must STILL be refused,
+            // proving the clamp holds and a caller can never raise the cap
+            // above the transport's hard ceiling.
+            let declared = 17u32 * 1024 * 1024;
+            let reply = declared.to_be_bytes().to_vec();
+            let path = fake_uds_admin("clamp", move |_| reply);
+            let start = std::time::Instant::now();
+            let e = attest_roundtrip_uds(
+                path.to_str().unwrap(),
+                &nonce(),
+                &ProxyPolicy::default(),
+                32 * 1024 * 1024, // above MAX_PAYLOAD: must clamp to 16 MiB
+            )
+            .unwrap_err();
+            assert!(start.elapsed() < Duration::from_secs(10), "refused at the clamped cap");
+            assert_eq!(e, ProxyError::FrameSize(declared as usize));
+        }
     }
 }
