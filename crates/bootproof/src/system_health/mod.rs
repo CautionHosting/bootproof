@@ -10,12 +10,20 @@ pub const SHELL: &str = include_str!("../assets/system_health/shell.html");
 /// baked into the binary, immutable).
 pub const SW: &str = include_str!("../assets/system_health/verify.js");
 /// Hex SHA-256 of SW's bytes; a test recomputes and asserts this.
-/// (2026-11-08 I-2b: rebumped for the whole-doc-signature gate + the
-/// token-safe canonical_doc_digest mirror (the u64-precision-safe parse);
-/// previous value b5f422f43d2ce451315ac877666342e6494fd4e0a47352bd42122a4a
-/// 19ee9843 was the result.html contract fix, and before that
-/// 5b270efc267e01b12d5145c94a508895381c1da57aabad18555c91f57ca23ad5.)
-pub const SW_SHA256: &str = "fbd2bbb07d892c7f98ccf2b0899eac82e3ba965d5849c71408d8279a09f4967e";
+/// (2026-11-08 AMI-2 MERGED: the local-verification footer claim (this lane)
+/// AND the snp chip_id/CPUID hardware-identity browser rows (dog's lane) now
+/// coexist in one verify.js, so this is the FIRST value covering BOTH. It is
+/// DERIVED from the merged bytes (sha256sum of the rebased asset), NOT
+/// hand-copied; never bake any historical value here. On-chain value chain:
+///   5575655a THIS (footer + identity rows, derived at rebase tip 6c5a06c)
+///   fbd2bbb0 at 655b202 (identity rows only; this tip's parent)
+///   4f19d4fb at 0b52091 (I-2b whole-doc-signature gate + canonical_doc_digest)
+///   b5f422f4 (the result.html contract fix)
+///   5b270efc267e01b12d5145c94a508895381c1da57aabad18555c91f57ca23ad5 (pre-pagefix)
+/// Footnote: 0013e67f was the footer-only value on the pre-rebase branch tip
+/// 924d33f; the rebase onto 655b202 REWROTE that commit, so 0013e67f never
+/// landed on this chain and is an off-chain orphan, not a predecessor.)
+pub const SW_SHA256: &str = "5575655a2c1655f488b390717c5317c3e0b72973c5db074305824393bc48d01a";
 
 pub mod schema;
 

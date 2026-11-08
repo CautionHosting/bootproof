@@ -1464,9 +1464,24 @@ function render(res) {
       esc(r.status) + "</span> <span class=why>" + esc(r.value) + "</span></td></tr>");
   }
   parts.push("</table>");
+  // The local-verification claim (AMI-2): this footer states WHERE
+  // verification ran, namely in the user's own browser, by the service worker
+  // whose bytes are shown and linked below. It states NOTHING about what the
+  // verdicts say. That is why the claim stays honest even when a row above
+  // reads NOT PROVEN or FAILED: a verifier that runs on the user's machine and
+  // returns a red verdict is still a verifier that ran on the user's machine.
+  // It must never be worded as "you are secure" or as any promise about the
+  // rows it renders; it is a statement about the verifier's location and
+  // behavior, nothing more. The link stays same-origin RELATIVE (/verify.js.src
+  // is already served) and its text matches the shell's static link so the
+  // static and painted pages read as one voice. The footer stays gated on
+  // res.swLen so the local claim always ships alongside the exact bytes+hash it
+  // identifies (no self-hash, no claim).
   if (res.swLen) {
-    parts.push('<p class=foot>verifier: ' + esc(res.swLen) + " bytes, sha256 " + esc(res.swSha) +
-      ' · <a href="/verify.js.src">read it</a> · re-verifies every ' + (REFRESH_MS / 1000) + "s</p>");
+    parts.push('<p class=foot>Every fact on this page was verified in your ' +
+      "browser by the service worker shown below. This page was rendered " +
+      "locally, not by the server. Verifier: " + esc(res.swLen) + " bytes, sha256 " + esc(res.swSha) +
+      '. <a href="/verify.js.src">view verifier source</a>. Re-verifies every ' + (REFRESH_MS / 1000) + "s.</p>");
   }
   return parts.join("");
 }
