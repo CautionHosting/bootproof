@@ -91,6 +91,26 @@ Already true (committed):
   requirement is the design, not a TODO).
 - The `system-health` feature seam is in (`Cargo.toml` + gated `pub mod`),
   commit `cf576e9`.
+- The golden-fixture two-verifiers-agree gate is in:
+  `fixtures/system_health/` (`gen_golden.js` regenerates
+  `golden.json` + the three tamper fixtures deterministically via RFC
+  6979 signing, byte-stable; `harness.js` drives the REAL `verify.js`
+  headless through node's vm + WebCrypto). The gate lives in two tests:
+  `crates/bootproof/tests/system_health_agreement.rs` (core snp + tpm2
+  registry) and `crates/bootproof-platform-wardend/tests/system_health_agreement.rs`
+  (the wardend channel; the core must never depend on a platform crate).
+  The SNP half is the REAL live report under the REAL live VLEK with the
+  nonce FROZEN to the live report's own binding; the TPM2 half is a
+  synthetic wire-v1 quote over PCRs 0-9 + 22 so the cross-channel fold
+  (PCR22 == H(0 || H(snp doc || wardend doc))) is PROVEN in both. The
+  frozen verdict crosswalk: the golden asserts EXACT status equality
+  (PROVEN/DEGRADED both sides); a rejected snp channel maps Rust's
+  `memory_encryption` NOT PROVEN failed-fact to JS's FAILED; a rejected
+  tpm2 channel (fold mismatch) emits NO tpm facts + a loud Rust error
+  (Tpm2Verifier is all-or-nothing) and maps to JS's rolled FAILED
+  `tpm_quote`. A tamper must never verify: agreement on the REJECTION is
+  the security property; agreement on the fact placement is only
+  asserted where both verifiers place the fact identically.
 
 Remaining deltas (the actual work):
 1. **Move the System Health envelope *presentation* schema** (the
@@ -109,9 +129,6 @@ Remaining deltas (the actual work):
    socket so wardenctl-over-HTTP and the browser both hit one bootproof-defined
    path. Decide HTTP-terminates-at-bastiond-bridged-to-posternd vs posternd
    exposing an HTTP listener bridged by bastiond — surface before coding.
-4. **Golden fixture two-verifiers-agree gate**: one real/deterministic bundle,
-   `verify_bundle` in Rust AND the service worker in JS produce identical
-   verdicts, asserted in a bootproof test.
 
 ## Build + test
 
