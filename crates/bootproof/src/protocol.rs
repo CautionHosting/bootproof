@@ -20,6 +20,13 @@
 //! is simple and the challenge is the whole request); the framing does not
 //! forbid more, but nothing does it yet.
 //!
+//! The attestation ADMIN FACE (a daemon's nonce->envelope listener: wardend's
+//! `seald` today, any platform's equivalent tomorrow) speaks the same pieces
+//! in a different order: [`FrameOrder::LenFirst`], `[u32-BE len, tag,
+//! payload]`, the historical wire shape NOW OWNED HERE. One codec owns both
+//! orders on purpose: a private second framing in a consumer is exactly the
+//! drift this program exists to kill.
+//!
 //! No TLS: the socket is loopback, owner-only (0600), and the parent dir is
 //! 0700. A corrupt/malicious length prefix is capped at [`MAX_PAYLOAD`].
 
@@ -46,6 +53,22 @@ pub const RESP_ERR: u8 = 1;
 /// length prefix). 16 MiB is far above any real Bundle (a few hundred KB at
 /// most).
 pub const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
+
+/// The two wire orders the ONE codec owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameOrder {
+    /// `[tag, u32-BE len, payload]`: the daemon<->hardware-owner socket.
+    /// The LEN covers the payload ONLY (the tag sits outside the length
+    /// field).
+    TagFirst,
+    /// `[u32-BE len, tag, payload]`: the attestation admin face (a daemon's
+    /// nonce->envelope listener: wardend's `seald` today, any platform's
+    /// equivalent tomorrow). The LEN covers the tag AND the payload: the
+    /// admin face framed the entire remainder after the length prefix as
+    /// one blob. This is the historical wire shape, now owned here so no
+    /// consumer carries a private second codec.
+    LenFirst,
+}
 
 /// Encode a frame: `[tag, u32-BE len, payload]`. `tag` is the op (request) or
 /// status (response).
@@ -77,6 +100,62 @@ pub fn decode(buf: &[u8]) -> Result<(u8, Vec<u8>), String> {
     }
     let payload = buf[5..5 + len].to_vec();
     Ok((tag, payload))
+}
+
+/// Encode a frame in the admin-face order: `[u32-BE len, tag, payload]`,
+/// where `len` covers `tag + payload` (the historical admin-face blob rule,
+/// see [`FrameOrder::LenFirst`]). A 33-byte request (OP_ATTEST + 32-byte
+/// nonce) declares 33.
+pub fn encode_len_first(tag: u8, payload: &[u8]) -> Vec<u8> {
+    let declared = 1 + payload.len();
+    let mut out = Vec::with_capacity(4 + declared);
+    out.extend_from_slice(&(declared as u32).to_be_bytes());
+    out.push(tag);
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Decode a complete in-memory len-first frame into `(tag, payload)`.
+/// A declared length of 0 is refused (there would be no tag byte), the cap
+/// is [`MAX_PAYLOAD`], and a truncated buffer is refused without touching
+/// the payload.
+pub fn decode_len_first(buf: &[u8]) -> Result<(u8, Vec<u8>), String> {
+    if buf.len() < 4 {
+        return Err(format!("frame too short: {} bytes (need >= 4)", buf.len()));
+    }
+    let declared = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    if declared == 0 {
+        return Err("empty frame (no tag)".to_string());
+    }
+    if declared > MAX_PAYLOAD {
+        return Err(format!("payload too large: {declared} bytes (max {MAX_PAYLOAD})"));
+    }
+    if buf.len() < 4 + declared {
+        return Err(format!(
+            "frame truncated: have {} bytes, need {}",
+            buf.len(),
+            4 + declared
+        ));
+    }
+    Ok((buf[4], buf[5..4 + declared].to_vec()))
+}
+
+/// Encode a frame in the given order (the dispatch form of [`encode`] and
+/// [`encode_len_first`]; the bytes are identical to the named functions).
+pub fn encode_order(order: FrameOrder, tag: u8, payload: &[u8]) -> Vec<u8> {
+    match order {
+        FrameOrder::TagFirst => encode(tag, payload),
+        FrameOrder::LenFirst => encode_len_first(tag, payload),
+    }
+}
+
+/// Decode a complete in-memory frame in the given order (the dispatch form
+/// of [`decode`] and [`decode_len_first`]).
+pub fn decode_order(order: FrameOrder, buf: &[u8]) -> Result<(u8, Vec<u8>), String> {
+    match order {
+        FrameOrder::TagFirst => decode(buf),
+        FrameOrder::LenFirst => decode_len_first(buf),
+    }
 }
 
 /// Read exactly `n` bytes, or bail (partial reads on a UDS are rare but we do
@@ -170,6 +249,84 @@ mod tests {
         buf.extend_from_slice(&((MAX_PAYLOAD + 1) as u32).to_be_bytes());
         buf.push(0);
         assert!(decode(&buf).is_err());
+    }
+
+    #[test]
+    fn len_first_frame_shape_is_pinned() {
+        // The admin-face contract, pinned byte-exact: a 33-byte request
+        // (OP_ATTEST + a 32-byte nonce) declares 33, LEN first, tag inside
+        // the length field.
+        let nonce = [0x41u8; 32];
+        let frame = encode_len_first(1, &nonce);
+        assert_eq!(frame.len(), 4 + 33);
+        assert_eq!(&frame[0..4], &[0x00, 0x00, 0x00, 0x21]);
+        assert_eq!(frame[4], 1);
+        assert_eq!(&frame[5..], &nonce[..]);
+        let (tag, payload) = decode_len_first(&frame).unwrap();
+        assert_eq!(tag, 1);
+        assert_eq!(payload, nonce.to_vec());
+    }
+
+    #[test]
+    fn the_two_orders_are_different_bytes_and_both_decode_themselves() {
+        // Drift guard: the orders are NOT interchangeable (a len-first peer
+        // mis-parses a tag-first frame). Each decoder must accept its own
+        // encoder's bytes and reject the other order's shape as garbage or
+        // truncation.
+        let tf = encode(OP_COLLECT, b"abcd");
+        let lf = encode_len_first(OP_COLLECT, b"abcd");
+        assert_ne!(tf, lf);
+        assert_eq!(decode(&tf).unwrap(), (OP_COLLECT, b"abcd".to_vec()));
+        assert_eq!(
+            decode_len_first(&lf).unwrap(),
+            (OP_COLLECT, b"abcd".to_vec())
+        );
+        // A tag-first frame read as len-first: the declared length is the
+        // tag+payload of the OTHER layout (0x0100_0000 = huge) -> refused.
+        assert!(decode_len_first(&tf).is_err());
+        // A len-first frame read as tag-first: the declared length is the
+        // leading tag byte of the other layout -> truncation/refusal.
+        assert!(decode(&lf).is_err());
+    }
+
+    #[test]
+    fn len_first_rejects_zero_short_and_oversized() {
+        // declared 0: no tag byte exists -> refused.
+        assert!(decode_len_first(&[0, 0, 0, 0]).is_err());
+        // shorter than the 4-byte prefix.
+        assert!(decode_len_first(&[0, 0, 0]).is_err());
+        // declared 10, only 3 blob bytes present.
+        let mut buf = vec![0, 0, 0, 10, 1, 2, 3];
+        assert!(decode_len_first(&buf).is_err());
+        // oversized declaration (no allocation on the declared length).
+        let mut big = (MAX_PAYLOAD as u32 + 1).to_be_bytes().to_vec();
+        big.push(1);
+        assert!(decode_len_first(&big).is_err());
+        let _ = buf.len();
+        buf.clear();
+    }
+
+    #[test]
+    fn dispatch_forms_equal_named_forms() {
+        for (tag, payload) in [(OP_COLLECT, b"".to_vec()), (RESP_OK, vec![7u8; 40])]
+        {
+            assert_eq!(
+                encode_order(FrameOrder::TagFirst, tag, &payload),
+                encode(tag, &payload)
+            );
+            assert_eq!(
+                encode_order(FrameOrder::LenFirst, tag, &payload),
+                encode_len_first(tag, &payload)
+            );
+            assert_eq!(
+                decode_order(FrameOrder::TagFirst, &encode(tag, &payload)).unwrap(),
+                decode(&encode(tag, &payload)).unwrap()
+            );
+            assert_eq!(
+                decode_order(FrameOrder::LenFirst, &encode_len_first(tag, &payload)).unwrap(),
+                decode_len_first(&encode_len_first(tag, &payload)).unwrap()
+            );
+        }
     }
 
     #[tokio::test]

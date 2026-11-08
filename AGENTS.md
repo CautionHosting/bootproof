@@ -42,9 +42,20 @@ platform plugin instead.
 - `protocol` — the framed socket: `[tag, u32-BE len, payload]`, `OP_COLLECT`,
   `OP_READ_PCRS`, `RESP_OK`/`RESP_ERR`, `encode`/`decode`/`read_frame`/
   `write_frame`. This is the nonce→bundle wire contract a daemon exposes and a
-  client (wardenctl, posternd proxy) speaks.
+  client (wardenctl, posternd proxy) speaks. ONE codec owns both frame orders
+  (`FrameOrder::TagFirst` = this socket; `FrameOrder::LenFirst` = the admin
+  face's historical `[len, tag, payload]` shape): a consumer never carries a
+  private second framing.
 - `serve` — the reference HTTP face: `POST /attest {nonce?, user_data?,
   public_key?}` → the bundle+facts. The template for any HTTP attestation proxy.
+- `proxy` — the client side of the attestation ADMIN FACE (a daemon's
+  nonce→envelope listener): `ProxyPolicy`, `parse_hex_nonce`,
+  `attest_roundtrip`, `ProxyError` (+ `status`/`json`), `json_error`. The
+  len-first round-trip a wire owner (bastiond's `/health/api`, the generic
+  CLI) calls instead of hand-rolling the codec. Stops BELOW HTTP (frames +
+  nonce + errors + status-as-data; the wire owner renders HTTP bytes). A
+  deliberate byte pipe: it never verifies the envelope. Sync, std-only, no
+  tokio.
 - `bridge` — the gVisor file-transport (challenge/response files) for a
   sandboxed collector that cannot reach the host UDS.
 - `spki` — `spki_der`, `spki_raw_key`, `spki_pin`, `pin_of_cert`: the bounded
@@ -124,11 +135,27 @@ Remaining deltas (the actual work):
 2. **The browser verifier bundle** (`system_health.rs` +
    `assets/system_health/*`): shell + service worker + `SW_SHA256` + the
    drift-killer test + the golden fixture + the `verify_bundle`-agreement test.
-3. **posternd HTTP attest proxy** (the SSH proxy already exists as
-   `proxy_wardenctl`): a bootproof-framed pass-through of the seald attestation
-   socket so wardenctl-over-HTTP and the browser both hit one bootproof-defined
-   path. Decide HTTP-terminates-at-bastiond-bridged-to-posternd vs posternd
-   exposing an HTTP listener bridged by bastiond — surface before coding.
+3. **The HTTP attest proxy: design resolved, bootproof seam landed, the
+   wardend swap is the open increment.** The AGENTS.md either/or
+   (bastiond-bridged-to-posternd vs posternd-HTTP-bridged-by-bastiond) was a
+   false dichotomy: posternd owns :22 only (`proxy_wardenctl` is a frame pipe
+   INSIDE an authenticated SSH session; there is no TCP listener), so a
+   browser cannot reach it and an unauthenticated posternd HTTP face would
+   duplicate the SSH-gated admin path. RESOLVED: HTTP terminates at `bastiond`
+   (the only wire owner) as today, and the proxy LOGIC (frame codec, nonce
+   parser, timeouts, error/status mapping) moves INTO bootproof. `bootproof::proxy`
+   now owns the round-trip: `ProxyPolicy` + `parse_hex_nonce` +
+   `attest_roundtrip` + `ProxyError` (+ `error_json`/`status`), failure
+   semantics MOVED from wardend's `bastion/src/health.rs` (equivalence tests
+   re-run the original code shapes side by side, same inputs -> same reason
+   strings). It stops BELOW HTTP: bootproof owns frames/nonce/errors/status-AS-DATA,
+   the wire owner owns the HTTP bytes. `protocol` was generalized with an
+   explicit `FrameOrder` (`TagFirst` daemon socket, `LenFirst` admin face) so
+   ONE codec owns both orders (no private second framing in a consumer). The
+   proxy is a deliberate byte pipe: it never verifies the envelope (a checking
+   proxy is an unpinned third verifier). OPEN: wardend's `health.rs` deletes its
+   hand-rolled codec and calls the seam (byte-identical HTTP responses pinned
+   by the QEMU gate), dispatched as wardend's increment.
 
 ## Build + test
 

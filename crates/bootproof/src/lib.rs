@@ -10,6 +10,7 @@ pub mod facts;
 pub mod format;
 pub mod protocol;
 pub mod provenance;
+pub mod proxy;
 pub mod serve;
 #[cfg(feature = "system-health")]
 pub mod system_health;
