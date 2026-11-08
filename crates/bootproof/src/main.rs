@@ -1,10 +1,14 @@
 //! `bootproof` — unified remote-attestation binary.
 //!
 //! Subcommands:
-//!   attest   — one-shot: collect one Bundle from the collect daemon and
+//!   attest       — one-shot: collect one Bundle from the collect daemon and
 //!              write its JSON to `--out <file>`
-//!   verify   — offline bundle verify (`verify <file>`), or challenge a
+//!   verify       — offline bundle verify (`verify <file>`), or challenge a
 //!              remote bootproofd node (`verify <remote>`)
+//!   attest-fetch — the generic neutral attester: fetch a Bundle from ANY
+//!              Bundle-bearing face (framed admin face or HTTP) and verify
+//!              it through the registry-driven engine (no credentials, no
+//!              platform assumptions)
 //!   tpm-probe— debug: read PCRs + properties from a local TPM
 
 mod tpm_probe;
@@ -73,6 +77,50 @@ enum Command {
         /// `--collect-socket`.
         #[arg(long)]
         bridge_dir: Option<PathBuf>,
+    },
+    /// The generic, neutral, UNAUTHENTICATED remote attester: fetch a
+    /// Bundle from ANY Bundle-bearing face and verify it through the
+    /// registry-driven engine. Channels come from the bundle's own
+    /// evidence; a channel this build has no verifier for is a loud error,
+    /// a channel the node lacks is an honest NOT PROVEN. Exit codes:
+    /// 0 = verified with no FAILED channel (NOT PROVEN tolerated, printed
+    /// loudly); 1 = a channel FAILED or a --require-channel channel is
+    /// absent; 2 = transport/parse/nonce error, nothing was verified.
+    AttestFetch {
+        /// The framed admin face (host:port, the len-first OP_ATTEST
+        /// protocol: seald's admin.sock bridge). The transport is
+        /// UNAUTHENTICATED: integrity comes from the bundle's signatures +
+        /// the fresh nonce; confidentiality and staleness-resistance are
+        /// the tunnel's job (ssh -L). Refuses non-loopback addresses
+        /// unless --allow-remote.
+        #[arg(long, conflicts_with = "url")]
+        frame: Option<String>,
+        /// An HTTP(S) bundle face: POST {"nonce": "<base64>"}, answered
+        /// with a bare Bundle JSON or an envelope carrying one under a
+        /// top-level "bundle" key. https validates the cert chain against
+        /// the webpki roots but NOT against the bundle signer identity
+        /// (that identity link is the browser verifier's job).
+        #[arg(long, conflicts_with = "frame")]
+        url: Option<String>,
+        /// Allow --frame against a non-loopback address (unauthenticated
+        /// transport: know what you are opting into).
+        #[arg(long)]
+        allow_remote: bool,
+        /// Pin the challenge nonce (64 hex chars) instead of a fresh random
+        /// one (reproducible captures; the replay guard still applies).
+        #[arg(long)]
+        nonce_hex: Option<String>,
+        /// Fail (exit 1) if this channel is ABSENT from the bundle
+        /// (repeatable): turns the honest NOT PROVEN absence into an
+        /// operator-selected failure.
+        #[arg(long)]
+        require_channel: Vec<String>,
+        /// Print the fetched bundle JSON before the facts table.
+        #[arg(long)]
+        bundle: bool,
+        /// Request timeout in seconds (each transport phase; default 30).
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
     },
     /// Verify and print the trust tree (no target), or challenge a remote
     /// node (with target), verify its proof offline, and print the facts table.
@@ -299,6 +347,29 @@ fn main() -> anyhow::Result<()> {
                 bundle.evidence.len(),
                 out.display()
             );
+        }
+        Command::AttestFetch {
+            frame,
+            url,
+            allow_remote,
+            nonce_hex,
+            require_channel,
+            bundle,
+            timeout,
+        } => {
+            let opts = bootproof::attest_fetch::FetchOpts {
+                frame,
+                url,
+                allow_remote,
+                nonce_hex,
+                require_channels: require_channel,
+                bundle,
+                timeout: std::time::Duration::from_secs(timeout),
+            };
+            std::process::exit(bootproof::attest_fetch::run(
+                &opts,
+                &bootproof::verify::render_table,
+            )?);
         }
         Command::Verify {
             target,

@@ -1,4 +1,5 @@
 pub mod attest;
+pub mod attest_fetch;
 pub mod b64;
 pub mod bridge;
 pub mod channel;

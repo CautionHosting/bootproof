@@ -250,7 +250,10 @@ fn b64(b: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(b)
 }
 
-fn render_table(facts: &[Fact]) -> String {
+/// Render the derived facts as the standard four-column table (FACT /
+/// VALUE / ANCHOR / STATUS). Shared by `verify` and `attest-fetch` so every
+/// client face renders one shape.
+pub fn render_table(facts: &[Fact]) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "{:<22} {:<46} {:<10} {:<10}\n",
