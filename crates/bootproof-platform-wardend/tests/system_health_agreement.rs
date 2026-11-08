@@ -208,8 +208,14 @@ fn the_doc_digest_parity_pin_rust_equals_js() {
     );
     // The fixture doc digest is also pinned directly (the coordination
     // point both lanes and the coordinator recompute independently).
+    // The fixture carries a key_acl handle of 1653858798848288593
+    // (> 2^53, the D12 real one, D12's key_acl_handle('bastiond-tls')):
+    // the Rust u64 decode and the JS BigInt token path agree to the last
+    // bit while a naive JSON.parse of the same fixture reads ...500. If
+    // this literal drifts, either an implementation's canonicalization or
+    // the generator's u64 token discipline broke.
     assert_eq!(
-        rust_hex, "5df1b76eaeb4b6332e534712a76db6881e6720accdacf42b7d718a55964e9dd2",
+        rust_hex, "c957cec67aebdcd839b66d7a58d462c4513e85a23596d8564f689338651aa62d",
         "the fixture wardend doc digest changed: the canonicalization or the fixture doc drifted"
     );
 }

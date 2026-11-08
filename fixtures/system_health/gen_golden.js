@@ -86,7 +86,23 @@ const u8arr = (b) => Array.from(Buffer.from(b));
 const b64 = (b) => Buffer.from(b).toString('base64');
 const u16 = (v) => Buffer.from([v >> 8, v & 0xff]);
 const u32 = (v) => Buffer.from([(v >>> 24) & 0xff, (v >>> 16) & 0xff, (v >>> 8) & 0xff, v & 0xff]);
-const u64 = (v) => { const b = Buffer.alloc(8); b.writeBigUInt64BE(BigInt(v)); return b; };
+// u64: the token-safe 8-byte BE writer. v is a BigInt, a decimal string, or
+// a Number that is a SAFE integer (<= 2^53). The >2^53 parity rule: a bare
+// numeric literal > 2^53 corrupts AT AUTHORING (1653858798848288593 becomes
+// ...500 the moment it is a Number), and every u64 in the fixture's digest
+// path must flow through here as a token (BigInt/string), never a coerced
+// Number. A Number argument outside Number.MAX_SAFE_INTEGER is a LOUD
+// generation failure, never a silent bit loss (this is the fixture-side
+// drift detector for the JS coercion class; the I-2b browser leg carries
+// the parsing-side obligation).
+const u64 = (v) => {
+  const b = Buffer.alloc(8);
+  if (typeof v === 'bigint') b.writeBigUInt64BE(v);
+  else if (typeof v === 'string') b.writeBigUInt64BE(BigInt(v));
+  else if (Number.isSafeInteger(v)) b.writeBigUInt64BE(BigInt(v));
+  else throw new Error('u64: coerced Number beyond 2^53 (' + v + ') — author u64 values as BigInt or string tokens');
+  return b;
+};
 function derLen(n) {
   if (n < 128) return Buffer.from([n]);
   if (n < 256) return Buffer.from([0x81, n]);
@@ -419,6 +435,16 @@ const canonicalDocDigest = (doc) => sha256(Buffer.concat([
   dOpt(doc.retry, (r) => Buffer.concat([dU64(r.warden_respawn), dU64(r.watchdog_reboot_guard)])),
 ]));
 
+// The doc's JSON: the serde shape. A BigInt handle must serialize as a
+// BARE NUMBER TOKEN (serde_json writes u64 as a bare integer; a quoted
+// string would fail the Rust decode). JSON.stringify has no BigInt
+// support, so the token route: quote it through the replacer, then strip
+// the quotes. Deterministic; the exact decimal digits of the BigInt are
+// what lands in the bytes (no Number ever sees the value).
+const jSerde = (o) => Buffer.from(JSON.stringify(o, (k, v) =>
+  typeof v === 'bigint' ? `@@bigint-token:${v.toString()}@@` : v
+).replace(/"@@bigint-token:(\d+)@@"/g, '$1'));
+
 const wardendDocObj = {
   seal_state: { posture: 'sealed', state: u8arr(st1) },
   state_log: [log0, log1],
@@ -429,12 +455,20 @@ const wardendDocObj = {
   },
   units: [{ name: 'seald', up: true, heartbeat: TS1 }],
   luks: { device: '/dev/nvme1n1', open: true, pcr_policy: [0, 22], marker_counter: 7 },
-  key_acls: [{ handle: 1, operations: ['sign', 'unseal'], pcr_policy: [22] }],
+  // The D12 real handle (key_acl_handle('bastiond-tls') style: SHA-256-
+  // derived u64s routinely exceed 2^53): authored as a BigInt TOKEN so the
+  // generator itself never coerces it. In the fixture's doc JSON it is
+  // serialized as a bare number (the serde shape), so every consumer that
+  // parses the doc with JSON.parse loses the low bits — the >2^53 parity
+  // landmine the I-2b browser leg must survive (BigInt/decimal-string
+  // token path), witnessed by the fixture digest moving to a value that
+  // ONLY the token-safe canonicalization reproduces.
+  key_acls: [{ handle: 1653858798848288593n, operations: ['sign', 'unseal'], pcr_policy: [22] }],
   retry: { warden_respawn: 2, watchdog_reboot_guard: 0 },
 };
 // The canonical wardend doc bytes: what BOTH verifiers decode, what the
 // fold measures, what a byte-level tamper must break.
-const WARDEND_DOC = Buffer.from(JSON.stringify(wardendDocObj));
+const WARDEND_DOC = jSerde(wardendDocObj);
 
 // I-2: the whole-doc signature. The HSM signs the canonical digest of
 // THIS doc (every field; never the signature itself: the signature rides
@@ -452,7 +486,7 @@ const WARDEND_DOC_SIG = signDetPrehashed(HSM.pub, HSM.d, WARDEND_DOC_DIGEST);
 // JS side computing this hex over the fixture doc bytes and the Rust side
 // asserting the same hex IS the cross-implementation parity witness:
 // same bytes, two canonicalizations, one vector.
-const FIXTURE_DOC_DIGEST_HEX = '5df1b76eaeb4b6332e534712a76db6881e6720accdacf42b7d718a55964e9dd2';
+const FIXTURE_DOC_DIGEST_HEX = "c957cec67aebdcd839b66d7a58d462c4513e85a23596d8564f689338651aa62d";
 if (hexOf(WARDEND_DOC_DIGEST) !== FIXTURE_DOC_DIGEST_HEX) {
   throw new Error(
     'doc-digest parity FAILED: the JS canonicalDocDigest drifted from the pinned vector\n' +
