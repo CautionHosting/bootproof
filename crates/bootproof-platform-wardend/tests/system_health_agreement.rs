@@ -356,3 +356,32 @@ fn the_browser_doc_digest_matches_rust_and_the_naive_path_diverges() {
         "token-safe and naive digests must both be present AND differ: tok={tok:?} naive={naive:?}"
     );
 }
+
+/// I-2b (browser-side FAILED-vs-NOT-PROVEN distinction): the doc gate has TWO
+/// distinct honest rejections, and they must not collapse into one. An ABSENT
+/// doc_signature is NOT PROVEN (nothing to anchor: the_unsigned_doc_is_rejected
+/// _by_the_browser_too pins that). A PRESENT-but-wrong one (the log-tamper doc:
+/// the flipped bytes change the canonical digest, so the fixture's real 64-byte
+/// signature no longer matches) is FAILED: there IS a signature, and it fails.
+/// This pins the FAILED sub by NAME (the fact-level roll already pins it
+/// transitively via wardend_state_chain FAILED in the core test; this closes
+/// the branch so a regression that mislabels a stale signature as "unverified"
+/// instead of "rejected" trips here).
+#[test]
+fn the_tampered_doc_signature_is_failed_not_not_proven_in_the_browser() {
+    let g = fixtures_dir().join("golden.log-tamper.json");
+    let subs = js_subs(&g);
+    assert_eq!(
+        subs.get("wardend.doc_signature").map(String::as_str),
+        Some("FAILED"),
+        "a present-but-wrong doc_signature must read FAILED (a rejected signature), \
+         never NOT PROVEN (that would hide a tamper as a mere absence): {subs:?}"
+    );
+    // And the channel roll agrees: the tamper is a hard rejection.
+    let js = js_facts(&g);
+    assert_eq!(
+        js.get("wardend_state_chain").map(String::as_str),
+        Some("FAILED"),
+        "the wardend channel must roll to FAILED on the tampered doc: {js:?}"
+    );
+}
