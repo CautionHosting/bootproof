@@ -385,3 +385,44 @@ fn the_tampered_doc_signature_is_failed_not_not_proven_in_the_browser() {
         "the wardend channel must roll to FAILED on the tampered doc: {js:?}"
     );
 }
+
+/// I-2b (the core security property, cross-verifier): the WHOLE point of the
+/// doc signature is that seal_state is doc content, and an UNSIGNED doc must
+/// never PROVEN the seal state on EITHER verifier. This is the leak the browser
+/// gate closes (pre-I-2b the page rendered a healthy seal state straight from
+/// the doc with no anchor). One bundle, two verifiers, one verdict on the
+/// load-bearing field:
+///   * Rust: an unsigned doc fails the doc-signature leg INSIDE verify(), so
+///     the engine takes the failed-fact path and never runs facts() — so
+///     wardend_seal_state is NOT PROVEN on the Rust side (in fact absent).
+///   * JS: checkStateLog gates on the doc signature BEFORE the seal_state sub,
+///     so an unsigned doc never even renders wardend.seal_state.
+/// Asserted on the same golden.unsigned-doc fixture both verifiers consume.
+#[test]
+fn an_unsigned_doc_never_proven_seal_state_on_either_verifier() {
+    let g = fixtures_dir().join("golden.unsigned-doc.json");
+    // Rust: the seal-state fact must not be PROVEN (the doc gate precedes any
+    // fact emission; an unsigned doc yields only the channel failed-fact).
+    let (rust, _errors) = rust_wardend_facts(&g);
+    assert_ne!(
+        rust.get("wardend_seal_state").map(String::as_str),
+        Some("PROVEN"),
+        "an unsigned doc must never PROVEN wardend_seal_state on the Rust side: {rust:?}"
+    );
+    // JS: the browser must ALSO never PROVEN it — and, being gated before the
+    // sub is ever pushed, must not even render a PROVEN seal_state. (The
+    // cross-verifier point: the leak closed on BOTH sides, not just the page.)
+    let subs = js_subs(&g);
+    assert_ne!(
+        subs.get("wardend.seal_state").map(String::as_str),
+        Some("PROVEN"),
+        "the browser must never PROVEN wardend.seal_state on an unsigned doc: {subs:?}"
+    );
+    // Positive witness that this is a real rejection, not an empty run: the
+    // doc_signature sub fired (NOT PROVEN for the absent anchor) on the JS side.
+    assert_eq!(
+        subs.get("wardend.doc_signature").map(String::as_str),
+        Some("NOT PROVEN"),
+        "the JS gate must fire the doc_signature sub as the honest cause: {subs:?}"
+    );
+}
