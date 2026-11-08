@@ -90,6 +90,15 @@ pub struct Identity {
     /// this boolean - this field exists so the server can say "no cert
     /// yet" without shipping an empty string the browser might confuse
     /// with a parse failure).
+    ///
+    /// `serde(default)`: absent means the honest false (no leaf published
+    /// => the identity link renders NOT PROVEN). The typed serializer
+    /// always EMITS the field (it stays a plain bool, never an Option);
+    /// the default only lenient-parses bytes written before the field
+    /// existed. The fixture-vs-schema agreement gate keeps every fixture
+    /// an EXPLICIT instance (the key is written), so lenient parsing never
+    /// hides drift in the canonical fixtures.
+    #[serde(default)]
     pub leaf_pem_present: bool,
 }
 

@@ -24,3 +24,11 @@ p256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
 # digest; the standard Verifier::verify would hash it again). The `hazmat`
 # feature exposes the `verify_prehashed` free function.
 ecdsa = { version = "0.16", features = ["hazmat"] }
+
+[dev-dependencies]
+# The agreement tests gate every fixture through the Typed presentation
+# schema (bootproof::system_health::schema::Envelope) before the verdict
+# crosswalk runs: the fixture-vs-schema drift killer. The feature is only
+# for the test build (cargo unions features for dev targets); the plugin's
+# library still depends on the plain bootproof core.
+bootproof = { path = "../bootproof", features = ["system-health"] }

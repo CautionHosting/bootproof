@@ -24,8 +24,42 @@ fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/system_health")
 }
 
+/// The typed-schema gate (the fixture-vs-schema drift killer, same rule as
+/// the core agreement test): decode a fixture through the REAL
+/// `system_health::schema::Envelope` BEFORE the verdict crosswalk runs, so
+/// no fixture can drift from the presentation schema unnoticed. Also
+/// assert the schema-declared `identity.leaf_pem_present` key explicitly:
+/// the schema leniently defaults that field, so a bare typed decode would
+/// not catch an omission.
+fn typed_envelope(fixture: &Path) -> bootproof::system_health::schema::Envelope {
+    let text = std::fs::read_to_string(fixture)
+        .unwrap_or_else(|e| panic!("read {}: {e}", fixture.display()));
+    serde_json::from_str(&text).unwrap_or_else(|e| {
+        panic!("{} is not a valid schema::Envelope: {e}", fixture.display())
+    })
+}
+
+fn assert_identity_leaf_claim_explicit(fixture: &Path, expected: bool) {
+    let text = std::fs::read_to_string(fixture).expect("fixture readable");
+    let v: serde_json::Value = serde_json::from_str(&text).expect("fixture JSON");
+    let claim = v
+        .get("identity")
+        .expect("identity section")
+        .get("leaf_pem_present");
+    assert_eq!(
+        claim.and_then(|x| x.as_bool()),
+        Some(expected),
+        "{}: identity.leaf_pem_present must be the explicit {expected}",
+        fixture.display()
+    );
+}
+
 /// Verify ONLY the wardend channel (this plugin's scope) with the engine.
 fn rust_wardend_facts(fixture: &Path) -> (BTreeMap<String, String>, Vec<String>) {
+    // The typed-schema gate runs FIRST (every fixture, typed, before any
+    // verdict is derived).
+    let _ = typed_envelope(fixture);
+    assert_identity_leaf_claim_explicit(fixture, false);
     let text = std::fs::read_to_string(fixture)
         .unwrap_or_else(|e| panic!("read {}: {e}", fixture.display()));
     let env: serde_json::Value = serde_json::from_str(&text).expect("fixture JSON");

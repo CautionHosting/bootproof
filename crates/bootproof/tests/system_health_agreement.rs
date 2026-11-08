@@ -38,12 +38,59 @@ fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/system_health")
 }
 
+/// The typed-schema gate (the fixture-vs-schema drift killer): decode a
+/// fixture through the REAL `system_health::schema::Envelope` type, not a
+/// `serde_json::Value`. Value-level consumption was the hole that let the
+/// golden drift from the schema (the identity block omitted a
+/// schema-declared field and nothing typed ever saw it). Every fixture
+/// must be a valid typed `Envelope` BEFORE the verdict crosswalk runs.
+///
+/// `system_health` is the feature that owns the schema; the gate is gated
+/// with it (the acceptance gate runs `--features system-health`). On top of
+/// the structural decode, the golden's identity is asserted to carry the
+/// `leaf_pem_present` key EXPLICITLY: the schema leniently defaults that
+/// field (absent == honest false), so a bare `from_str` would NOT catch an
+/// omission, and this Value-level presence assert is what pins the exact
+/// drift that started this.
+#[cfg(feature = "system-health")]
+fn typed_envelope(fixture: &Path) -> bootproof::system_health::schema::Envelope {
+    let text = std::fs::read_to_string(fixture)
+        .unwrap_or_else(|e| panic!("read {}: {e}", fixture.display()));
+    let env: bootproof::system_health::schema::Envelope =
+        serde_json::from_str(&text).unwrap_or_else(|e| {
+            panic!("{} is not a valid schema::Envelope: {e}", fixture.display())
+        });
+    env
+}
+
+/// Assert the schema-declared `identity.leaf_pem_present` key is present
+/// EXPLICITLY in a fixture's JSON (the value is the dual-location server
+/// claim; the golden publishes no leaf so it must be `false`). The typed
+/// `#[serde(default)]` cannot catch an omission; this does.
+fn assert_identity_leaf_claim_explicit(fixture: &Path, expected: bool) {
+    let text = std::fs::read_to_string(fixture).expect("fixture readable");
+    let v: serde_json::Value = serde_json::from_str(&text).expect("fixture JSON");
+    let id = v.get("identity").expect("identity section");
+    let claim = id.get("leaf_pem_present");
+    assert_eq!(
+        claim.and_then(|x| x.as_bool()),
+        Some(expected),
+        "{}: identity.leaf_pem_present must be the explicit {expected}",
+        fixture.display()
+    );
+}
+
 /// The Rust side: verify a fixture bundle with the core registry. Returns
 /// (fact name -> normalized status, the errors). The wardend channel is
 /// intentionally NOT registered here (the core never depends on a platform
 /// crate): its "no verifier" error is filtered from the pass checks by the
 /// callers that expect it.
 fn rust_facts(fixture: &Path) -> (BTreeMap<String, String>, Vec<String>) {
+    // The typed-schema gate runs FIRST: a fixture that is not a valid
+    // schema::Envelope must fail here, before any verdict is derived.
+    #[cfg(feature = "system-health")]
+    let _ = typed_envelope(fixture);
+    assert_identity_leaf_claim_explicit(fixture, false);
     let text = std::fs::read_to_string(fixture)
         .unwrap_or_else(|e| panic!("read {}: {e}", fixture.display()));
     let env: serde_json::Value = serde_json::from_str(&text).expect("fixture is JSON");
@@ -241,6 +288,12 @@ fn snp_tamper_rejected_by_both() {
 #[test]
 fn missing_snp_exact_not_proven_agreement() {
     let g = fixture("golden.missing-snp.json");
+    // The typed-schema gate: this test decodes inline (custom policy), so
+    // the gate + the explicit identity claim are asserted on its own path
+    // too: every fixture passes through the typed schema.
+    #[cfg(feature = "system-health")]
+    let _ = typed_envelope(&g);
+    assert_identity_leaf_claim_explicit(&g, false);
     // Register the snp verifier as a REQUIRED channel: the honest
     // required-absent fact is the engine behavior under test.
     let text = std::fs::read_to_string(&g).expect("fixture readable");

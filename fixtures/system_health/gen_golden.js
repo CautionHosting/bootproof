@@ -408,7 +408,13 @@ const envelope = {
   // schema's shape for "published, and re-checkable".
   facts: [],
   nonce: hexOf(NONCE),
-  identity: { attest_signer_spki_sha256: HSM_PIN },
+  // Both identity keys, explicit, in schema declaration order (declaration
+  // order IS the contract): the golden publishes no TLS leaf PEM (see
+  // metadata.cert_chain.leaf_pem: null), so the honest claim is false.
+  // The typed-schema gate in the agreement tests decodes every fixture
+  // through system_health::schema::Envelope: the fixture must stay an
+  // explicit typed-valid instance, never a lenient-parse survivor.
+  identity: { attest_signer_spki_sha256: HSM_PIN, leaf_pem_present: false },
   metadata: {
     instance_id: 'i-0golden0000000000',
     user_data: 'bootproof golden fixture user-data (no wardend-commit line)',

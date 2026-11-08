@@ -122,6 +122,13 @@ Already true (committed):
   `tpm_quote`. A tamper must never verify: agreement on the REJECTION is
   the security property; agreement on the fact placement is only
   asserted where both verifiers place the fact identically.
+  Typed-schema gate (the fixture-vs-schema drift killer): every fixture
+  (golden + all three tampers) must decode through the typed
+  `schema::Envelope` in BOTH agreement tests before the verdict crosswalk
+  runs, and `identity.leaf_pem_present` must be present EXPLICITLY (the
+  schema leniently defaults it, absent == honest false, so the explicit-
+  key assert is the load-bearing half; Value-level-only consumption once
+  let a fixture omit the field unnoticed).
 
 Remaining deltas (the actual work):
 1. **Move the System Health envelope *presentation* schema** (the
