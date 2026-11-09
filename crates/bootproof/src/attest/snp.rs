@@ -10,10 +10,12 @@
 //!    challenge — what `verify/snp.rs` checks; the back 32 are bound by the
 //!    VLEK signature) and request `VMPL 0` (the report echoes the VMPL the
 //!    guest runs at).
-//! 3. Publish the full 1184-byte v5 report as the `doc`, and the
-//!    platform-provisioned VLEK certificate (DER) as the `vlek` anchor so
-//!    the verifier can check the report signature and chain it to AMD's
-//!    pinned roots.
+//! 3. Publish the full 1184-byte v5 report as the `doc`, and the full
+//!    endorsement chain as anchors: the platform-provisioned VLEK cert
+//!    (DER) plus the build-time-baked AMD KDS roots (`asvk`, `ark`). The
+//!    bundle verifies with NOTHING external: the verifier checks the
+//!    report signature, chains the VLEK, and pins the bundled roots
+//!    against its own baked copy.
 //!
 //! The snp `doc` is the raw firmware report, verbatim (what the firmware
 //! signed). The verifier decodes it, checks the VLEK signature, the
@@ -72,6 +74,25 @@ impl Channel for Snp {
                 .to_der()
                 .map_err(|e| format!("encode VLEK DER: {e}"))?;
             anchors.insert("vlek".into(), B64::new(der));
+        }
+
+        // Bundle-carried full-chain (the self-containment goal): ship the
+        // vendor-published endorsement roots (ASVK + ARK) alongside the
+        // VLEK so the bundle verifies with NOTHING external. These are the
+        // build-time-baked AMD KDS roots (identical to what the offline
+        // verifier chains against); publishing them is byte-stable because
+        // the bundle carries the PEM-body DER via the same canonical walk
+        // (`pem_body_der`) the browser pin-checks and the drift-killer test
+        // pins, so the served bytes hash under the SAME SPKI pin every
+        // verifier expects. A swapped root fails closed at every verifier
+        // (Rust: verify/snp.rs pin gate; JS: snp.asvk_pin / snp.ark_pin) --
+        // bundling a root does NOT weaken the chain, it only removes the
+        // external-fetch dependency.
+        if let Some(asvk) = snp::pem_body_der(snp::AMD_ASVK_MILAN_PEM) {
+            anchors.insert("asvk".into(), B64::new(asvk));
+        }
+        if let Some(ark) = snp::pem_body_der(snp::AMD_ARK_MILAN_PEM) {
+            anchors.insert("ark".into(), B64::new(ark));
         }
 
         let evidence = Evidence {

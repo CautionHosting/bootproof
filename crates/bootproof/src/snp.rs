@@ -33,6 +33,28 @@ pub const AMD_ASVK_MILAN_PEM: &[u8] =
     include_bytes!("trust/data/asvk-sev-vlek-milan.pem");
 pub const AMD_ARK_MILAN_PEM: &[u8] = include_bytes!("trust/data/ark-milan.pem");
 
+/// The DER body of the first certificate in a PEM blob: strip the armor
+/// lines, drop whitespace, base64-decode. This is the canonical PEM->DER
+/// walk of the contract: it byte-identical to the JS verifier's `pemDer`
+/// (verify.js) and to the fixture generator's (gen_golden.js), and it is
+/// what `system_health`'s drift-killer test pins the SPKI anchors with.
+/// Bundled endorsement anchors are produced through THIS function so the
+/// DER the bundle ships hashes under the same SPKI pin as the baked PEM
+/// (an alternate walk -- e.g. a `sev` crate re-encode -- could change the
+/// DER bytes and break the pin equality the browser checks).
+pub fn pem_body_der(pem: &[u8]) -> Option<Vec<u8>> {
+    let text = String::from_utf8_lossy(pem);
+    let body: String = text
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .collect();
+    let body: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(body.as_bytes())
+        .ok()
+}
+
 /// Test fixture: a real 1184-byte firmware report captured from a live EC2
 /// SEV-SNP guest (the same SNP_GET_EXT_REPORT ioctl `issue_report` issues
 /// in-process), plus the 64-byte report_data that produced it and the live

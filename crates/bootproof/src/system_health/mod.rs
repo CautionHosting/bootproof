@@ -46,27 +46,16 @@ mod tests {
         assert!(SW.contains("addEventListener"));
     }
 
-    /// PEM -> DER: strip the armor lines and base64-decode the body.
-    fn pem_to_der(pem: &[u8]) -> Vec<u8> {
-        let body: String = pem
-            .iter()
-            .map(|b| *b as char)
-            .collect::<String>()
-            .lines()
-            .filter(|l| !l.starts_with("-----"))
-            .collect();
-        use base64::Engine as _;
-        base64::engine::general_purpose::STANDARD
-            .decode(body.as_bytes())
-            .expect("test PEM is valid base64")
-    }
-
+    /// PEM -> DER is the SHARED production walk (`crate::snp::pem_body_der`),
+    /// not a test-local copy: the drift-killer then pins the EXACT function
+    /// the bundle produces its `asvk`/`ark` anchors through, so a change to
+    /// that walk cannot drift the served bytes away from the JS pins.
     #[test]
     fn js_anchors_match_rust_trust() {
         // The baked JS SPKI pins must equal the crate's own trust anchors.
-        let ark = crate::spki::spki_pin(&pem_to_der(crate::snp::AMD_ARK_MILAN_PEM))
+        let ark = crate::spki::spki_pin(&crate::snp::pem_body_der(crate::snp::AMD_ARK_MILAN_PEM).expect("ARK pem body"))
             .expect("ARK spki pin");
-        let asvk = crate::spki::spki_pin(&pem_to_der(crate::snp::AMD_ASVK_MILAN_PEM))
+        let asvk = crate::spki::spki_pin(&crate::snp::pem_body_der(crate::snp::AMD_ASVK_MILAN_PEM).expect("ASVK pem body"))
             .expect("ASVK spki pin");
         let want_ark = "9f056bee44377e29308cb5ffa895bdfb62d18881fa6bed8d6f075b0204089cb9";
         let want_ask = "66450a123ea5876206df67f2514a4fea224c0f63b18313423078b0edc4535e33";

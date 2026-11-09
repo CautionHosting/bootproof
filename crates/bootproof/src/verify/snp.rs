@@ -15,6 +15,9 @@
 //!    672 bytes) verifies against the VLEK.
 //! 5. The VLEK chains to the pinned roots: VLEK -> ASVK (SEV-VLEK-Milan)
 //!    -> ARK (ARK-Milan), all in-process (sev crypto_nossl).
+//! 5b. If the bundle carries `asvk`/`ark` root anchors, their SPKI pins
+//!    must match the baked roots (the self-containment check; a swapped
+//!    bundled root is rejected, its absence is not).
 //! 6. Guest policy meets the memory-encryption baseline: debug disabled
 //!    (policy & 0x80000 == 0) and page-swap disabled, i.e. policy == 0x2030000
 //!    for a standard CVM.
@@ -120,6 +123,41 @@ impl SnpVerifier {
                 "snp: VLEK does not chain to the pinned ARK-Milan ({})",
                 c.chain_err.as_deref().unwrap_or("unknown")
             ));
+        }
+
+        // 5b. Bundle-carried root integrity (the self-containment check).
+        // The chain above already anchored the VLEK to the BAKED ASVK/ARK,
+        // so a forged VLEK is rejected here regardless. This check closes
+        // the loop on the roots the bundle TRANSPORTS: when the node ships
+        // `asvk`/`ark` anchors (so a client can verify with nothing
+        // external), those shipped bytes must be the SAME roots, proven by
+        // SPKI-SHA256 pin equality against the baked PEM. A swapped root
+        // is rejected even though the baked-root chain would pass, because
+        // a decoy root in the bundle would mislead a client that trusts the
+        // bundle's own copy. Absence is NOT a failure (older nodes and the
+        // CLI that only needs the chain): it mirrors the JS `snp.vlek_chain`
+        // SERVER_ASSERTED roll, which does not downgrade memory_encryption.
+        // This is byte-for-byte the browser's `snp.asvk_pin` / `snp.ark_pin`
+        // decision, so the two verifiers cannot disagree on the roots.
+        for (anchor, baked_pem, name) in [
+            ("asvk", crate::snp::AMD_ASVK_MILAN_PEM, "ASVK"),
+            ("ark", crate::snp::AMD_ARK_MILAN_PEM, "ARK"),
+        ] {
+            let bundled = match ev.anchors.get(anchor) {
+                Some(b) => &b.0,
+                None => continue,
+            };
+            let baked_der = crate::snp::pem_body_der(baked_pem)
+                .ok_or_else(|| format!("snp: baked {name} PEM unreadable (build defect)"))?;
+            let want = crate::spki::spki_pin(&baked_der)
+                .map_err(|e| format!("snp: baked {name} SPKI pin: {e}"))?;
+            let got = crate::spki::spki_pin(bundled)
+                .map_err(|e| format!("snp: bundled {name} anchor SPKI pin: {e}"))?;
+            if want != got {
+                return Err(format!(
+                    "snp: bundled {name} root SPKI pin {got} does not match the baked {name} ({want})"
+                ));
+            }
         }
 
         // 6. Guest policy: debug must be disabled, page-swap must be disabled.
@@ -364,6 +402,41 @@ mod tests {
         let me = facts.iter().find(|f| f.name == "memory_encryption").unwrap();
         assert_eq!(me.status, Status::Proven);
         assert!(me.anchors.iter().any(|a| a == "snp"));
+    }
+
+    #[test]
+    fn bundled_matching_roots_verify() {
+        // The self-containment positive path: when the bundle carries the
+        // SAME baked ASVK/ARK roots the verifier chains against (via the
+        // canonical PEM-body DER), the pin gate passes and the report still
+        // verifies. This is exactly what a produced bundle ships.
+        let asvk = crate::snp::pem_body_der(crate::snp::AMD_ASVK_MILAN_PEM).unwrap();
+        let ark = crate::snp::pem_body_der(crate::snp::AMD_ARK_MILAN_PEM).unwrap();
+        let mut ev = evidence(REPORT, Some(vlek_der()));
+        ev.anchors.insert("asvk".into(), B64::new(asvk));
+        ev.anchors.insert("ark".into(), B64::new(ark));
+        let v = SnpVerifier::verify_snp_with_vmpl(&ev, &fixture_nonce(), 1)
+            .expect("matching bundled roots must verify");
+        assert_eq!(v.vmpl, 1);
+    }
+
+    #[test]
+    fn bundled_swapped_root_fails_closed() {
+        // The self-containment security path: a bundle that ships a root
+        // that is NOT the baked key is rejected by pin equality, even
+        // though the baked-root chain (step 5) passed. The decoy here is a
+        // real AMD key (the ARK) substituted for the ASVK anchor: it parses
+        // and it is a genuine cert, but its SPKI pin is not the baked
+        // ASVK's, so a client that trusted the bundle's own root copy would
+        // be misled. Absence is tolerated (older nodes); a WRONG root is not.
+        let decoy = crate::snp::pem_body_der(crate::snp::AMD_ARK_MILAN_PEM).unwrap();
+        let mut ev = evidence(REPORT, Some(vlek_der()));
+        ev.anchors.insert("asvk".into(), B64::new(decoy));
+        let err = SnpVerifier::verify_snp_with_vmpl(&ev, &fixture_nonce(), 1).unwrap_err();
+        assert!(
+            err.contains("ASVK") && err.contains("SPKI pin"),
+            "the swapped ASVK root must fail the pin gate with the ASVK name: {err}"
+        );
     }
 
     #[test]
