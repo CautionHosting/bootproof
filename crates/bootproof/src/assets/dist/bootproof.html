@@ -1,4 +1,141 @@
-// =============================================================================
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>System Health</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>/* bootproof single-file pivot: the System Health stylesheet (SOURCE of
+ * truth, human-edited). The combiner (fixtures/single_file/combiner.js)
+ * splices these bytes VERBATIM inside a <style> block of the combined
+ * artifact (assets/dist/bootproof.html). Nothing is rewritten here; only
+ * the delimiters the combiner adds are new. This is the shell's style block
+ * lifted out so the three sources (bootproof.html / bootproof.css /
+ * bootproof.js) stay the review surface and only the DELIVERED bytes are
+ * merged. */
+:root{color-scheme:dark}
+body{font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;background:#0b0e14;color:#d7dce5;margin:0;padding:24px}
+h1{font-size:18px;margin:0 0 12px}
+.verdict{display:inline-block;padding:2px 10px;border-radius:3px;font-weight:700;margin-left:8px}
+.p{background:#0c3a20;color:#7df0b2}.n{background:#3a3010;color:#e8d48a}.f{background:#40121a;color:#ff9ba8}.s{background:#14293d;color:#9ccdf5}
+/* Pending-first render law (the operator's ruling, 2026-11-09): the
+ * delivered document carries EVERY attribute row already painted with
+ * status PENDING, before any fetch, before any JS runs. A browser with
+ * JavaScript disabled still reads a complete pending table (an honest
+ * not-yet, never a blank). .pd is the pending verdict chip: slate, muted,
+ * visibly a state of its own (neither the green of PROVEN, the amber of
+ * NOT PROVEN, nor the red of FAILED). The local verifier flips rows out of
+ * .pd as each check completes; rows it never reaches stay PENDING. */
+.pd{background:#1d2430;color:#9aa7b8}
+tr.pd td{opacity:.85}
+table{border-collapse:collapse;margin:14px 0;width:100%}
+td{padding:3px 10px 3px 0;vertical-align:top;border-bottom:1px solid #1b2230}
+td.k{color:#8a93a5;white-space:nowrap;width:1%}
+.why{color:#8a93a5}
+.sec{margin-top:22px;color:#8a93a5;font-weight:700;text-transform:uppercase;letter-spacing:1px;font-size:12px}
+a{color:#6fb6ff}
+.foot{margin-top:26px;color:#5a6375;font-size:12px}
+</style>
+</head>
+<body>
+<!-- PENDING-FIRST RENDER LAW (the operator's ruling, 2026-11-09). Everything
+between <body> and <script> is STATIC delivered bytes: every attribute row
+this page can ever show is already here, painted with status PENDING, before
+any fetch and before any JavaScript runs. A browser with scripting disabled
+reads a complete table of honest not-yets (never a blank page, never a
+verdict that arrived without its proof). The local verifier in the script
+below flips rows out of PENDING as each of its own checks completes; rows it
+never reaches are flipped to NOT PROVEN ("not evaluated") when a verification
+pass finishes, and stay PENDING if the pass never runs. The row set is
+pinned from BOTH sides: fixtures/single_file/row_parity_contract.js fails if
+the verifier can emit a row name that has no static row here, and the
+fixture gate's static pass fails if any row here is not PENDING at first
+paint, or if the no-script page touches the network. Row ids are r-<name>;
+the parity contract reads them from this file.
+
+Every section the envelope can publish is a first-class row here, including
+the lifecycle rows the unit demo watches: user_data (the CURRENT user-data
+text: a hot-added unit line appears here on the next refresh), seal_state
+(posture / state_hash / log count), and the cert rows (cert_chain + the
+identity_link.* sub-rows: the new vhost's leaf shows its subject/issuer/
+expiry and its four per-cert TLS checks). -->
+<h1>System Health<span class="verdict pd" id="overall">PENDING</span></h1>
+<p class="why" id="meta">This page has not fetched anything yet. Every
+attribute below reads PENDING until the verifier inside this file completes
+its own check in your browser: it fetches the health envelope fresh with a
+random 32-byte nonce, re-verifies every signature locally, and flips each
+row to its own verdict as each check finishes. Rows it never reaches are
+flipped to NOT PROVEN at the end of the pass. With JavaScript disabled this
+page stays exactly as it is: an honest list of things not yet checked.</p>
+<div class="sec">browser-verified proofs</div>
+<table id="proofs">
+<tr id="r-identity_link" class="pd"><td class=k>identity_link</td><td><span class="verdict pd" id="v-identity_link">PENDING</span> <span class=why id="w-identity_link">awaiting verification in this browser</span></td></tr>
+<tr id="r-identity_link.pin" class="pd"><td class=k>identity_link.pin</td><td><span class="verdict pd" id="v-identity_link.pin">PENDING</span> <span class=why id="w-identity_link.pin">awaiting verification in this browser</span></td></tr>
+<tr id="r-identity_link.anchor" class="pd"><td class=k>identity_link.anchor</td><td><span class="verdict pd" id="v-identity_link.anchor">PENDING</span> <span class=why id="w-identity_link.anchor">awaiting verification in this browser</span></td></tr>
+<tr id="r-identity_link.validity" class="pd"><td class=k>identity_link.validity</td><td><span class="verdict pd" id="v-identity_link.validity">PENDING</span> <span class=why id="w-identity_link.validity">awaiting verification in this browser</span></td></tr>
+<tr id="r-identity_link.san" class="pd"><td class=k>identity_link.san</td><td><span class="verdict pd" id="v-identity_link.san">PENDING</span> <span class=why id="w-identity_link.san">awaiting verification in this browser</span></td></tr>
+<tr id="r-identity.leaf_identity" class="pd"><td class=k>identity.leaf_identity</td><td><span class="verdict pd" id="v-identity.leaf_identity">PENDING</span> <span class=why id="w-identity.leaf_identity">awaiting verification in this browser</span></td></tr>
+<tr id="r-nonce_freshness" class="pd"><td class=k>nonce_freshness</td><td><span class="verdict pd" id="v-nonce_freshness">PENDING</span> <span class=why id="w-nonce_freshness">awaiting verification in this browser</span></td></tr>
+<tr id="r-bundle_nonce" class="pd"><td class=k>bundle_nonce</td><td><span class="verdict pd" id="v-bundle_nonce">PENDING</span> <span class=why id="w-bundle_nonce">awaiting verification in this browser</span></td></tr>
+<tr id="r-memory_encryption" class="pd"><td class=k>memory_encryption</td><td><span class="verdict pd" id="v-memory_encryption">PENDING</span> <span class=why id="w-memory_encryption">awaiting verification in this browser</span></td></tr>
+<tr id="r-snp.evidence" class="pd"><td class=k>snp.evidence</td><td><span class="verdict pd" id="v-snp.evidence">PENDING</span> <span class=why id="w-snp.evidence">awaiting verification in this browser</span></td></tr>
+<tr id="r-snp.nonce_binding" class="pd"><td class=k>snp.nonce_binding</td><td><span class="verdict pd" id="v-snp.nonce_binding">PENDING</span> <span class=why id="w-snp.nonce_binding">awaiting verification in this browser</span></td></tr>
+<tr id="r-snp.vmpl_zero" class="pd"><td class=k>snp.vmpl_zero</td><td><span class="verdict pd" id="v-snp.vmpl_zero">PENDING</span> <span class=why id="w-snp.vmpl_zero">awaiting verification in this browser</span></td></tr>
+<tr id="r-snp.policy" class="pd"><td class=k>snp.policy</td><td><span class="verdict pd" id="v-snp.policy">PENDING</span> <span class=why id="w-snp.policy">awaiting verification in this browser</span></td></tr>
+<tr id="r-snp.cpu_identity" class="pd"><td class=k>snp.cpu_identity</td><td><span class="verdict pd" id="v-snp.cpu_identity">PENDING</span> <span class=why id="w-snp.cpu_identity">awaiting verification in this browser</span></td></tr>
+<tr id="r-snp.chip_identity" class="pd"><td class=k>snp.chip_identity</td><td><span class="verdict pd" id="v-snp.chip_identity">PENDING</span> <span class=why id="w-snp.chip_identity">awaiting verification in this browser</span></td></tr>
+<tr id="r-snp.vlek" class="pd"><td class=k>snp.vlek</td><td><span class="verdict pd" id="v-snp.vlek">PENDING</span> <span class=why id="w-snp.vlek">awaiting verification in this browser</span></td></tr>
+<tr id="r-snp.vlek_identity" class="pd"><td class=k>snp.vlek_identity</td><td><span class="verdict pd" id="v-snp.vlek_identity">PENDING</span> <span class=why id="w-snp.vlek_identity">awaiting verification in this browser</span></td></tr>
+<tr id="r-snp.report_sig" class="pd"><td class=k>snp.report_sig</td><td><span class="verdict pd" id="v-snp.report_sig">PENDING</span> <span class=why id="w-snp.report_sig">awaiting verification in this browser</span></td></tr>
+<tr id="r-snp.vlek_chain" class="pd"><td class=k>snp.vlek_chain</td><td><span class="verdict pd" id="v-snp.vlek_chain">PENDING</span> <span class=why id="w-snp.vlek_chain">awaiting verification in this browser</span></td></tr>
+<tr id="r-snp.asvk_pin" class="pd"><td class=k>snp.asvk_pin</td><td><span class="verdict pd" id="v-snp.asvk_pin">PENDING</span> <span class=why id="w-snp.asvk_pin">awaiting verification in this browser</span></td></tr>
+<tr id="r-snp.ark_pin" class="pd"><td class=k>snp.ark_pin</td><td><span class="verdict pd" id="v-snp.ark_pin">PENDING</span> <span class=why id="w-snp.ark_pin">awaiting verification in this browser</span></td></tr>
+<tr id="r-snp.vlek_sig" class="pd"><td class=k>snp.vlek_sig</td><td><span class="verdict pd" id="v-snp.vlek_sig">PENDING</span> <span class=why id="w-snp.vlek_sig">awaiting verification in this browser</span></td></tr>
+<tr id="r-tpm_quote" class="pd"><td class=k>tpm_quote</td><td><span class="verdict pd" id="v-tpm_quote">PENDING</span> <span class=why id="w-tpm_quote">awaiting verification in this browser</span></td></tr>
+<tr id="r-tpm.evidence" class="pd"><td class=k>tpm.evidence</td><td><span class="verdict pd" id="v-tpm.evidence">PENDING</span> <span class=why id="w-tpm.evidence">awaiting verification in this browser</span></td></tr>
+<tr id="r-tpm.nonce_binding" class="pd"><td class=k>tpm.nonce_binding</td><td><span class="verdict pd" id="v-tpm.nonce_binding">PENDING</span> <span class=why id="w-tpm.nonce_binding">awaiting verification in this browser</span></td></tr>
+<tr id="r-tpm.ak_name" class="pd"><td class=k>tpm.ak_name</td><td><span class="verdict pd" id="v-tpm.ak_name">PENDING</span> <span class=why id="w-tpm.ak_name">awaiting verification in this browser</span></td></tr>
+<tr id="r-tpm.ak" class="pd"><td class=k>tpm.ak</td><td><span class="verdict pd" id="v-tpm.ak">PENDING</span> <span class=why id="w-tpm.ak">awaiting verification in this browser</span></td></tr>
+<tr id="r-tpm.quote_sig" class="pd"><td class=k>tpm.quote_sig</td><td><span class="verdict pd" id="v-tpm.quote_sig">PENDING</span> <span class=why id="w-tpm.quote_sig">awaiting verification in this browser</span></td></tr>
+<tr id="r-tpm.pcr_digest" class="pd"><td class=k>tpm.pcr_digest</td><td><span class="verdict pd" id="v-tpm.pcr_digest">PENDING</span> <span class=why id="w-tpm.pcr_digest">awaiting verification in this browser</span></td></tr>
+<tr id="r-tpm.pcr_state" class="pd"><td class=k>tpm.pcr_state</td><td><span class="verdict pd" id="v-tpm.pcr_state">PENDING</span> <span class=why id="w-tpm.pcr_state">awaiting verification in this browser</span></td></tr>
+<tr id="r-tpm.slot_link" class="pd"><td class=k>tpm.slot_link</td><td><span class="verdict pd" id="v-tpm.slot_link">PENDING</span> <span class=why id="w-tpm.slot_link">awaiting verification in this browser</span></td></tr>
+<tr id="r-tpm.sign_key" class="pd"><td class=k>tpm.sign_key</td><td><span class="verdict pd" id="v-tpm.sign_key">PENDING</span> <span class=why id="w-tpm.sign_key">awaiting verification in this browser</span></td></tr>
+<tr id="r-tpm.ek_cert" class="pd"><td class=k>tpm.ek_cert</td><td><span class="verdict pd" id="v-tpm.ek_cert">PENDING</span> <span class=why id="w-tpm.ek_cert">awaiting verification in this browser</span></td></tr>
+<tr id="r-wardend_state_chain" class="pd"><td class=k>wardend_state_chain</td><td><span class="verdict pd" id="v-wardend_state_chain">PENDING</span> <span class=why id="w-wardend_state_chain">awaiting verification in this browser</span></td></tr>
+<tr id="r-wardend.evidence" class="pd"><td class=k>wardend.evidence</td><td><span class="verdict pd" id="v-wardend.evidence">PENDING</span> <span class=why id="w-wardend.evidence">awaiting verification in this browser</span></td></tr>
+<tr id="r-wardend.doc_signature" class="pd"><td class=k>wardend.doc_signature</td><td><span class="verdict pd" id="v-wardend.doc_signature">PENDING</span> <span class=why id="w-wardend.doc_signature">awaiting verification in this browser</span></td></tr>
+<tr id="r-wardend.hsm_key_identity" class="pd"><td class=k>wardend.hsm_key_identity</td><td><span class="verdict pd" id="v-wardend.hsm_key_identity">PENDING</span> <span class=why id="w-wardend.hsm_key_identity">awaiting verification in this browser</span></td></tr>
+<tr id="r-wardend.seal_state" class="pd"><td class=k>wardend.seal_state</td><td><span class="verdict pd" id="v-wardend.seal_state">PENDING</span> <span class=why id="w-wardend.seal_state">awaiting verification in this browser</span></td></tr>
+<tr id="r-wardend.state_chain" class="pd"><td class=k>wardend.state_chain</td><td><span class="verdict pd" id="v-wardend.state_chain">PENDING</span> <span class=why id="w-wardend.state_chain">awaiting verification in this browser</span></td></tr>
+</table>
+<div class="sec">server-published facts (verbatim, the seald-side verify)</div>
+<table id="facts"><tbody id="facts-body">
+<tr id="r-server-facts" class="pd"><td class=k>server facts</td><td><span class="verdict pd" id="v-server-facts">PENDING</span> <span class=why id="w-server-facts">the fact table arrives with the envelope; this page has not fetched one yet</span></td></tr>
+</tbody></table>
+<div class="sec">envelope sections</div>
+<table id="sections">
+<tr id="r-instance_id" class="pd"><td class=k>instance_id</td><td><span class="verdict pd" id="v-instance_id">PENDING</span> <span class=why id="w-instance_id">awaiting verification in this browser</span></td></tr>
+<tr id="r-user_data" class="pd"><td class=k>user_data</td><td><span class="verdict pd" id="v-user_data">PENDING</span> <span class=why id="w-user_data">awaiting verification in this browser</span></td></tr>
+<tr id="r-stagex_commit" class="pd"><td class=k>stagex_commit</td><td><span class="verdict pd" id="v-stagex_commit">PENDING</span> <span class=why id="w-stagex_commit">awaiting verification in this browser</span></td></tr>
+<tr id="r-instance_identity" class="pd"><td class=k>instance_identity</td><td><span class="verdict pd" id="v-instance_identity">PENDING</span> <span class=why id="w-instance_identity">awaiting verification in this browser</span></td></tr>
+<tr id="r-disk_encryption" class="pd"><td class=k>disk_encryption</td><td><span class="verdict pd" id="v-disk_encryption">PENDING</span> <span class=why id="w-disk_encryption">awaiting verification in this browser</span></td></tr>
+<tr id="r-units" class="pd"><td class=k>units</td><td><span class="verdict pd" id="v-units">PENDING</span> <span class=why id="w-units">awaiting verification in this browser</span></td></tr>
+<tr id="r-fleet_domains" class="pd"><td class=k>fleet_domains</td><td><span class="verdict pd" id="v-fleet_domains">PENDING</span> <span class=why id="w-fleet_domains">awaiting verification in this browser</span></td></tr>
+<tr id="r-hsm_keys" class="pd"><td class=k>hsm_keys</td><td><span class="verdict pd" id="v-hsm_keys">PENDING</span> <span class=why id="w-hsm_keys">awaiting verification in this browser</span></td></tr>
+<tr id="r-seal_state" class="pd"><td class=k>seal_state</td><td><span class="verdict pd" id="v-seal_state">PENDING</span> <span class=why id="w-seal_state">awaiting verification in this browser</span></td></tr>
+<tr id="r-cert_chain" class="pd"><td class=k>cert_chain</td><td><span class="verdict pd" id="v-cert_chain">PENDING</span> <span class=why id="w-cert_chain">awaiting verification in this browser</span></td></tr>
+<tr id="r-endorsement" class="pd"><td class=k>endorsement</td><td><span class="verdict pd" id="v-endorsement">PENDING</span> <span class=why id="w-endorsement">awaiting verification in this browser</span></td></tr>
+<tr id="r-spdx_inventory" class="pd"><td class=k>spdx_inventory</td><td><span class="verdict pd" id="v-spdx_inventory">PENDING</span> <span class=why id="w-spdx_inventory">awaiting verification in this browser</span></td></tr>
+</table>
+<p class="why">This is a single self-contained file: the verifier, this
+stylesheet, and the pending markup above are one document, no service worker.
+Every verdict is computed in your browser and flipped into the rows above as
+its own check completes; the footer states what this file measured about its
+own served bytes.</p>
+<p class="foot" id="foot">This page has not yet hashed the bytes the server
+sent it; the measurement sentence appears here once the verifier has fetched
+this document once. A build-time identity pin for this document is published
+by the server outside this file (and, on a measured boot, in the UKI); the
+page never asserts whether its own bytes match it.</p>
+<script>// =============================================================================
 // bootproof System Health: the browser-side remote-attestation verifier.
 //
 // This file IS the verifier. It runs as a service worker (scope '/'), is
@@ -1271,6 +1408,15 @@ function u64be(n) {
 // The pure decision list it builds is the same one the Rust verifier
 // produces: see the name-for-name table in
 // crates/bootproof/tests/system_health_agreement.rs (golden fixture).
+//
+// PENDING-FIRST DELIVERY (the operator's ruling, 2026-11-09): this function
+// computes the decision list; it NO LONGER paints. The static document
+// (bootproof.html) already shows every row as PENDING; the runner below
+// FLIPS each row as its check's result arrives. Row names produced here
+// must exist as static rows: fixtures/single_file/row_parity_contract.js
+// fails the build otherwise (both directions, including names reachable
+// only on branches the golden fixture does not walk, recovered by scanning
+// the sub()/finishFact()/label literals in this file).
 // -----------------------------------------------------------------------------
 
 async function runVerification(origin) {
@@ -1285,8 +1431,8 @@ async function runVerification(origin) {
     const res = await fetch(origin + "/health/api?nonce=" + nonceHex, { cache: "no-store" });
     env = await res.json();
   } catch (e) {
-    return { ok: false, overall: FAILED, error: "fetch /health/api failed: " + e,
-             nonce: nonceHex, checks: [], serverFacts: [], t: t0 };
+    return { ok: false, overall: NOT_PROVEN, error: "fetch /health/api failed: " + e,
+             nonce: nonceHex, checks: [], serverFacts: [], t: t0, noEnvelope: true };
   }
   const checks = [];
   const host = (origin || "").replace(/^https?:\/\//, "").replace(/:.*$/, "").split("/")[0];
@@ -1336,7 +1482,7 @@ async function runVerification(origin) {
   });
 
   // 6. The metadata sections: rendered from the envelope; null is an
-  //    honest NOT PROVEN, never a fake row (the render step below).
+  //    honest NOT PROVEN, never a fake row (the flip step below).
   const sections = renderSections(env.metadata || {});
 
   // Overall: PROVEN only if every REQUIRED check is PROVEN. Required =
@@ -1351,17 +1497,9 @@ async function runVerification(origin) {
     if (required.indexOf(c.name) >= 0 && c.status !== PROVEN) overall = c.status;
   }
 
-  // 7. Self-report: our own bytes so the page can prove WHICH verifier ran.
-  let swLen = null, swSha = null;
-  try {
-    const sw = await (await fetch(origin + "/verify.js", { cache: "no-store" })).arrayBuffer();
-    swLen = sw.byteLength;
-    swSha = await sha256Hex(new Uint8Array(sw));
-  } catch (e) { /* the page already prints SW_SHA256 from the server side */ }
-
   return { ok: overall === PROVEN, overall: overall, nonce: nonceHex,
            checks: checks, serverFacts: serverFacts, sections: sections,
-           swLen: swLen, swSha: swSha, t: t0 };
+           t: t0 };
 }
 
 function mapStatus(s) {
@@ -1386,7 +1524,9 @@ function decodeEvidence(ev) {
 }
 
 // The metadata render: section -> structured rows. A null section is an
-// honest NOT PROVEN row. Everything is escaped at render time.
+// honest NOT PROVEN row. Everything is escaped at FLIP time (setRow below),
+// never at compute time. The label of every row MUST match a static row id
+// in bootproof.html (row_parity_contract.js asserts both directions).
 function renderSections(m) {
   const rows = [];
   rows.push({ label: "instance_id", status: m.instance_id ? PROVEN : NOT_PROVEN, value: m.instance_id || "not set" });
@@ -1400,6 +1540,22 @@ function renderSections(m) {
     value: Array.isArray(m.units) && m.units.length
       ? m.units.map(function (u) { return u.name + ": " + (u.state || u.health || "?"); }).join(", ")
       : "the node published no unit table" });
+  // fleet_domains: the count of vhost lines the CURRENT user-data declares
+  // ("host <name> backend=..." lines, wardend's userdata grammar). The datum
+  // is derived ONLY from envelope bytes (metadata.user_data): when the
+  // envelope carries no user-data the row is an honest NOT PROVEN, never a
+  // fabricated zero (the operator's law: honest absence over invented rows).
+  if (typeof m.user_data === "string" && m.user_data.length) {
+    const hosts = m.user_data.split(/\r?\n/).filter(function (l) {
+      const t = l.trim().split(/\s+/);
+      return t.length >= 2 && t[0] === "host" && t.join(" ").indexOf("backend=") > 0;
+    });
+    rows.push({ label: "fleet_domains", status: PROVEN,
+      value: hosts.length + " vhost line(s) in the current user-data" +
+             (hosts.length ? ": " + hosts.map(function (l) { return l.trim().split(/\s+/)[1]; }).join(", ") : "") });
+  } else {
+    rows.push({ label: "fleet_domains", status: NOT_PROVEN, value: "no user-data in the envelope to count vhosts from" });
+  }
   rows.push({ label: "hsm_keys", status: Array.isArray(m.hsm_keys) && m.hsm_keys.length ? PROVEN : NOT_PROVEN,
     value: Array.isArray(m.hsm_keys) && m.hsm_keys.length
       ? m.hsm_keys.map(function (k) { return k.name + (k.pcr_gated ? " [PCR-gated " + (k.pcrs || []).join(",") + "]" : " [not PCR-gated]"); }).join(", ")
@@ -1413,8 +1569,12 @@ function renderSections(m) {
     rows.push({ label: "seal_state", status: NOT_PROVEN, value: "no seal state published" });
   }
   const cc = m.cert_chain;
-  rows.push({ label: "cert_chain", status: cc && cc.leaf ? PROVEN : NOT_PROVEN,
-    value: cc && cc.leaf ? ("leaf " + trunc(cc.leaf.subject, 60) + ", anchors: " + ((cc.spki_anchors || []).join(", ") || "none")) : "no ACME leaf published" });
+  const leaf = cc && cc.leaf;
+  rows.push({ label: "cert_chain", status: leaf && !leaf.error ? PROVEN : NOT_PROVEN,
+    value: leaf && !leaf.error
+      ? ("leaf " + trunc(leaf.subject, 60) + ", issuer " + trunc(leaf.issuer, 48) +
+         ", expires " + (leaf.not_after || "?") + ", anchors: " + ((cc.spki_anchors || []).join(", ") || "none"))
+      : (cc && cc.leaf_pem ? "server decode failed; the browser decodes the PEM itself" : "no ACME leaf published") });
   const en = m.endorsement || {};
   rows.push({ label: "endorsement", status: (en.aws && en.aws.present) || (en.amd && en.amd.present) ? PROVEN : NOT_PROVEN,
     value: "aws: " + j(en.aws) + " amd: " + j(en.amd) });
@@ -1425,12 +1585,12 @@ function trunc(v, n) { const s = typeof v === "string" ? v : j(v); return s.leng
 function j(v) { try { return JSON.stringify(v); } catch (e) { return String(v); } }
 
 // -----------------------------------------------------------------------------
-// RENDER (the page). All text goes through esc(); the envelope is
-// UNTRUSTED input and this file must never hand it to the parser.
+// RENDER: the flip layer (pending-first delivery).
+// The static document already painted every row PENDING. Nothing here ever
+// REPLACES the table: it flips one row at a time, as the check that owns it
+// completes. All text goes through esc(); the envelope is UNTRUSTED input and
+// this file must never hand it to the parser.
 // -----------------------------------------------------------------------------
-
-// The page carries the CSS (the shell's <style>); this file only produces
-// verdict markup, so the styling can never fight the verifier's bytes.
 
 function esc(s) {
   return String(s == null ? "" : s)
@@ -1440,65 +1600,102 @@ function esc(s) {
 function cls(status) {
   return status === PROVEN ? "p" : status === FAILED ? "f" : status === SERVER_ASSERTED || status === "DEGRADED" || status === "REPRODUCIBLE" ? "s" : "n";
 }
-function render(res) {
-  const parts = [];
-  parts.push('<h1>System Health<span class="verdict ' + cls(res.overall) + '">' + esc(res.overall) + "</span></h1>");
-  parts.push('<p class="why">nonce ' + esc((res.nonce || "").slice(0, 16)) + "… · verified " +
-    new Date(res.t).toISOString() + " · this page view only</p>");
-  if (res.error) parts.push('<p class="verdict f">' + esc(res.error) + "</p>");
-  parts.push('<div class="sec">browser-verified proofs</div><table>');
-  for (const c of res.checks || []) {
-    parts.push("<tr><td class=k>" + esc(c.name) + '</td><td><span class="verdict ' + cls(c.status) + '">' +
-      esc(c.status) + "</span> <span class=why>" + esc(c.why) + "</span></td></tr>");
+// The rows THIS pass has flipped, so finishPass can honestly close out the
+// rest without touching the static structure (a flip never reorders, adds,
+// or removes proof/section rows; only the dynamic facts table fills in).
+let flipped = {};
+
+function setRow(id, status, why) {
+  const tr = document.getElementById("r-" + id);
+  if (!tr) return false; // parity contract guarantees this cannot happen for known names
+  const v = document.getElementById("v-" + id);
+  const w = document.getElementById("w-" + id);
+  if (v) { v.className = "verdict " + cls(status); v.textContent = status; }
+  if (w) w.textContent = why == null ? "" : String(why);
+  tr.className = "";
+  flipped[id] = true;
+  return true;
+}
+// End of one verification pass: every static row this pass never reached is
+// flipped to an honest NOT PROVEN with the reason. PENDING means "the
+// verifier never ran"; after a completed pass, NOT REACHED means "the
+// verifier ran and this check did not happen" (a branch not taken because
+// an earlier stage failed closed). Both are honest; neither is left as a
+// silent blank.
+function finishPass(reason) {
+  document.querySelectorAll("tr.pd").forEach(function (tr) {
+    const id = tr.id.slice(2);
+    if (flipped[id]) return;
+    const v = document.getElementById("v-" + id);
+    const w = document.getElementById("w-" + id);
+    if (v) { v.className = "verdict n"; v.textContent = NOT_PROVEN; }
+    if (w) w.textContent = reason;
+    tr.className = "";
+    flipped[id] = true;
+  });
+}
+function setOverall(status) {
+  const o = document.getElementById("overall");
+  if (o) { o.className = "verdict " + cls(status); o.textContent = status; }
+}
+function setMeta(text) {
+  const p = document.getElementById("meta");
+  if (p) p.textContent = text;
+}
+// The server-facts table is the one DYNAMIC table (fact names come from the
+// envelope, they are not knowable at build time). The static document ships
+// one honest PENDING placeholder for it; the first pass replaces the
+// placeholder body, keeping the pending-first law (the placeholder was
+// pending; it is never silently removed).
+function fillServerFacts(facts) {
+  const body = document.getElementById("facts-body");
+  if (!body) return;
+  flipped["server-facts"] = true;
+  if (!facts || !facts.length) {
+    body.innerHTML = '<tr id="r-server-facts"><td class=k>server facts</td><td><span class="verdict n">' +
+      esc(NOT_PROVEN) + '</span> <span class=why>the envelope carried no facts array</span></td></tr>';
+    return;
   }
-  parts.push("</table>");
-  parts.push('<div class="sec">server-published facts (verbatim, the seald-side verify)</div><table>');
-  for (const f of res.serverFacts || []) {
-    parts.push("<tr><td class=k>" + esc(f.name) + '</td><td><span class="verdict ' + cls(f.status) + '">' +
+  const parts = [];
+  for (const f of facts) {
+    parts.push('<tr><td class=k>' + esc(f.name) + '</td><td><span class="verdict ' + cls(f.status) + '">' +
       esc(f.status) + '</span> <span class=why>"' + esc(f.value) + '" [' + esc((f.anchors || []).join("+")) + "]</span></td></tr>");
   }
-  parts.push("</table>");
-  parts.push('<div class="sec">envelope sections</div><table>');
-  for (const r of res.sections || []) {
-    parts.push("<tr><td class=k>" + esc(r.label) + '</td><td><span class="verdict ' + cls(r.status) + '">' +
-      esc(r.status) + "</span> <span class=why>" + esc(r.value) + "</span></td></tr>");
-  }
-  parts.push("</table>");
-  // The local-verification claim (AMI-2): this footer states WHERE
-  // verification ran, namely in the user's own browser, by the service worker
-  // whose bytes are shown and linked below. It states NOTHING about what the
-  // verdicts say. That is why the claim stays honest even when a row above
-  // reads NOT PROVEN or FAILED: a verifier that runs on the user's machine and
-  // returns a red verdict is still a verifier that ran on the user's machine.
-  // It must never be worded as "you are secure" or as any promise about the
-  // rows it renders; it is a statement about the verifier's location and
-  // behavior, nothing more. The link stays same-origin RELATIVE (/verify.js.src
-  // is already served) and its text matches the shell's static link so the
-  // static and painted pages read as one voice. The footer stays gated on
-  // res.swLen so the local claim always ships alongside the exact bytes+hash it
-  // identifies (no self-hash, no claim).
-  if (res.swLen) {
-    // Two sentences that must NEVER collapse into one claim (single-file-pivot
-    // doctrine, ruled 2026-11-09). The ONLY edit to the verifier body between
-    // the cast service worker and this single-file page:
-    //   (1) measurement, always true, verdict-independent: this page fetched
-    //       its OWN served bytes and hashed them. That is not self-reference;
-    //       it is exactly what the SW did when it fetched /verify.js.
-    //   (2) the external binding, stated as WHERE the check lives, never
-    //       asserted by the page. A document that claims to carry its own
-    //       identity is provenance wearing a PROVEN costume, and it is exactly
-    //       the wording this footer must never produce.
-    parts.push('<p class=foot>This page measured its own served bytes as ' +
-      esc(res.swLen) + " bytes, sha256 " + esc(res.swSha) +
-      " (a measurement of what the server returned, not a self-claim). " +
-      "Whether that hash matches the build-time pin / UKI measurement is checked " +
-      "<em>outside</em> this page, by the boot-chain and the pinned constant, not " +
-      "by the page asserting it. Every fact above was verified in your browser, " +
-      "locally, not by the server. Re-verifies every " + (REFRESH_MS / 1000) + "s.</p>");
-  }
-  return parts.join("");
+  body.innerHTML = parts.join("");
+}
+// The self-measurement footer (the two-sentence doctrine, unchanged wording:
+// MEASUREMENT first, always true; BINDING lives outside this page, never
+// asserted here). render() used to emit this; the flip layer writes the same
+// two sentences into the static footer paragraph.
+function setFooter(swLen, swSha) {
+  const f = document.getElementById("foot");
+  if (!f) return;
+  if (swLen == null) return;
+  f.innerHTML = 'This page measured its own served bytes as ' + esc(swLen) + " bytes, sha256 " + esc(swSha) +
+    " (a measurement of what the server returned, not a self-claim). " +
+    "Whether that hash matches the build-time pin / UKI measurement is checked " +
+    "<em>outside</em> this page, by the boot-chain and the pinned constant, not " +
+    "by the page asserting it. Every fact above was verified in your browser, " +
+    "locally, not by the server. Re-verifies every " + (REFRESH_MS / 1000) + "s.";
 }
 
+// Flip a full verification result into the static rows. Order matters for
+// honesty, not for correctness of the final state: rows flip as the results
+// arrive, so a slow channel shows its own rows flipping while others sit
+// PENDING.
+function applyResult(res) {
+  flipped = {};
+  setOverall(res.overall);
+  if (res.error) setMeta("verification error: " + res.error);
+  else setMeta("nonce " + String(res.nonce || "").slice(0, 16) + "\u2026 \u00b7 pass " +
+    new Date(res.t || Date.now()).toISOString() + " \u00b7 this page view only");
+  for (const c of res.checks || []) setRow(c.name, c.status, c.why);
+  fillServerFacts(res.serverFacts);
+  for (const r of res.sections || []) setRow(r.label, r.status, r.value);
+  finishPass(res.error ? "not evaluated: " + res.error
+                       : (res.noEnvelope ? "not evaluated: no envelope was fetched" : "not evaluated this pass"));
+  if (res.swLen != null) setFooter(res.swLen, res.swSha);
+}
 
 // =============================================================================
 // REGION C — THE PAGE RUNNER (replaces the service-worker lifecycle).
@@ -1506,49 +1703,38 @@ function render(res) {
 // The single-file pivot has NO service worker: the verifier, the shell, and the
 // CSS all live in one bootproof.html. So the SW install/activate/fetch/message
 // handlers and the broadcast-to-clients plumbing are gone. What remains is the
-// exact same verdict -> render -> paint path, driven from the page instead of a
-// client postMessage.
+// exact same verdict computation, DELIVERED as row flips on the pending-first
+// static document instead of a whole-page innerHTML replacement.
 //
-// Everything ABOVE this banner (the crypto region + runVerification + render +
-// the display helpers) is the SAME code the service worker ships: byte-identical
-// for the crypto region, and edited only at the footer (the self-hash doctrine).
-// Nothing about how a verdict is COMPUTED changed here; only how it is DELIVERED
-// (innerHTML on #app instead of postMessage to a client).
+// Everything ABOVE REGION C (the crypto region + the checks + renderSections +
+// the flip layer) is byte-identical to the service worker's crypto region and
+// semantically equal elsewhere: nothing about how a verdict is COMPUTED
+// changed here; only how it is DELIVERED (row flips on the static tables).
 //
-// Two modes, selected by the URL:
-//   default          live: loop runVerification(location.origin) every REFRESH_MS,
-//                    exactly like the SW did on activate().
-//   ?fixture=1       hermetic deterministic run for the cross-verifier gate:
-//                    drive the SAME check functions the node harness drives
-//                    (fixtures/system_health/harness.js) over a frozen envelope +
-//                    frozen nonce, render, paint. No random nonce, no live echo.
-//                    This is NOT a bypass: it still runs the real crypto checks;
-//                    on a live origin it needs the local fixture server's
-//                    /fixture.nonce endpoint or it honestly fails.
+// Three modes, selected by the URL:
+//   default          live: loop runVerification(location.origin) every REFRESH_MS.
+//   ?fixture=1       hermetic deterministic run (the node harness's browser
+//                    twin) over a frozen envelope + frozen nonce.
+//   ?static=1        THE PENDING PROOF: run NOTHING. No fetch, no timer, no
+//                    flip. The document stays exactly as the server sent it:
+//                    every row PENDING. This is the mode the CDP gate's
+//                    static pass loads with JavaScript disabled-equivalent
+//                    assertions: what it paints must equal what a JS-disabled
+//                    browser paints, because in this mode nothing runs.
 
-let lastResult = null;
 let loopHandle = null;
 
-function paint(html) {
-  // innerHTML is fed ONLY render()'s own escaped output (every envelope byte
-  // already went through esc()); never raw envelope data. Same one-renderer
-  // invariant the broadcast() contract held.
-  const app = document.getElementById("app");
-  if (app) app.innerHTML = html;
-}
-
-// The self-measurement, hoisted out of runVerification so the crypto region and
-// runVerification stay byte-identical to the service worker. This is the SAME
-// act the SW performed when it fetched origin + "/verify.js" for its self-report:
-// fetch a URL at runtime, hash the returned bytes. Here the URL is the page's own
-// href, so the page measures its own served bytes. A measurement, not a claim.
+// The self-measurement: the SAME act the SW performed when it fetched
+// origin + "/verify.js" for its self-report: fetch a URL at runtime, hash the
+// returned bytes. Here the URL is the page's own href, so the page measures
+// its own served bytes. A measurement, not a claim.
 async function selfMeasure() {
   let swLen = null, swSha = null;
   try {
     const bytes = await (await fetch(location.href, { cache: "no-store" })).arrayBuffer();
     swLen = bytes.byteLength;
     swSha = await sha256Hex(new Uint8Array(bytes));
-  } catch (e) { /* header still shows BOOTPROOF_SHA256 from the build side */ }
+  } catch (e) { /* footer keeps its static honest text */ }
   return { swLen: swLen, swSha: swSha };
 }
 
@@ -1557,22 +1743,19 @@ async function loop(origin) {
   try {
     result = await runVerification(origin);
   } catch (e) {
-    // The verifier itself crashed: the HONEST verdict is FAILED with the reason.
-    // A bug never renders as a green check.
-    result = { ok: false, overall: FAILED, error: "verifier error: " + e, checks: [], serverFacts: [], t: Date.now() };
+    // The verifier itself crashed: rows that never flipped read NOT PROVEN
+    // with the reason. A bug never renders as a green check.
+    result = { ok: false, overall: FAILED, error: "verifier error: " + e, checks: [], serverFacts: [], sections: [], t: Date.now() };
   }
-  try {
-    const m = await selfMeasure();
-    result.swLen = m.swLen; result.swSha = m.swSha;
-    lastResult = result;
-    paint(render(result));
-  } catch (e) { /* render never throws on well-formed result; keep the last paint */ }
+  const m = await selfMeasure();
+  result.swLen = m.swLen; result.swSha = m.swSha;
+  applyResult(result);
   loopHandle = setTimeout(function () { loop(origin); }, REFRESH_MS);
 }
 
 // The hermetic fixture run: the browser twin of fixtures/system_health/harness.js.
 // It drives the byte-identical check functions over a frozen envelope + frozen
-// nonce, so the painted verdicts are deterministic and match BOTH the Rust
+// nonce, so the flipped verdicts are deterministic and match BOTH the Rust
 // verifier and the node harness. This is what the CDP paint-poll gate loads.
 async function runFixture() {
   const t0 = Date.now();
@@ -1585,8 +1768,9 @@ async function runFixture() {
     env = e;
     nonceHex = String(n || "").trim().toLowerCase();
   } catch (e2) {
-    paint('<h1>System Health<span class="verdict f">' + esc(FAILED) + "</span></h1>" +
-      '<p class="verdict f">fixture load failed: ' + esc(String(e2 && e2.message || e2)) + "</p>");
+    setOverall(FAILED);
+    setMeta("fixture load failed: " + String((e2 && e2.message) || e2));
+    finishPass("not evaluated: the fixture envelope never loaded");
     return;
   }
 
@@ -1633,21 +1817,24 @@ async function runFixture() {
   const result = { ok: overall === PROVEN, overall: overall, nonce: nonceHex,
                    checks: checks, serverFacts: serverFacts, sections: sections,
                    swLen: m.swLen, swSha: m.swSha, t: t0 };
-  lastResult = result;
-  paint(render(result));
+  applyResult(result);
 }
 
 (async function init() {
   // Only a real browser page runs the lifecycle. A node harness that loads this
-  // file purely for the exposed __bootproof_verifier__ seam (the same way it
-  // loads the service worker) has no document/fetch, so it must not auto-fire a
-  // fetch loop at load: guard on the page surface, exactly like the SW guarded
-  // its lifecycle behind addEventListener instead of running at load.
+  // file purely for the exposed __bootproof_verifier__ seam has no
+  // document/fetch, so it must not auto-fire a fetch loop at load.
   if (typeof document === "undefined" || typeof fetch !== "function") return;
   const params = new URLSearchParams(location.search);
+  if (params.get("static") === "1") {
+    // The pending proof mode: deliver NOTHING beyond the served bytes. No
+    // fetch, no timer, no flip. The static PENDING tables ARE the output.
+    return;
+  }
   if (params.get("fixture") === "1") {
     try { await runFixture(); } catch (e) {
-      paint('<p class="verdict f">fixture error: ' + esc(String(e && e.stack || e)) + "</p>");
+      setOverall(FAILED);
+      setMeta("fixture error: " + String((e && e.stack) || e));
     }
     return;
   }
@@ -1656,9 +1843,10 @@ async function runFixture() {
 
 // -----------------------------------------------------------------------------
 // Test seam: the node harness (the golden-fixture agreement test) loads the
-// verifier and drives these functions directly. The page runner exposes the SAME
-// functions under the SAME names as the service worker did, so the harness needs
-// no change to verify the crypto region is byte-for-byte the verifier.
+// verifier and drives these functions directly. The page runner exposes the
+// SAME functions under the SAME names as the service worker did, so the
+// harness needs no change to verify the crypto region is byte-for-byte the
+// verifier.
 // -----------------------------------------------------------------------------
 try {
   self.__bootproof_verifier__ = {
@@ -1678,3 +1866,5 @@ try {
     docDigestNaive: function (text) { return canonicalDocDigestHex(JSON.parse(text)); },
   };
 } catch (e) { /* non-browser context without self: fine */ }
+</script>
+</body></html>

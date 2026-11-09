@@ -4,7 +4,11 @@
 //! verifier ships from THIS crate alongside the Rust verifier it mirrors -
 //! the two cannot drift (a test pins the SW bytes' hash).
 
-/// The System Health HTML shell (title "System Health"; registers /verify.js).
+/// The LEGACY System Health HTML shell (title "System Health"; registers
+/// /verify.js). The single-file pivot supersedes this lane: bastiond serves
+/// single_file::BOOTPROOF_HTML at / and this shell + SW are the one-release
+/// coexistence path (wardend's /verify.js shim). Do NOT add rows or prose
+/// here; the review surface is assets/single_file/.
 pub const SHELL: &str = include_str!("../assets/system_health/shell.html");
 /// The service-worker verifier source (application/javascript; the bytes
 /// baked into the binary, immutable).
@@ -26,10 +30,11 @@ pub const SW: &str = include_str!("../assets/system_health/verify.js");
 pub const SW_SHA256: &str = "5575655a2c1655f488b390717c5317c3e0b72973c5db074305824393bc48d01a";
 
 pub mod schema;
-/// The single-file pivot: the FIRST canonical bootproof.html (verifier + CSS +
-/// markup in one self-contained document, no service worker), generated from
-/// three reviewable sources by fixtures/single_file/combiner.js and embedded
-/// here. See the module docs for the derivation gates.
+/// The single-file pivot: the canonical bootproof.html (the pending-first
+/// one-file document: verifier + CSS + static PENDING tables in one file, no
+/// service worker), spliced from three reviewable operator-named sources by
+/// fixtures/single_file/combiner.js and embedded here. See the module docs
+/// for the derivation gates.
 pub mod single_file;
 
 #[cfg(test)]

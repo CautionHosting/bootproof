@@ -24,10 +24,14 @@
 // override to match the shipped client), timeout 60, port 0 = ephemeral.
 //
 // --expect-row (repeatable): per-row doctrine, per the 08:28Z ruling.
-// For each label (e.g. identity_link), the driver finds the label in the
-// painted text and reads the FIRST verdict word after it (the row renders
-// "label ... VERDICT"). Rules:
+// For each label (e.g. identity_link), the driver finds the row by DOM id
+// (r-<label> / v-<label>) and reads the verdict chip's own text. The
+// pending-first page names rows by id; a text-window scan would let a
+// dotted label (identity_link.pin) match its parent rollup's row. Rules:
 //   FAILED              -> fail (a FAILED row is always a gate failure)
+//   PENDING             -> fail by default (a row still pending when the
+//                          gate reads it never flipped); --allow-pending
+//                          flips that to a pass (the static-paint pass)
 //   NOT PROVEN          -> PASS when the row is a declared pin claim.
 //     Under ruling (iii) identity_link is a pin claim, NOT PROVEN is
 //     honest and must NOT fail the CDP gate ("never dress a pin fact in
@@ -39,10 +43,21 @@
 //   anything else / absent -> fail (the row must paint a verdict word).
 // The exit code is 0 iff painted AND every --expect-row passes.
 //
+// --all-pending: the STATIC-PAINT assertion (the pending-first render law).
+// Every r-* row in the DOM must read exactly PENDING with the pd chip class.
+// Pair with --max-subresource-requests 0: a page whose rows are all pending
+// AND which fetched nothing beyond its own document IS what a JS-disabled
+// browser reads (the ?static=1 mode proves it even with JS on: nothing runs).
+//
+// --max-subresource-requests N: cap on Network.requestWillBeSent events
+// EXCLUDING the main document (and favicon). The document request itself is
+// not counted (the page cannot be gated on not loading itself).
+//
 // Output: one JSON object on stdout:
-//   { painted, match, rows{}, ms, certErrors[], netFailures[],
+//   { painted, match, rows{}, ms, mode, requests[], subresourceRequests,
+//     allPending, certErrors[], netFailures[],
 //     consoleErrors[], title, url }
-// Exit 0 iff painted and rows pass.
+// Exit 0 iff painted and rows pass and the request cap holds.
 
 'use strict';
 const { spawn } = require('child_process');
@@ -71,6 +86,9 @@ function optAll(name) {
   return out;
 }
 const EXPECT_ROWS = optAll('--expect-row');
+const ALL_PENDING = flag('--all-pending');
+const ALLOW_PENDING = flag('--allow-pending');
+const MAX_SUBREQ = opt('--max-subresource-requests', null);
 const marker = opt('--marker', 'bootproof-verdict');
 const markerRe = marker.startsWith('re:')
   ? new RegExp(marker.slice(3))
@@ -232,6 +250,7 @@ function getJson(host, portNo, p) {
   const certErrors = [];
   const netFailures = [];
   const consoleErrors = [];
+  const requests = []; // every Network.requestWillBeSent after attach: {url, type}
 
   function attach(target) {
     const p = new URL(target.webSocketDebuggerUrl).pathname;
@@ -266,6 +285,8 @@ function getJson(host, portNo, p) {
       else if (e.level === 'error') consoleErrors.push(line);
     } else if (m.method === 'Network.loadingFailed') {
       netFailures.push(`${P.errorText || 'failed'}${P.certificateError ? ' cert:' + P.certificateError : ''}`);
+    } else if (m.method === 'Network.requestWillBeSent') {
+      requests.push({ url: P.request ? P.request.url : '?', type: P.type || 'Other' });
     } else if (m.method === 'Security.securityStateAdded' || m.method === 'Security.certificateErrorAdded') {
       if (P.state === 'insecure' || m.method.endsWith('certificateErrorAdded')) {
         certErrors.push(JSON.stringify(P).slice(0, 300));
@@ -283,6 +304,23 @@ function getJson(host, portNo, p) {
 
   const t0 = Date.now();
   let painted = false, matchSnippet = '', title = '', paintedText = '';
+  // The row probe runs in-page and is ID-BASED: a dotted label can never be
+  // confused with its parent rollup. Returns {id:{verdict,cls,rowCls}}.
+  const ROW_PROBE =
+    'JSON.stringify((function(){' +
+    'var o={};var trs=document.querySelectorAll("tr[id^=\\"r-\\"]");' +
+    'for(var i=0;i<trs.length;i++){' +
+    'var id=trs[i].id.slice(2);var v=document.getElementById("v-"+id);' +
+    'o[id]={verdict:v?v.textContent:null,cls:v?v.className:null,rowCls:trs[i].className||"",' +
+    'why:(function(){var w=document.getElementById("w-"+id);return w?w.textContent:null;})()};}' +
+    'return o;})())';
+  // The page href probe: chrome can hand us a target whose /json/list url is
+  // the launch URL while the live document is still about:blank (witnessed on
+  // the static pass: every evaluate ran on about:blank for the full timeout).
+  // When that happens we Page.navigate the attached target ourselves; the
+  // launch-url-at-boot assumption is not something CDP guarantees.
+  const HREF_PROBE = 'location.href';
+  let navigated = false;
   let lastList = 0;
   while (Date.now() - t0 < TIMEOUT_MS) {
     // Re-attach if the socket died or the target id vanished (chrome
@@ -294,10 +332,22 @@ function getJson(host, portNo, p) {
         const fresh = list.find((x) => x.type === 'page' && x.url === url) ||
                       list.find((x) => x.type === 'page' && x.webSocketDebuggerUrl && x.url !== 'about:blank') ||
                       list.find((x) => x.type === 'page' && x.webSocketDebuggerUrl);
-        if (fresh && (wsDead || fresh.id !== cur.id)) attach(fresh);
+        if (fresh && (wsDead || fresh.id !== cur.id)) { attach(fresh); navigated = false; }
       } catch { /* chrome mid-restart; retry next tick */ }
     }
     if (wsDead) { await new Promise((r2) => setTimeout(r2, 250)); continue; }
+    // Self-heal the about:blank target: one forced navigation per attach
+    // generation, only if the live document is not our URL.
+    if (!navigated) {
+      const h = await cmd('Runtime.evaluate', { expression: HREF_PROBE, returnByValue: true });
+      const href = (h && h.result && h.result.value) || '';
+      if (typeof href === 'string' && href !== url && !href.startsWith(url.split('?')[0])) {
+        await cmd('Page.navigate', { url });
+        navigated = true; // navigate once per generation; the reconnect below re-arms
+      } else {
+        navigated = true; // already on the right document, nothing to fix
+      }
+    }
     const r = await cmd('Runtime.evaluate', {
       expression: 'JSON.stringify({p: document.body ? document.body.innerText : "", t: document.title})',
       returnByValue: true,
@@ -306,7 +356,16 @@ function getJson(host, portNo, p) {
     try { doc = JSON.parse(r && r.result && r.result.value || '{}'); } catch {}
     title = doc.t || title;
     paintedText = doc.p || paintedText;
-    if (markerRe.test(doc.p)) {
+    // Readiness: the marker paints, OR (static mode) the pending rows are in
+    // the DOM — they exist the moment the document parses, and the static
+    // pass must not wait for anything that never runs.
+    let rowsNow = null;
+    if (ALL_PENDING) {
+      const rr = await cmd('Runtime.evaluate', { expression: ROW_PROBE, returnByValue: true });
+      try { rowsNow = JSON.parse(rr && rr.result && rr.result.value || 'null'); } catch {}
+    }
+    const pendingHit = ALL_PENDING && rowsNow && Object.keys(rowsNow).length > 10;
+    if (markerRe.test(doc.p) || pendingHit) {
       painted = true;
       const i = doc.p.indexOf(marker.startsWith('re:') ? '' : marker);
       matchSnippet = doc.p.slice(Math.max(0, i), i + 200).replace(/\s+/g, ' ');
@@ -328,22 +387,45 @@ function getJson(host, portNo, p) {
   }
 
   // -- Per-row doctrine checks (ruling iii: NOT PROVEN pin claim = PASS).
-  // The first verdict word after the label IS the row's verdict; the
-  // render emits "label ... <verdict>" with no nested verdict words
-  // between, so a bounded lookahead finds it.
+  // Rows are read by DOM id (v-<label>), never by a text window.
+  let liveRows = {};
+  {
+    const rr = await cmd('Runtime.evaluate', { expression: ROW_PROBE, returnByValue: true });
+    try { liveRows = JSON.parse(rr && rr.result && rr.result.value || '{}'); } catch {}
+  }
   const rows = {};
   let rowsOk = true;
   for (const label of EXPECT_ROWS) {
-    const i = paintedText.indexOf(label);
-    if (i < 0) { rows[label] = { verdict: null, pass: false, why: 'label not painted' }; rowsOk = false; continue; }
-    const win = paintedText.slice(i + label.length, i + label.length + 80);
-    const m = win.match(/(NOT PROVEN|PROVEN|FAILED)/);
-    if (!m) { rows[label] = { verdict: null, pass: false, why: 'no verdict word within 80 chars' }; rowsOk = false; continue; }
-    const v = m[1];
-    const pass = v !== 'FAILED';
-    rows[label] = { verdict: v, pass, why: v === 'NOT PROVEN' ? 'pin-claim doctrine: NOT PROVEN is a pass (ruling iii)' : v === 'PROVEN' ? (label === 'identity_link' ? 'UNEXPECTED under key separation, but pass; flag it' : 'proven') : 'failed rows fail the gate' };
+    const ent = liveRows[label];
+    const v = ent && ent.verdict ? String(ent.verdict).trim() : null;
+    if (!v) { rows[label] = { verdict: null, pass: false, why: 'row chip v-' + label + ' not painted' }; rowsOk = false; continue; }
+    let pass;
+    if (v === 'PENDING') pass = !!ALLOW_PENDING;
+    else pass = v !== 'FAILED';
+    rows[label] = { verdict: v, why_text: ent.why == null ? null : String(ent.why).slice(0, 300), pass, why: v === 'PENDING' ? (ALLOW_PENDING ? 'pending pass allowed (static paint)' : 'row never flipped') : v === 'NOT PROVEN' ? 'pin-claim doctrine: NOT PROVEN is a pass (ruling iii)' : v === 'PROVEN' ? (label === 'identity_link' ? 'UNEXPECTED under key separation, but pass; flag it' : 'proven') : 'failed rows fail the gate' };
     if (!pass) rowsOk = false;
   }
+
+  // -- The static-paint check: EVERY row PENDING with the pd chip class.
+  let allPending = null;
+  if (ALL_PENDING) {
+    const bad = [];
+    for (const id of Object.keys(liveRows)) {
+      const e = liveRows[id];
+      const v = e.verdict ? String(e.verdict).trim() : null;
+      if (v !== 'PENDING') bad.push(id + '=' + v);
+      else if (!/pd/.test(e.cls || '')) bad.push(id + '=chip-cls');
+      else if (e.rowCls && !/pd/.test(e.rowCls)) bad.push(id + '=row-cls');
+    }
+    allPending = { count: Object.keys(liveRows).length, bad };
+    if (!allPending.count) allPending.bad.push('(no rows found)');
+    if (allPending.bad.length) rowsOk = false;
+  }
+
+  // -- Subresource accounting: everything but the main document + favicon.
+  const subreq = requests.filter((q) => q.type !== 'Document' && !/favicon\.ico/.test(q.url));
+  let reqOk = true;
+  if (MAX_SUBREQ !== null && subreq.length > parseInt(MAX_SUBREQ, 10)) reqOk = false;
 
   const out = {
     painted,
@@ -351,6 +433,9 @@ function getJson(host, portNo, p) {
     rows,
     ms: Date.now() - t0,
     mode: BYPASS ? 'bypass-cert(precert)' : 'strict-cert',
+    requests,
+    subresourceRequests: subreq.length,
+    allPending,
     certErrors, netFailures, consoleErrors,
     title, url,
     error: wsErrs.length ? wsErrs[wsErrs.length - 1] : null,
@@ -359,5 +444,5 @@ function getJson(host, portNo, p) {
   console.log(JSON.stringify(out, null, 2));
   try { await cmd('Target.closeTarget', { targetId: cur.id }); } catch {}
   proc.kill('SIGKILL');
-  process.exit(painted && rowsOk ? 0 : 1);
+  process.exit(painted && rowsOk && reqOk ? 0 : 1);
 })().catch((e) => { console.error('driver failed:', e.message); process.exit(3); });

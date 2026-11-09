@@ -16,7 +16,10 @@ const fs = require('fs');
 const path = require('path');
 
 const ROOT = path.join(__dirname, '..', '..'); // repo root
-const HTML = path.join(ROOT, 'crates', 'bootproof', 'src', 'assets', 'single_file', 'bootproof.html');
+// The DELIVERED artifact (the spliced dist bytes), NOT the shell source: the
+// shell still carries the {{BOOTPROOF_CSS}}/{{BOOTPROOF_JS}} sentinels and is
+// not servable. The gate therefore tests exactly what bastiond embeds.
+const HTML = path.join(ROOT, 'crates', 'bootproof', 'src', 'assets', 'dist', 'bootproof.html');
 
 // Which fixture envelope: --fixture <path> (default golden.json). The gate
 // drives golden.json; tamper twins can be pointed at the same server later.
