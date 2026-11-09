@@ -19,14 +19,30 @@
 //
 // Usage:
 //   node cdp-paint-poll.js <url> [--marker <substring|regex>] [--bypass-cert]
-//        [--timeout <secs>] [--port <n>]
+//        [--timeout <secs>] [--port <n>] [--expect-row <label>]...
 // Defaults: marker "bootproof-verdict" (the shell's verdict container id;
 // override to match the shipped client), timeout 60, port 0 = ephemeral.
 //
+// --expect-row (repeatable): per-row doctrine, per the 08:28Z ruling.
+// For each label (e.g. identity_link), the driver finds the label in the
+// painted text and reads the FIRST verdict word after it (the row renders
+// "label ... VERDICT"). Rules:
+//   FAILED              -> fail (a FAILED row is always a gate failure)
+//   NOT PROVEN          -> PASS when the row is a declared pin claim.
+//     Under ruling (iii) identity_link is a pin claim, NOT PROVEN is
+//     honest and must NOT fail the CDP gate ("never dress a pin fact in
+//     a PROVEN costume"; a red verdict from a working verifier is still
+//     a working verifier). PROVEN on identity_link would be the SURPRISE
+//     (it would mean the leaf key == the signer key, which the ruling
+//     says is structurally impossible while key separation holds), so
+//     the run PASSES on both NOT PROVEN and PROVEN but reports which.
+//   anything else / absent -> fail (the row must paint a verdict word).
+// The exit code is 0 iff painted AND every --expect-row passes.
+//
 // Output: one JSON object on stdout:
-//   { painted, match, ms, certErrors[], netFailures[], consoleErrors[],
-//     title, url }
-// Exit 0 iff painted.
+//   { painted, match, rows{}, ms, certErrors[], netFailures[],
+//     consoleErrors[], title, url }
+// Exit 0 iff painted and rows pass.
 
 'use strict';
 const { spawn } = require('child_process');
@@ -49,6 +65,12 @@ function opt(name, dflt) {
   const i = argv.indexOf(name);
   return i >= 0 && argv[i + 1] ? argv[i + 1] : dflt;
 }
+function optAll(name) {
+  const out = [];
+  for (let i = 0; i < argv.length; i++) if (argv[i] === name && argv[i + 1]) out.push(argv[i + 1]);
+  return out;
+}
+const EXPECT_ROWS = optAll('--expect-row');
 const marker = opt('--marker', 'bootproof-verdict');
 const markerRe = marker.startsWith('re:')
   ? new RegExp(marker.slice(3))
@@ -63,6 +85,16 @@ const PORT = parseInt(opt('--port', '0'), 10);
 
 function wsConnect(host, portNo, resource, onMessage, onClose) {
   const key = crypto.randomBytes(16).toString('base64');
+  // READY GATE (a witnessed race, fixed): writes issued before the HTTP
+  // upgrade completes can flush on socket-connect in an ordering node
+  // does not define relative to the connect callback below, so chrome can
+  // receive raw CDP JSON BEFORE the upgrade request and kill the socket
+  // (witnessed: 4 reconnects, every one 'socket closed', zero events).
+  // Frames sent before the 101 response are QUEUED here and flushed in
+  // order the moment the handshake completes. No send ever precedes the
+  // upgrade, deterministically.
+  let ready = false;
+  const queue = [];
   const sock = net.connect(portNo, host, () => {
     sock.write(
       `GET ${resource} HTTP/1.1\r\n` +
@@ -85,6 +117,9 @@ function wsConnect(host, portNo, resource, onMessage, onClose) {
       }
       handoff = true;
       buf = buf.slice(end + 4);
+      ready = true;
+      for (const q of queue) rawSend(q);
+      queue.length = 0;
     }
     // Frame decode (server->client: unmasked). Handles 7/16/64-bit lengths;
     // CDP never fragments text at these sizes in practice, but we re-arm on
@@ -106,7 +141,7 @@ function wsConnect(host, portNo, resource, onMessage, onClose) {
   sock.on('error', onClose);
   sock.on('close', () => onClose(new Error('socket closed')));
 
-  function send(obj) {
+  function rawSend(obj) {
     const data = Buffer.from(JSON.stringify(obj));
     const mask = crypto.randomBytes(4);
     let head;
@@ -119,6 +154,9 @@ function wsConnect(host, portNo, resource, onMessage, onClose) {
     const masked = Buffer.alloc(data.length);
     for (let i = 0; i < data.length; i++) masked[i] = data[i] ^ mask[i & 3];
     sock.write(Buffer.concat([head, mask, masked]));
+  }
+  function send(obj) {
+    if (ready) rawSend(obj); else queue.push(obj);
   }
   return { send, sock };
 }
@@ -175,22 +213,44 @@ function getJson(host, portNo, p) {
     if (!t) await new Promise((r) => setTimeout(r, 200));
   }
   if (!t) { proc.kill('SIGKILL'); throw new Error('no page target found'); }
-  const wsPath = new URL(t.webSocketDebuggerUrl).pathname;
 
-  const ws = wsConnect('127.0.0.1', portNo, wsPath, onMsg, (e) => { resultError = String(e); });
+  // The live websocket, swappable: chrome can recreate the page target
+  // mid-load (the target we grabbed from /json/list can be destroyed and
+  // replaced with a fresh id; witnessed live when a run closed its socket
+  // with zero paint events). The poll loop re-checks /json/list and
+  // reconnects to whatever page target currently serves our URL.
+  let ws = null;
+  let wsDead = true;
+  let cur = t;
+  const wsErrs = [];
 
+  // Declared BEFORE attach: attach() calls cmd() synchronously, and
+  // cmd() touches id/pending (a let/const below the call site would be a
+  // TDZ ReferenceError).
   let id = 0;
   const pending = new Map();
   const certErrors = [];
   const netFailures = [];
   const consoleErrors = [];
-  let resultError = '';
+
+  function attach(target) {
+    const p = new URL(target.webSocketDebuggerUrl).pathname;
+    ws = wsConnect('127.0.0.1', portNo, p, onMsg, (e) => { wsErrs.push(String(e)); wsDead = true; });
+    wsDead = false;
+    cur = target;
+    // Domains must be re-enabled on the fresh session (the old target's
+    // event stream died with it).
+    cmd('Page.enable'); cmd('Runtime.enable'); cmd('Network.enable');
+    cmd('Security.enable'); cmd('Log.enable');
+  }
+  attach(cur);
 
   function cmd(method, params) {
     return new Promise((resolve) => {
       const mid = ++id;
       pending.set(mid, resolve);
-      ws.send({ id: mid, method, params: params || {} });
+      try { ws.send({ id: mid, method, params: params || {} }); }
+      catch { pending.delete(mid); resolve({ __wsdead: true }); }
       // CDP errors resolve too (we log, never hang).
       setTimeout(() => { if (pending.has(mid)) { pending.delete(mid); resolve({ __timeout: true }); } }, 15000);
     });
@@ -222,8 +282,22 @@ function getJson(host, portNo, p) {
   await cmd('Log.enable');
 
   const t0 = Date.now();
-  let painted = false, matchSnippet = '', title = '';
+  let painted = false, matchSnippet = '', title = '', paintedText = '';
+  let lastList = 0;
   while (Date.now() - t0 < TIMEOUT_MS) {
+    // Re-attach if the socket died or the target id vanished (chrome
+    // recreated the page). /json/list is cheap; poll it at 1 Hz.
+    if (wsDead || Date.now() - lastList > 1000) {
+      lastList = Date.now();
+      try {
+        const list = await getJson('127.0.0.1', portNo, '/json/list');
+        const fresh = list.find((x) => x.type === 'page' && x.url === url) ||
+                      list.find((x) => x.type === 'page' && x.webSocketDebuggerUrl && x.url !== 'about:blank') ||
+                      list.find((x) => x.type === 'page' && x.webSocketDebuggerUrl);
+        if (fresh && (wsDead || fresh.id !== cur.id)) attach(fresh);
+      } catch { /* chrome mid-restart; retry next tick */ }
+    }
+    if (wsDead) { await new Promise((r2) => setTimeout(r2, 250)); continue; }
     const r = await cmd('Runtime.evaluate', {
       expression: 'JSON.stringify({p: document.body ? document.body.innerText : "", t: document.title})',
       returnByValue: true,
@@ -231,26 +305,59 @@ function getJson(host, portNo, p) {
     let doc = { p: '', t: '' };
     try { doc = JSON.parse(r && r.result && r.result.value || '{}'); } catch {}
     title = doc.t || title;
+    paintedText = doc.p || paintedText;
     if (markerRe.test(doc.p)) {
       painted = true;
       const i = doc.p.indexOf(marker.startsWith('re:') ? '' : marker);
       matchSnippet = doc.p.slice(Math.max(0, i), i + 200).replace(/\s+/g, ' ');
+      // Give the SW one extra beat to paint the remaining rows: the shell
+      // fills innerHTML with ALL rows in one message, but a partial paint
+      // followed by the full one is possible across SW posts, and an
+      // expect-row that missed by 200 ms would be a false fail.
+      if (EXPECT_ROWS.length) {
+        await new Promise((r2) => setTimeout(r2, 1000));
+        const rr = await cmd('Runtime.evaluate', {
+          expression: 'JSON.stringify({p: document.body ? document.body.innerText : ""})',
+          returnByValue: true,
+        });
+        try { const d2 = JSON.parse(rr && rr.result && rr.result.value || '{}'); if (d2.p) paintedText = d2.p; } catch {}
+      }
       break;
     }
     await new Promise((r2) => setTimeout(r2, 250));
   }
 
+  // -- Per-row doctrine checks (ruling iii: NOT PROVEN pin claim = PASS).
+  // The first verdict word after the label IS the row's verdict; the
+  // render emits "label ... <verdict>" with no nested verdict words
+  // between, so a bounded lookahead finds it.
+  const rows = {};
+  let rowsOk = true;
+  for (const label of EXPECT_ROWS) {
+    const i = paintedText.indexOf(label);
+    if (i < 0) { rows[label] = { verdict: null, pass: false, why: 'label not painted' }; rowsOk = false; continue; }
+    const win = paintedText.slice(i + label.length, i + label.length + 80);
+    const m = win.match(/(NOT PROVEN|PROVEN|FAILED)/);
+    if (!m) { rows[label] = { verdict: null, pass: false, why: 'no verdict word within 80 chars' }; rowsOk = false; continue; }
+    const v = m[1];
+    const pass = v !== 'FAILED';
+    rows[label] = { verdict: v, pass, why: v === 'NOT PROVEN' ? 'pin-claim doctrine: NOT PROVEN is a pass (ruling iii)' : v === 'PROVEN' ? (label === 'identity_link' ? 'UNEXPECTED under key separation, but pass; flag it' : 'proven') : 'failed rows fail the gate' };
+    if (!pass) rowsOk = false;
+  }
+
   const out = {
     painted,
     match: matchSnippet,
+    rows,
     ms: Date.now() - t0,
     mode: BYPASS ? 'bypass-cert(precert)' : 'strict-cert',
     certErrors, netFailures, consoleErrors,
     title, url,
-    error: resultError || null,
+    error: wsErrs.length ? wsErrs[wsErrs.length - 1] : null,
+    reconnects: wsErrs.length,
   };
   console.log(JSON.stringify(out, null, 2));
-  try { await cmd('Target.closeTarget', { targetId: t.id }); } catch {}
+  try { await cmd('Target.closeTarget', { targetId: cur.id }); } catch {}
   proc.kill('SIGKILL');
-  process.exit(painted ? 0 : 1);
+  process.exit(painted && rowsOk ? 0 : 1);
 })().catch((e) => { console.error('driver failed:', e.message); process.exit(3); });
