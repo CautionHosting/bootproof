@@ -390,6 +390,7 @@ mod tests {
                 sign_pcrs: None,
                 slot_link: SlotLink::NoSlotPcr,
                 ek_cert: None,
+                nsm_binding: crate::channel::NsmBinding::Absent,
             }))
         }
         fn facts(&self, _v: &Verified) -> Vec<Fact> {

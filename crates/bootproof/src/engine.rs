@@ -374,6 +374,7 @@ mod tests {
                     sign_pcrs: None,
                     slot_link: crate::channel::SlotLink::NoSlotPcr,
                     ek_cert: None,
+                    nsm_binding: crate::channel::NsmBinding::Absent,
                 }))
             }
         }

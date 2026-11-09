@@ -136,6 +136,35 @@ pub enum SlotLink {
     NoSlotPcr,
 }
 
+/// The NitroNSM identity-binding decision for a bundle's `nsm_doc` anchor.
+///
+/// The AWS NSM attestation document is the NitroTPM equivalent of the NV
+/// EK certificate: a vendor-signed statement (COSE_Sign1, chained to the
+/// AWS Nitro root baked in bootproof-sdk) of "this public area is the
+/// attestation key of module X, at challenge N". The binding check ties
+/// that statement to the AK that signed the quote.
+///
+/// The three states mirror the ek_cert absent/present split and MUST stay
+/// distinguishable on the wire (contract rule: an honest absence is
+/// structurally different from a failed check):
+///   * `Absent`  -- no `nsm_doc` anchor (non-Nitro platform, or the node
+///                  could not produce one). Honest silence.
+///   * `Failed`  -- a doc IS present and something about it fails: the
+///                  signature, the chain, the nonce echo, or the AK
+///                  equality. Loud, with the reason. NEVER silently
+///                  passes.
+///   * `Proven`  -- signature + chain + nonce + AK equality all hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NsmBinding {
+    /// No `nsm_doc` anchor in the bundle.
+    Absent,
+    /// The anchor is present and fully verified; carries the vendor-
+    /// attested module id (e.g. `i-0123...-tpm0000...`).
+    Proven { module_id: String },
+    /// The anchor is present but failed a check; carries the honest reason.
+    Failed(String),
+}
+
 /// Verified tpm2 channel data.
 pub struct Tpm2Verified {
     /// The attested per-PCR digests (index -> digest), in ascending order,
@@ -154,6 +183,10 @@ pub struct Tpm2Verified {
     pub slot_link: SlotLink,
     /// EK certificate bytes, if the node bundled one.
     pub ek_cert: Option<Vec<u8>>,
+    /// The NitroNSM identity-binding decision over the `nsm_doc` anchor
+    /// (Absent on non-Nitro bundles; Proven only when the AWS-signed doc
+    /// chains, echoes the nonce, and names this quote's AK).
+    pub nsm_binding: NsmBinding,
 }
 
 /// Verified snp channel data: a SEV-SNP firmware attestation report that

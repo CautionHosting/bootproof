@@ -549,6 +549,9 @@ impl Verifier for WardendVerifier {
             sign_pcrs: None,
             slot_link: bootproof::channel::SlotLink::NoSlotPcr,
             ek_cert: None,
+            // The wardend channel renders its own facts; the NSM binding
+            // decision belongs to the tpm2 channel's verifier.
+            nsm_binding: bootproof::channel::NsmBinding::Absent,
         }))
     }
 

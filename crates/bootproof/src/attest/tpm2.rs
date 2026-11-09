@@ -55,6 +55,14 @@ pub fn attested_selection() -> PcrSelection {
 pub struct Tpm2 {
     device: std::path::PathBuf,
     tcp: Option<String>,
+    /// The raw NV scratch index the NSM identity doc uses as its message
+    /// buffer (`Some` = attempt the NSM vendor command). OPT-IN because the
+    /// vendor flow WRITES the index (dialect NV holds only 3 indices and
+    /// NV_UndefineSpace is broken, so the platform pre-defines one); a
+    /// non-Nitro host must never touch NV for an attestation it cannot
+    /// complete. A platform configures this (`with_nsm_scratch`) after
+    /// defining the index; `None` keeps the channel pure-read.
+    nsm_scratch: Option<u32>,
 }
 
 impl Tpm2 {
@@ -62,7 +70,18 @@ impl Tpm2 {
         Self {
             device: device.into(),
             tcp: None,
+            nsm_scratch: None,
         }
+    }
+
+    /// Enable the NSM identity doc leg: the raw NV scratch index (lower 24
+    /// bits; NV_HANDLE_BASE is added by `attest.rs`) the platform has
+    /// already defined with empty owner auth, 8 KiB, AUTHWRITE|OWNERWRITE.
+    /// NitroTPM platforms (wardend seald) call this; other platforms never
+    /// do, so the vendor command is never issued and NV is never written.
+    pub fn with_nsm_scratch(mut self, index: u32) -> Self {
+        self.nsm_scratch = Some(index);
+        self
     }
 
     /// Use a swtpm over TCP (host:port) instead of the char device.
@@ -224,6 +243,36 @@ impl Channel for Tpm2 {
         //    NV_Read (chunked to TPM_PT_NV_BUFFER_MAX) for the bytes.
         let ek_cert = read_ek_cert(&mut tpm);
 
+        // 6b. NSM identity document (NitroTPM only, best effort). The AWS
+        //     NSM vendor command (`0x20000001`) produces a COSE_Sign1
+        //     attestation document signed by the AWS Nitro attestation PKI
+        //     (chains to the root already baked in bootproof-sdk). The
+        //     request carries THIS run's AK public area as `public_key` and
+        //     the challenge nonce: AWS thereby signs "the key that quotes
+        //     on this TPM at this challenge" -- the AK binding that the NV
+        //     EK cert provides on other platforms and NitroTPM lacks.
+        //     Fresh per request (the nonce rides inside the signed doc), so
+        //     no cache and no TTL exists to get wrong. Honest absence on
+        //     every failure path (non-Nitro firmware, no scratch NV index,
+        //     vendor error): the bundle simply carries no `nsm_doc` anchor
+        //     and the verifier stays silent on the binding, exactly the
+        //     ek_cert absent/present split.
+        let nsm_doc = match self.nsm_scratch {
+            Some(scratch) => match tpm.attestation_document(
+                None,
+                Some(qualifying.to_vec()),
+                Some(ak.public.clone()),
+                scratch,
+            ) {
+                Ok(doc) => Some(doc),
+                Err(e) => {
+                    eprintln!("[attest] no NSM identity doc (vendor command failed): {e}");
+                    None
+                }
+            },
+            None => None,
+        };
+
         // The tpm2 doc.
         let mut doc = Vec::new();
         doc.push(1); // version
@@ -240,6 +289,9 @@ impl Channel for Tpm2 {
         let mut anchors = std::collections::BTreeMap::new();
         if let Some(cert) = ek_cert {
             anchors.insert("ek_cert".into(), B64::new(cert));
+        }
+        if let Some(doc) = nsm_doc {
+            anchors.insert("nsm_doc".into(), B64::new(doc));
         }
 
         let evidence = Evidence {

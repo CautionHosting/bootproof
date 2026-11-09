@@ -24,6 +24,108 @@ use sha2::Sha256;
 use bootproof_tpm::commands_policy::{policy_pcr_auth_policy, parse_public_area};
 use bootproof_tpm::{PcrSelection, constants::alg};
 
+/// The NSM identity-doc check legs that need the AWS Nitro PKI path: the
+/// COSE_Sign1 signature + cert chain to the baked root + nonce echo.
+/// `bootproof_sdk::format::nitro::Nitro::verify` owns that machinery (it
+/// already gates the sdk's own attestation flow); the bootproof core
+/// reuses it rather than re-implementing COSE/webpki here -- the
+/// governing principle in reverse: ONE implementation of each vendor
+/// verifier, consumed through the registry, never forked.
+fn nsm_sig_chain_nonce_ok(doc_bytes: &[u8], nonce: &[u8], at_secs: u64) -> Result<(), String> {
+    use bootproof_sdk::format::nitro::{Nitro, NitroPcrs};
+    use bootproof_sdk::format::VerifiableSignedAttestationFormat;
+    use std::collections::HashMap;
+    use std::time::Duration;
+    // Empty PCR policy: the sdk verifies signature + chain + nonce with no
+    // PCR pin. PCR agreement between the NSM doc and the TPM quote is NOT
+    // checked here on purpose -- the two are different PCRs (NSM reports
+    // SHA-384 enclave/NitroTPM PCRs; the quote is SHA-256 over the
+    // platform set) and pinning their correspondence is a separate,
+    // explicitly-scoped contract extension. The AK public-area equality
+    // is the binding.
+    let pcrs: NitroPcrs = HashMap::new();
+    Nitro::with_pcr_policy(doc_bytes.to_vec(), pcrs)
+        // `&&[u8]`: the sealed AsNonce blanket impl covers sized types, so
+        // the slice reference itself is the nonce value.
+        .verify(Duration::from_secs(at_secs), &nonce)
+        .map(|_| ())
+        .map_err(|e| format!("nsm doc: {e}"))
+}
+
+/// Pure NSM binding decision (factored out so the arms are testable with
+/// an explicit `now`; `verify()` calls it with the wall clock).
+///
+/// `ak_public` is the RAW TPMT_PUBLIC bytes the quote was signed by
+/// (already signature-verified by the caller). Freshness design:
+///   * REPLAY is bound by the nonce: the doc signs `nonce == this
+///     challenge`, so an old doc cannot answer a new challenge.
+///   * STALENESS is bound by the AWS cert validity window: the chain
+///     check runs at the wall clock, and the NSM signing cert is valid
+///     for ~3 hours around issuance, so a doc older than that window
+///     fails closed through webpki (`CertExpired`). A live capture proves
+///     the window (measured: notBefore/notAfter 2h57m apart on the
+///     fixture leaf). No separate max-age constant exists to get wrong.
+/// `now_secs` is therefore ONLY an injectable test seam for the wall
+/// clock; production always passes the real clock.
+fn nsm_binding_decision(
+    anchor: Option<&[u8]>,
+    nonce: &[u8],
+    ak_public: &[u8],
+    now_secs: u64,
+) -> crate::channel::NsmBinding {
+    use crate::channel::NsmBinding;
+    let Some(doc_bytes) = anchor else {
+        return NsmBinding::Absent;
+    };
+    // Parse first: the public_key + module_id echo what AWS signed.
+    let facts = match bootproof_tpm::attest::parse_attestation_document(doc_bytes) {
+        Ok(f) => f,
+        Err(e) => return NsmBinding::Failed(format!("nsm doc: {e}")),
+    };
+    // Leg (a): COSE signature + chain to the baked Nitro root + the nonce
+    // echo. Runs at `now` in production: an expired doc (a replay older
+    // than the ~3h cert window) fails here, loudly.
+    if let Err(e) = nsm_sig_chain_nonce_ok(doc_bytes, nonce, now_secs) {
+        return NsmBinding::Failed(e);
+    }
+    // Leg (b): THE decisive assertion. The doc's `public_key` is the
+    // AWS-signed statement of "the attestation key on this module". It
+    // must equal the TPMT_PUBLIC that signed the quote, byte for byte.
+    // Anything else is forged-identity territory: fail closed, loudly.
+    nsm_ak_match_arm(facts.public_key.as_deref(), ak_public, &facts.module_id)
+}
+
+/// The AK-equality arm, factored out so the decisive byte comparison is
+/// unit-witnessed on all three sub-arms (match / mismatch / absent) even
+/// though no committed fixture carries a non-null signed public_key
+/// (measured: nsm-live.cbor and aws-test.cbor both captured
+/// public_key == CBOR null 0xf6 -- the captures predate the public_key
+/// request). The PROVEN end-to-end arm rides the live NitroTPM gate
+/// (CAST-3): a genuine doc with a signed AK exists only on NitroTPM
+/// hardware with the scratch index defined, exactly like the ek-cert live
+/// witness. What is witnessed here: the equality gate passes ONLY on
+/// byte-exact equality, and every other arm fails closed with a loud
+/// reason.
+fn nsm_ak_match_arm(
+    signed_pk: Option<&[u8]>,
+    ak_public: &[u8],
+    module_id: &str,
+) -> crate::channel::NsmBinding {
+    use crate::channel::NsmBinding;
+    match signed_pk {
+        Some(pk) if pk == ak_public => NsmBinding::Proven { module_id: module_id.into() },
+        Some(pk) => NsmBinding::Failed(format!(
+            "nsm doc public_key ({} bytes) != AK public area ({} bytes) that signed the quote: \
+             the vendor-signed identity is NOT the key producing these quotes",
+            pk.len(),
+            ak_public.len()
+        )),
+        None => NsmBinding::Failed(
+            "nsm doc carries no public_key: the node requested no AK binding".into(),
+        ),
+    }
+}
+
 use crate::channel::{SlotLink, Tpm2Verified, Verified, Verifier};
 use crate::wire::{Bundle, Evidence, Fact, Status};
 
@@ -323,6 +425,21 @@ impl Verifier for Tpm2Verifier {
 
         let ek_cert = ev.anchors.get("ek_cert").map(|b| b.0.clone());
 
+        // 8. The NitroNSM identity binding (NitroTPM's answer to the NV EK
+        //    cert): an AWS-signed doc naming THIS AK for THIS nonce. The
+        //    wall clock is the freshness leg (cert window); the nonce is
+        //    the replay leg. Both inside the pure decision fn so the
+        //    stale-doc and decoy arms are testable without hardware.
+        let nsm_binding = nsm_binding_decision(
+            ev.anchors.get("nsm_doc").map(|b| b.0.as_slice()),
+            nonce,
+            ak_public,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0), // clock before 1970: every doc fails the chain check, fail closed
+        );
+
         Ok(Verified::Tpm2(Tpm2Verified {
             per_pcr,
             ak_public: ak_public.to_vec(),
@@ -331,6 +448,7 @@ impl Verifier for Tpm2Verifier {
             sign_pcrs,
             slot_link,
             ek_cert,
+            nsm_binding,
         }))
     }
 
@@ -423,6 +541,39 @@ impl Verifier for Tpm2Verifier {
             },
         });
 
+        // The AK identity binding. Three states, kept structurally
+        // distinct (honest absence != present-but-failed):
+        //   PROVEN      -- AWS signed "this AK, this nonce", chain + echo
+        //                  verify: the quote-signing key is vendor-attested.
+        //   NOT PROVEN  -- two spellings, both honest, one in the value:
+        //                  absent (non-Nitro or the node could not produce
+        //                  a doc) vs a FAILED binding (never promoted to
+        //                  Proven, never silently dropped).
+        facts.push(match &v.nsm_binding {
+            crate::channel::NsmBinding::Proven { module_id } => Fact {
+                name: "nsm_ak_binding".into(),
+                value: format!(
+                    "AWS Nitro-signed identity doc chains to the baked root, echoes the nonce, \
+                     and names this quote's AK (module {module_id})"
+                ),
+                anchors: vec!["tpm2".into()],
+                status: Status::Proven,
+            },
+            crate::channel::NsmBinding::Absent => Fact {
+                name: "nsm_ak_binding".into(),
+                value: "absent: node served no NSM identity doc (non-Nitro platform, or the \
+                     NitroTPM NSM leg was unavailable)".into(),
+                anchors: vec!["tpm2".into()],
+                status: Status::NotProven,
+            },
+            crate::channel::NsmBinding::Failed(reason) => Fact {
+                name: "nsm_ak_binding".into(),
+                value: format!("identity doc present but FAILED: {reason}"),
+                anchors: vec!["tpm2".into()],
+                status: Status::NotProven,
+            },
+        });
+
         facts.push(Fact {
             name: "image_hash".into(),
             value: "SHA-384 PCR17 (later phase)".into(),
@@ -495,5 +646,214 @@ mod tests {
         let docs = vec![vec![0x01, 0x02, 0x03]];
         assert_eq!(slot_link_decision(None, &docs), SlotLink::NoSlotPcr);
         assert_eq!(slot_link_decision(None, &[]), SlotLink::NoSlotPcr);
+    }
+
+    // ---- NSM AK binding: the three belt arms, all hardware-free --------
+    //
+    // Two witness layers, no hardware:
+    //
+    // A. THE DECISIVE GATE (unit, exhaustive): nsm_ak_match_arm is the
+    //    byte-equality check itself. All three sub-arms witness here:
+    //    byte-exact match -> Proven; same-length decoy -> Failed, loud,
+    //    distinct reason; absent key -> Failed. This is the check the
+    //    belt demands be decisive, and it is fully witnessed.
+    //
+    // B. THE PIPELINE (fixture): the live NitroTPM document (nsm-live
+    //    .cbor, AWS-signed, chain to the baked root) drives the full
+    //    decision: nonce echo, chain validity window (measured: the leaf
+    //    cert is valid ~3h around issuance 2026-08-26 07:41..10:41 UTC,
+    //    so the fixture is EXPIRED at any real "now" today -> the stale
+    //    arm is the natural fixture behavior), and fail-closed-on-null-
+    //    public_key (measured: both committed fixtures captured
+    //    public_key == null 0xf6, so a GENUINE fixture doc at its own
+    //    valid time must still FAIL the binding, never pass it silently).
+    //    The end-to-end PROVEN leg (genuine doc + signed AK) requires
+    //    live NitroTPM hardware with the scratch NV index defined and is
+    //    the CAST-3 live gate, exactly like the ek-cert live witness.
+
+    /// The live NitroTPM document captured by the sdk (the same bytes the
+    /// sdk's `nsm_live_doc_full_verify` gates: one fixture, two crates).
+    const NSM_LIVE: &[u8] =
+        include_bytes!("../../../bootproof-sdk/src/format/data/nsm-live.cbor");
+
+    fn fixture_parts() -> (Vec<u8>, u64) {
+        let f = bootproof_tpm::attest::parse_attestation_document(NSM_LIVE)
+            .expect("the live fixture parses");
+        let nonce = f.nonce.expect("the live fixture echoes a nonce");
+        (nonce, f.timestamp_ms / 1000)
+    }
+
+    // -- A. the decisive gate, witnessed exhaustively ------------------
+
+    #[test]
+    fn ak_gate_byte_exact_match_proves() {
+        let ak = vec![0x00, 0x21, 0x00, 0x44, 0xAA, 0xBB];
+        let b = nsm_ak_match_arm(Some(&ak), &ak, "i-0abc-tpm0000000000000000");
+        match b {
+            crate::channel::NsmBinding::Proven { module_id } => {
+                assert_eq!(module_id, "i-0abc-tpm0000000000000000");
+            }
+            other => panic!("byte-exact equality must PROVEN, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ak_gate_same_length_decoy_fails_closed_loudly() {
+        // The attack the belt names: a genuine AWS-signed doc bound to a
+        // DIFFERENT key than the quote's AK. One byte differs, so only a
+        // byte-exact check can catch it. Must be Failed with the AK
+        // mismatch named in the reason -- never a silent pass, never the
+        // Absent spelling.
+        let ak = vec![0x00, 0x21, 0x00, 0x44, 0xAA, 0xBB];
+        let mut decoy = ak.clone();
+        decoy[4] ^= 0xFF;
+        let b = nsm_ak_match_arm(Some(&decoy), &ak, "i-0abc-tpm0000000000000000");
+        match b {
+            crate::channel::NsmBinding::Failed(reason) => {
+                assert!(
+                    reason.contains("public_key") && reason.contains("!= AK public area"),
+                    "decoy must name the AK mismatch loudly: {reason}"
+                );
+            }
+            other => panic!("decoy AK must FAIL, got {other:?}"),
+        }
+        // And the reverse roles (decoy signed, genuine claimed): same
+        // failure, different lengths must also fail (size equality is
+        // never the check).
+        let b2 = nsm_ak_match_arm(Some(&decoy[..5]), &ak, "m");
+        assert!(matches!(b2, crate::channel::NsmBinding::Failed(_)));
+    }
+
+    #[test]
+    fn ak_gate_absent_key_fails_closed() {
+        let ak = vec![0x00, 0x21];
+        let b = nsm_ak_match_arm(None, &ak, "m");
+        match b {
+            crate::channel::NsmBinding::Failed(reason) => {
+                assert!(reason.contains("no public_key"), "reason: {reason}");
+            }
+            other => panic!("absent signed key must FAIL, got {other:?}"),
+        }
+    }
+
+    // -- B. the pipeline over the real AWS-signed fixture ---------------
+
+    #[test]
+    fn fixture_genuine_doc_at_issue_time_still_fails_closed_on_null_ak() {
+        // The fixtures captured public_key == null (measured 0xf6), so
+        // even with a VALID chain (verified at the doc's own timestamp,
+        // the sdk test's technique) and the right nonce, the binding
+        // must fail closed on the AK leg. Fail-closed beats pass-by-
+        // omission: a node that requests no AK binding gets NOT PROVEN
+        // with a reason, never a free Proven.
+        let (nonce, ts) = fixture_parts();
+        let b = nsm_binding_decision(Some(NSM_LIVE), &nonce, b"whatever-ak", ts);
+        match b {
+            crate::channel::NsmBinding::Failed(reason) => {
+                assert!(
+                    reason.contains("no public_key"),
+                    "pipeline must reach the AK leg and fail there: {reason}"
+                );
+            }
+            other => panic!("null-key fixture must FAIL, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nsm_binding_wrong_nonce_fails_closed() {
+        let (mut nonce, ts) = fixture_parts();
+        nonce[0] ^= 0xFF;
+        let b = nsm_binding_decision(Some(NSM_LIVE), &nonce, b"whatever-ak", ts);
+        assert!(
+            matches!(b, crate::channel::NsmBinding::Failed(_)),
+            "a replayed doc against a fresh challenge must FAIL, got {b:?}"
+        );
+    }
+
+    #[test]
+    fn nsm_binding_stale_at_wall_clock_fails_closed() {
+        // The replay bound: the fixture's signing cert expired hours after
+        // issuance (measured window 2026-08-26 07:41..10:41 UTC). At the
+        // real wall clock the chain check must reject it -- a captured doc
+        // cannot be replayed forever even if someone reused its nonce.
+        let (nonce, _ts) = fixture_parts();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(now > 1_756_200_000, "test clock sanity (post 2025-08-26)");
+        let b = nsm_binding_decision(Some(NSM_LIVE), &nonce, b"whatever-ak", now);
+        match b {
+            crate::channel::NsmBinding::Failed(reason) => {
+                // webpki's expired verdict surfaces through the sdk error.
+                assert!(!reason.is_empty(), "stale doc must fail with a reason");
+            }
+            other => panic!("stale doc at wall clock must FAIL, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nsm_binding_absent_is_distinct_from_failed() {
+        use crate::channel::NsmBinding;
+        // Arm 3's structural-distinctness half: honest absence and a
+        // present-but-failed doc are different states (the ek_cert split
+        // pattern) and must stay distinct at BOTH the decision and the
+        // fact layer.
+        let absent = nsm_binding_decision(None, &[7u8; 32], &[0u8; 8], 0);
+        assert_eq!(absent, NsmBinding::Absent);
+
+        let v_absent = Verified::Tpm2(Tpm2Verified {
+            per_pcr: Vec::new(),
+            ak_public: Vec::new(),
+            sign_public: None,
+            sign_policy: None,
+            sign_pcrs: None,
+            slot_link: SlotLink::NoSlotPcr,
+            ek_cert: None,
+            nsm_binding: NsmBinding::Absent,
+        });
+        let mut v_failed = match v_absent {
+            Verified::Tpm2(v) => v,
+            _ => unreachable!(),
+        };
+        v_failed.nsm_binding = NsmBinding::Failed("decoy".into());
+
+        let f = Tpm2Verifier;
+        let facts_absent = f.facts(&Verified::Tpm2(Tpm2Verified {
+            nsm_binding: NsmBinding::Absent,
+            ..clone_tpm2(&v_failed)
+        }));
+        let fact_absent = facts_absent.iter().find(|x| x.name == "nsm_ak_binding").unwrap();
+        let facts_failed = f.facts(&Verified::Tpm2(v_failed));
+        let fact_failed = facts_failed.iter().find(|x| x.name == "nsm_ak_binding").unwrap();
+
+        // Same name, same status vocabulary (NotProven -- no red status
+        // exists in the wire contract), but structurally distinct VALUES:
+        // "absent:" vs "identity doc present but FAILED:". Neither is
+        // silently dropped; neither is ever Proven by construction.
+        assert_eq!(fact_absent.status, Status::NotProven);
+        assert_eq!(fact_failed.status, Status::NotProven);
+        assert!(fact_absent.value.starts_with("absent:"), "absent spelling: {}", fact_absent.value);
+        assert!(
+            fact_failed.value.contains("present but FAILED"),
+            "failed spelling: {}",
+            fact_failed.value
+        );
+        assert_ne!(fact_absent.value, fact_failed.value);
+    }
+
+    // Helper: Tpm2Verified is not Clone (holds Vecs only, but no derive);
+    // the distinctness test needs two copies differing in one field.
+    fn clone_tpm2(v: &Tpm2Verified) -> Tpm2Verified {
+        Tpm2Verified {
+            per_pcr: v.per_pcr.clone(),
+            ak_public: v.ak_public.clone(),
+            sign_public: v.sign_public.clone(),
+            sign_policy: v.sign_policy.clone(),
+            sign_pcrs: v.sign_pcrs.clone(),
+            slot_link: v.slot_link,
+            ek_cert: v.ek_cert.clone(),
+            nsm_binding: v.nsm_binding.clone(),
+        }
     }
 }
