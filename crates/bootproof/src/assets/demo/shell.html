@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>bootproof demo — {{ENV_LABEL}}</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>{{BOOTPROOF_CSS}}</style>
+</head>
+<body>
+<div class="staging">{{ENV_LABEL}} — this page is STAGING.<small>A green padlock here proves nothing about production: the staging issuer is browser-trusted by design (cross-sign chain). Production identity is decided by the prod chain + CT, not by this page. Facts below are verified in YOUR browser by the verifier inlined in this file.</small></div>
+<h1>bootproof demo</h1>
+<div id="app">Verifying…</div>
+<div class="sec">replicate this box</div>
+<p class="why">Plain input-instructions (displayed claims, not attested facts): copy these into ANY AWS account to launch the same AMI with the same user-data. What the launch does is decided by the measured boot + attestation, which the section above verifies in your browser. If you downloaded this file, these strings came with it.</p>
+<div class="replicate">
+<p>AMI: <span id="ami" class="cmd">{{AMI_ID}}</span> · type: <span id="itype" class="cmd">{{INSTANCE_TYPE}}</span> · region: <span id="region" class="cmd">{{REGION}}</span></p>
+<pre id="userdata">{{USER_DATA}}</pre>
+<button class="copy" type="button" onclick="navigator.clipboard&&navigator.clipboard.writeText(document.getElementById('userdata').innerText)">copy user-data</button>
+<pre class="cmd">{{RUN_CMD}}</pre>
+</div>
+<script>{{BOOTPROOF_JS}}</script>
+</body></html>

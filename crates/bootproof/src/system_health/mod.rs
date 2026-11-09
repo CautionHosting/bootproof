@@ -32,6 +32,10 @@ pub mod schema;
 /// here. See the module docs for the derivation gates.
 pub mod single_file;
 
+/// The staging demo quickstart page (downloadable, self-contained, with the
+/// replicate-me manifest baked in). See demo.rs for the envelope + gates.
+pub mod demo;
+
 #[cfg(test)]
 mod tests {
     use super::*;

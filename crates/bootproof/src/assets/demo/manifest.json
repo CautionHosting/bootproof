@@ -1,0 +1,9 @@
+{
+  "env": "STAGING DEMO",
+  "env_note": "LOUD PLACEHOLDER BUILD: the ami/user-data/region values below are pending squid's launch (chipmunk DM protocol: squid reports box-up + FQDNs, chipmunk pings crow). The regenerate==committed gate forces a combiner re-run + re-pin when the real values land; this file is the ONLY home for these strings.",
+  "ami_id": "ami-PENDING-SQUID-LAUNCH",
+  "instance_type": "c6a.2xlarge",
+  "region": "us-east-1-PENDING",
+  "user_data": "# PENDING squid's canonical user-data blob.\n# Design ruling (chipmunk 2026-11-09, operator directive): the exact\n# launch user-data is baked here VERBATIM so a DOWNLOADED index.html still\n# carries the replicate inputs with zero fetch. Until the real blob lands,\n# this text says so loudly instead of pretending.\n",
+  "command_template": "aws ec2 run-instances --region {REGION} --image-id {AMI_ID} --instance-type {INSTANCE_TYPE} --user-data file://user-data.sh"
+}
