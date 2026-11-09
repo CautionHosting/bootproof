@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>System Health</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>{{BOOTPROOF_CSS}}</style>
+</head>
+<body>
+<h1>System Health</h1>
+<div id="app">Verifying…</div>
+<p class="why">This is a single self-contained file: the verifier, this
+stylesheet, and the markup are one document, no service worker. The verifier's
+verdicts are computed in your browser and painted into the region above; the
+footer states what this file measured about its own served bytes.</p>
+<p class="foot">A build-time identity pin for this document is published by the
+server outside this file (and, on a measured boot, in the UKI); the page never
+asserts whether its own bytes match it.</p>
+<script>{{BOOTPROOF_JS}}</script>
+</body></html>
