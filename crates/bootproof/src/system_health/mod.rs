@@ -26,6 +26,11 @@ pub const SW: &str = include_str!("../assets/system_health/verify.js");
 pub const SW_SHA256: &str = "5575655a2c1655f488b390717c5317c3e0b72973c5db074305824393bc48d01a";
 
 pub mod schema;
+/// The single-file pivot: the FIRST canonical bootproof.html (verifier + CSS +
+/// markup in one self-contained document, no service worker), generated from
+/// three reviewable sources by fixtures/single_file/combiner.js and embedded
+/// here. See the module docs for the derivation gates.
+pub mod single_file;
 
 #[cfg(test)]
 mod tests {
