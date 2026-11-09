@@ -217,10 +217,12 @@ impl Channel for Tpm2 {
         let _ = tpm.flush_context(ak.handle);
 
         // 6. EK certificate (best effort; absent on some platforms).
-        let ek_cert = tpm
-            .read_public_raw(bootproof_tpm::constants::rh::EK_CERT_NV)
-            .ok()
-            .filter(|(pub_, _)| !pub_.is_empty());
+        //    DEFECT FIX (2026-11-09): this used `read_public_raw`, which
+        //    returns the TPM2B_PUBLIC bytes of the index's *metadata*
+        //    structure, not the certificate. The real EK cert lives in the
+        //    NV index's data area: NV_Read_public for the declared size,
+        //    NV_Read (chunked to TPM_PT_NV_BUFFER_MAX) for the bytes.
+        let ek_cert = read_ek_cert(&mut tpm);
 
         // The tpm2 doc.
         let mut doc = Vec::new();
@@ -236,7 +238,7 @@ impl Channel for Tpm2 {
         push_tpm2b(&mut doc, &per_pcr_concat);
 
         let mut anchors = std::collections::BTreeMap::new();
-        if let Some((cert, _name)) = ek_cert {
+        if let Some(cert) = ek_cert {
             anchors.insert("ek_cert".into(), B64::new(cert));
         }
 
@@ -278,6 +280,44 @@ fn push_tpm2b(out: &mut Vec<u8>, b: &[u8]) {
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Read the EK certificate from its NV index. Returns `Some(bytes)` ONLY
+/// when the index data actually parses as an X.509 certificate (DER or
+/// PEM); every other outcome (no index, no read auth, unreadable, short
+/// read, non-cert bytes) is an honest `None` so the bundle reports the
+/// honest absence instead of shipping a fake cert.
+///
+/// This is the defect fix: `NV_Read_public` answers with the index's
+/// metadata (a ~34-byte `TPMT_NV_PUBLIC`), NOT the certificate bytes, so
+/// reading the cert requires `NV_Read` on the index data area, chunked to
+/// the TPM's `TPM_PT_NV_BUFFER_MAX`. The X.509 gate is the regression
+/// tripwire: the metadata blob (or any other non-cert bytes) can never
+/// again land in the bundle as `ek_cert`.
+///
+/// Public so a witness example (and tests) can exercise the EXACT shipped
+/// read path, not a re-implementation of it.
+pub fn read_ek_cert(tpm: &mut Tpm) -> Option<Vec<u8>> {
+    let data = bootproof_tpm::nv::nv_read_index(tpm, bootproof_tpm::constants::rh::EK_CERT_NV)
+        .map_err(|e| eprintln!("[attest] EK cert NV read failed: {e}"))
+        .ok()?;
+    if data.is_empty() {
+        return None;
+    }
+    // DER first (NitroTPM stores DER), then PEM (some platforms armor it).
+    use x509_parser::prelude::FromDer;
+    if x509_parser::prelude::X509Certificate::from_der(&data).is_ok() {
+        return Some(data);
+    }
+    if x509_parser::pem::parse_x509_pem(&data).is_ok() {
+        return Some(data);
+    }
+    eprintln!(
+        "[attest] EK cert index holds {} bytes that are not an X.509 \
+         certificate; reporting honest absence",
+        data.len()
+    );
+    None
 }
 
 /// Detect whether a TPM is present on the usual device path.

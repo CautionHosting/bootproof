@@ -17,6 +17,7 @@ pub mod commands_policy;
 pub mod conn;
 pub mod constants;
 pub mod error;
+pub mod nv;
 #[cfg(feature = "attest")]
 pub mod attest;
 #[cfg(feature = "esys")]
