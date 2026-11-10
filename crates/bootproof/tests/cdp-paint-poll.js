@@ -19,29 +19,46 @@
 //
 // Usage:
 //   node cdp-paint-poll.js <url> [--marker <substring|regex>] [--bypass-cert]
-//        [--timeout <secs>] [--port <n>] [--expect-row <label>]...
+//        [--timeout <secs>] [--port <n>]
+//        [--expect-row <label[=VERDICT]>]... [--permissive]
+//   --expect-row <label>          requires the row to paint PROVEN (fail-closed)
+//   --expect-row <label=VERDICT>  requires that exact verdict (NOT PROVEN etc.)
+//   --permissive                  opt back into the old lenient non-FAILED rule
 // Defaults: marker "bootproof-verdict" (the shell's verdict container id;
 // override to match the shipped client), timeout 60, port 0 = ephemeral.
 //
-// --expect-row (repeatable): per-row doctrine, per the 08:28Z ruling.
+// --expect-row (repeatable): per-row doctrine, FAIL-CLOSED BY DEFAULT
+// (T-D, 2026-11-10; supersedes the permissive 08:28Z ruling-iii default).
 // For each label (e.g. identity_link), the driver finds the row by DOM id
 // (r-<label> / v-<label>) and reads the verdict chip's own text. The
 // pending-first page names rows by id; a text-window scan would let a
-// dotted label (identity_link.pin) match its parent rollup's row. Rules:
-//   FAILED              -> fail (a FAILED row is always a gate failure)
-//   PENDING             -> fail by default (a row still pending when the
-//                          gate reads it never flipped); --allow-pending
-//                          flips that to a pass (the static-paint pass)
-//   NOT PROVEN          -> PASS when the row is a declared pin claim.
-//     Under ruling (iii) identity_link is a pin claim, NOT PROVEN is
-//     honest and must NOT fail the CDP gate ("never dress a pin fact in
-//     a PROVEN costume"; a red verdict from a working verifier is still
-//     a working verifier). PROVEN on identity_link would be the SURPRISE
-//     (it would mean the leaf key == the signer key, which the ruling
-//     says is structurally impossible while key separation holds), so
-//     the run PASSES on both NOT PROVEN and PROVEN but reports which.
-//   anything else / absent -> fail (the row must paint a verdict word).
-// The exit code is 0 iff painted AND every --expect-row passes.
+// dotted label (identity_link.pin) match its parent rollup's row.
+//
+// A declared row carries an EXPECTED verdict: `--expect-row LABEL=VERDICT`.
+//   * A bare `--expect-row LABEL` means the expected verdict is PROVEN
+//     (the strict, fail-closed default: a row you name must PROVE).
+//   * `LABEL=NOT PROVEN` declares an honest non-proven claim (ruling iii:
+//     identity_link is a pin claim; "never dress a pin fact in a PROVEN
+//     costume"). A PROVEN there is now a MISMATCH, not a flagged pass.
+// The gate is fail-closed: the painted verdict must EQUAL the expected
+// verdict, else the run fails. This catches BOTH directions an overclaim-
+// prone verifier can go green under a permissive gate:
+//   * OVERCLAIM  -- a tampered verifier paints identity_link=PROVEN when the
+//                    harness declared `identity_link=NOT PROVEN` -> mismatch,
+//                    fail. (The old gate only flagged this in prose.)
+//   * UNDERCLAIM -- a verifier that fails to prove a required row paints
+//                    memory_encryption=NOT PROVEN when the harness declared
+//                    `memory_encryption=PROVEN` (or left it bare) -> mismatch,
+//                    fail. (The old `v!=='FAILED'` rule let this through.)
+// A PENDING row fails unless expected is PENDING or --allow-pending (the
+// static-paint pass). An absent row chip always fails.
+//
+// PERMISSIVE OPT-IN: --permissive restores the OLD rule (pass iff the row
+// is not FAILED) for every declared row. It is opt-in and never the default,
+// because a permissive-by-default driver green-lights a verifier that
+// overclaims -- exactly what must never gate a live box. Prefer naming the
+// exact expected verdict; reserve --permissive for exploratory runs only.
+// The exit code is 0 iff painted AND every --expect-row matches its expectation.
 //
 // --all-pending: the STATIC-PAINT assertion (the pending-first render law).
 // Every r-* row in the DOM must read exactly PENDING with the pd chip class.
@@ -85,9 +102,19 @@ function optAll(name) {
   for (let i = 0; i < argv.length; i++) if (argv[i] === name && argv[i + 1]) out.push(argv[i + 1]);
   return out;
 }
-const EXPECT_ROWS = optAll('--expect-row');
+// Parse each --expect-row entry into {label, expected}. A bare label
+// expects PROVEN (fail-closed default); `LABEL=VERDICT` declares an exact
+// expectation (e.g. `identity_link=NOT PROVEN`). Split on the FIRST '=' so a
+// verdict containing no '=' is safe; "NOT PROVEN" (a space) arrives as one
+// shell argument, so the whole `label=NOT PROVEN` token is one entry.
+const EXPECT_ROWS = optAll('--expect-row').map(function (e) {
+  const eq = e.indexOf('=');
+  if (eq < 0) return { label: e, expected: 'PROVEN' };
+  return { label: e.slice(0, eq), expected: e.slice(eq + 1).trim() };
+});
 const ALL_PENDING = flag('--all-pending');
 const ALLOW_PENDING = flag('--allow-pending');
+const PERMISSIVE = flag('--permissive');
 const MAX_SUBREQ = opt('--max-subresource-requests', null);
 const marker = opt('--marker', 'bootproof-verdict');
 const markerRe = marker.startsWith('re:')
@@ -395,14 +422,21 @@ function getJson(host, portNo, p) {
   }
   const rows = {};
   let rowsOk = true;
-  for (const label of EXPECT_ROWS) {
+  for (const spec of EXPECT_ROWS) {
+    const label = spec.label, expected = spec.expected;
     const ent = liveRows[label];
     const v = ent && ent.verdict ? String(ent.verdict).trim() : null;
-    if (!v) { rows[label] = { verdict: null, pass: false, why: 'row chip v-' + label + ' not painted' }; rowsOk = false; continue; }
+    if (!v) { rows[label] = { verdict: null, expected, pass: false, why: 'row chip v-' + label + ' not painted' }; rowsOk = false; continue; }
     let pass;
-    if (v === 'PENDING') pass = !!ALLOW_PENDING;
-    else pass = v !== 'FAILED';
-    rows[label] = { verdict: v, why_text: ent.why == null ? null : String(ent.why).slice(0, 300), pass, why: v === 'PENDING' ? (ALLOW_PENDING ? 'pending pass allowed (static paint)' : 'row never flipped') : v === 'NOT PROVEN' ? 'pin-claim doctrine: NOT PROVEN is a pass (ruling iii)' : v === 'PROVEN' ? (label === 'identity_link' ? 'UNEXPECTED under key separation, but pass; flag it' : 'proven') : 'failed rows fail the gate' };
+    if (PERMISSIVE) pass = v !== 'FAILED';                       // opt-in legacy rule
+    else if (v === 'PENDING') pass = !!ALLOW_PENDING;            // static-paint escape
+    else pass = (v === expected);                                // FAIL-CLOSED default
+    let why;
+    if (PERMISSIVE) why = 'permissive (opt-in): non-FAILED passes';
+    else if (v === 'PENDING') why = ALLOW_PENDING ? 'pending pass allowed (static paint)' : 'row never flipped';
+    else if (v === expected) why = 'matches declared expectation';
+    else why = 'MISMATCH: painted ' + v + ' but harness declared ' + expected;
+    rows[label] = { verdict: v, expected: expected, why_text: ent.why == null ? null : String(ent.why).slice(0, 300), pass: pass, why: why };
     if (!pass) rowsOk = false;
   }
 

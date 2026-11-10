@@ -14,23 +14,22 @@
 //   read: what this pass paints is what a script-less browser reads.
 //
 // PASS B — the FIXTURE RUN:
-//   loads /bootproof.html?fixture=1 over the golden envelope + frozen nonce:
-//   * the footer painted (the self-measurement sentence, non-transformed text),
-//   * memory_encryption / tpm_quote / wardend_state_chain / nonce_freshness all
-//     paint PROVEN (they are required rows: NOT PROVEN or FAILED = gate fail),
-//   * identity_link paints NOT PROVEN (ruling iii: the golden fixture publishes
-//     no leaf PEM; NOT PROVEN is the honest pass; FAILED fails, PROVEN is a
-//     surprise we surface as a failure of THIS gate because the fixture can
-//     only get there by shipping a leaf that matches the signer key, which the
-//     fixture does not contain),
-//   * the LIFECYCLE rows flipped out of PENDING (chipmunk's addendum): the
-//     demo watches user_data / seal_state / cert_chain flip as the unit joins
-//     the fleet — each must be non-PENDING, and the user_data row's why text
-//     must carry the envelope's own user_data value (the row witnesses the
-//     CURRENT user-data text, not a static echo),
-//   * the painted self-measurement hash equals BOOTPROOF_SHA256 as pinned in
-//     system_health/single_file.rs (grep the source: the gate never trusts a
-//     copied constant, it reads the pin where it lives).
+//   loads /bootproof.html?fixture=1 over the golden envelope + frozen nonce.
+//   The driver runs FAIL-CLOSED per row (T-D): each --expect-row declares the
+//   verdict the golden fixture MUST paint, and a mismatch (either direction:
+//   an overclaim to PROVEN, or a required row underclaiming to NOT PROVEN)
+//   fails the driver. The declarations below are the fixture's ground truth:
+//   * memory_encryption / tpm_quote / wardend_state_chain / nonce_freshness
+//     declare PROVEN (bare) — a required row that is NOT PROVEN or FAILED now
+//     fails at the DRIVER, not just the wrapper below.
+//   * identity_link declares NOT PROVEN (ruling iii: the golden fixture
+//     publishes no leaf PEM; NOT PROVEN is the honest pass; the driver now
+//     fails a PROVEN there as an overclaim, and FAILED as a mismatch).
+//   * seal_state declares PROVEN (byte-attested by the wardend doc signature).
+//   * cert_chain declares NOT PROVEN (no leaf PEM published; the honest render).
+//   * user_data declares PROVEN (the golden envelope publishes user-data).
+//   The wrapper below re-asserts each independently (belt and suspenders): the
+//   driver being green is necessary, never sufficient, for THIS gate to pass.
 // Chrome requirement: /usr/bin/google-chrome (same as the cert-night driver).
 'use strict';
 const { spawn } = require('child_process');
@@ -96,20 +95,25 @@ function drive(args, timeout) {
   const j = drive([url,
     '--marker', 'measured its own served bytes',
     '--timeout', '45',
+    // Fail-closed declarations (T-D): a bare label requires PROVEN; a
+    // `label=NOT PROVEN` label requires that exact honest verdict. These are
+    // the golden fixture's ground truth (captured by a raw driver run, not
+    // guessed). Any drift — a required row dropping to NOT PROVEN, or an
+    // honest pin claim climbing to PROVEN — now fails the driver itself.
     '--expect-row', 'memory_encryption',
     '--expect-row', 'tpm_quote',
     '--expect-row', 'wardend_state_chain',
     '--expect-row', 'nonce_freshness',
-    '--expect-row', 'identity_link',
+    '--expect-row', 'identity_link=NOT PROVEN',
     '--expect-row', 'user_data',
     '--expect-row', 'seal_state',
-    '--expect-row', 'cert_chain',
+    '--expect-row', 'cert_chain=NOT PROVEN',
   ], 90000);
 
   if (!j.painted) fail('footer marker never painted. rows: ' + JSON.stringify(j.rows));
-  // Required rows must be PROVEN (the driver only fails on FAILED, the gate
-  // is stricter for the REQUIRED set: this is the golden fixture, everything
-  // required is PROVEN there or the fixture/verifier drifted).
+  // Required rows must be PROVEN. The fail-closed driver already enforced this
+  // (a bare --expect-row requires PROVEN); the wrapper re-asserts it so the
+  // driver being green is necessary, never sufficient, for THIS gate to pass.
   for (const req of ['memory_encryption', 'tpm_quote', 'wardend_state_chain', 'nonce_freshness']) {
     const v = j.rows[req] && j.rows[req].verdict;
     if (v !== 'PROVEN') fail(`required row ${req} verdict ${v} != PROVEN`);
