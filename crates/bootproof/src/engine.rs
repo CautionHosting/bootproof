@@ -79,7 +79,7 @@ impl Default for VerifierRegistry {
 /// baseline) and the channels that MUST be present + verified for the
 /// bundle to pass. A required channel that is absent from the bundle is
 /// reported as an honest NOT PROVEN fact (via the verifier's
-/// `required_absent_fact`), never silently dropped.
+/// `required_absent_facts`) and a policy error, never silently dropped.
 #[derive(Debug, Clone, Default)]
 pub struct VerifyPolicy {
     /// The required VMPL the SNP report must run at (0 = the
@@ -103,14 +103,16 @@ impl VerifyPolicy {
 
 /// The result of a full verification: the derived facts (every channel
 /// present, every required channel — present or absent), the errors (a
-/// present-but-failing channel, or an unknown channel), and the overall
+/// present-but-failing channel, an unknown channel, or an absent required
+/// channel), and the overall
 /// pass (every required channel verified, no errors).
 #[derive(Debug)]
 pub struct VerifiedFacts {
     /// The derived facts (every channel present, every required channel —
     /// present or absent).
     pub facts: Vec<Fact>,
-    /// The errors (a present-but-failing channel, or an unknown channel).
+    /// The errors (a present-but-failing channel, an unknown channel, or
+    /// an absent required channel).
     pub errors: Vec<String>,
 }
 
@@ -253,11 +255,12 @@ pub fn verify_bundle(
         }
     }
 
-    // A required channel that is ABSENT from the bundle is an honest NOT
-    // PROVEN fact (never silently dropped): the verifier reports the fact it
-    // owns (snp: memory_encryption "absent").
+    // A required channel that is ABSENT from the bundle fails the policy,
+    // even if no verifier can render an absent fact. Keep the honest NOT
+    // PROVEN facts as well: absence is not a malformed proof.
     for req in &policy.required_channels {
         if !present.iter().any(|p| p == req) {
+            errors.push(format!("required channel {req:?} is absent"));
             if let Some(v) = verifiers.get(req) {
                 facts.extend(v.required_absent_facts());
             }
