@@ -130,6 +130,17 @@ const PORT = parseInt(opt('--port', '0'), 10);
 // acceptance run is reproducible and the emitted JSON records WHICH renderer
 // produced the verdict. The version string is captured at startup and emitted.
 const CHROME_PATH = opt('--chrome', '/usr/bin/google-chrome');
+// --host-resolver-rules <rules> passes Chrome's --host-resolver-rules flag
+// through verbatim (e.g. "MAP host.example.com 203.0.113.7"). WHY: a live
+// acceptance run must hit a box by IP while the URL keeps the REAL hostname,
+// so strict-cert mode witnesses the genuine SNI + SAN chain instead of
+// bypassing trust. This mirrors the shipped 'MAP HOST IP' mechanism in the
+// browser gate's row engine (browser_gate_rows.py): a fresh box's IP under a
+// pinned hostname is the normal acceptance topology, and a driver that cannot
+// express it forces either --bypass-cert (abandons the cert leg) or an
+// /etc/hosts edit (unattributable environment mutation). Behavior-identical
+// when the flag is absent: no rules, no extra chrome argument.
+const HOST_RESOLVER = opt('--host-resolver-rules', null);
 
 // ---------------- minimal CDP-over-WebSocket client ----------------
 // RFC6455 client, text frames only (CDP is JSON text). No deps because
@@ -242,6 +253,7 @@ function getJson(host, portNo, p) {
     // Self-signed pre-cert must not abort the TLS handshake path we are
     // witness-testing; on cert-night we OMIT this and let trust be real.
     ...(BYPASS ? ['--ignore-certificate-errors'] : []),
+    ...(HOST_RESOLVER ? [`--host-resolver-rules=${HOST_RESOLVER}`] : []),
     // Launch straight at the target: chrome 152 restricts /json/new to PUT
     // and the open-a-target dance is unnecessary when the first tab IS the
     // test page. We then find it via /json/list by URL match.
