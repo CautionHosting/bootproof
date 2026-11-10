@@ -1,0 +1,25 @@
+{
+  "schema": "trunc_crashsafe@v1",
+  "description": "First seed property (migrated from tier_expectations.json#trunc_crashsafe per chipmunk R3/Q3b). An absent field must never kill the render. Language-neutral DATA; the harness owns no expected value.",
+  "impl_binding": {
+    "value_fns": ["trunc", "renderSections"],
+    "render": "renderSections",
+    "note": "value-kinds use value_fns; rows_contain uses render. An impl omitting render cannot run the output-shape kind (SKIP, never fake-pass)."
+  },
+  "checks": [
+    { "kind": "call_equals", "class": "value", "fn": "trunc", "args_omitted": true,
+      "expect": "not published", "id": "trunc-omitted" },
+    { "kind": "call_equals", "class": "value", "fn": "trunc", "args": [null, 24],
+      "expect": "not published", "id": "trunc-null" },
+    { "kind": "survives", "class": "value", "fn": "renderSections",
+      "args": [ { "seal_state": { "posture": "sealed", "state_log": 3, "pcrs": [11, 13, 22] },
+                  "cert_chain": { "leaf": { "not_after": "2027-01-01T00:00:00Z" } } } ],
+      "id": "absent-fields-never-kill-the-page" },
+    { "kind": "rows_contain", "class": "output-shape", "fn": "renderSections",
+      "args": [ { "seal_state": { "posture": "sealed", "state_log": 3, "pcrs": [11, 13, 22] },
+                  "cert_chain": { "leaf": { "not_after": "2027-01-01T00:00:00Z" } } } ],
+      "rows": [ { "label": "seal_state", "value_contains": "not published" },
+                { "label": "cert_chain", "value_contains": "not published" } ],
+      "id": "marker-painted" }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "schema": "trust_tier@v1",
+  "description": "Second seed property (migrated from tier_expectations.json#map_status + present/absent section verdicts). The tier law: a server-PUBLISHED value is never browser-VERIFIED; presence maps to SERVER-ASSERTED, absence to NOT PROVEN, only local verification may mint PROVEN. Language-neutral DATA.",
+  "impl_binding": {
+    "value_fns": ["mapStatus", "renderSections"],
+    "render": "renderSections"
+  },
+  "checks": [
+    { "kind": "call_equals", "class": "value", "fn": "mapStatus", "args": ["proven"],
+      "expect": "SERVER-ASSERTED", "id": "mapstatus-proven-is-server-asserted" },
+    { "kind": "call_equals", "class": "value", "fn": "mapStatus", "args": ["some-unknown-status"],
+      "expect": "NOT PROVEN", "id": "mapstatus-unknown-is-not-proven" },
+    { "kind": "map_rows", "class": "value", "fn": "renderSections",
+      "args": [ { "user_data": "tier witness",
+                  "seal_state": { "posture": "sealed", "state_hash": "aa", "state_log": 3, "pcrs": [11, 13, 22] } } ],
+      "rows": [ { "label": "user_data", "status": "SERVER-ASSERTED" },
+                { "label": "seal_state", "status": "SERVER-ASSERTED" } ],
+      "id": "present-sections-are-server-asserted" },
+    { "kind": "map_rows", "class": "value", "fn": "renderSections", "args": [ {} ],
+      "rows": [ { "label": "user_data", "status": "NOT PROVEN" },
+                { "label": "seal_state", "status": "NOT PROVEN" } ],
+      "id": "absent-sections-are-not-proven" }
+  ]
+}
