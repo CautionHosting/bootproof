@@ -41,6 +41,22 @@
     "sw_sha": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
     "t": 1700000000000
   },
+  "trunc_crashsafe": {
+    "note": "T-E3 (chipmunk ruling 2026-11-10): an absent field must never kill the page render. trunc() fails closed to this marker on null/undefined instead of throwing; renderSections over metadata with absent fields must complete, never throw. This is a page-death class, not cosmetics: the whole table is one synchronous render pass, so a throw is a dead page. Same property on BOTH surfaces (single-file bootproof.js + service-worker verify.js) and any future unified-library consumer.",
+    "marker": "not published",
+    "trunc_cases": [
+      { "how": "omitted", "expected": "not published" },
+      { "how": "null", "expected": "not published" }
+    ],
+    "render_sections_must_survive": {
+      "note": "metadata carrying the reachable absent fields (each reaches a trunc site); renderSections must return rows, never throw, and paint the marker.",
+      "metadata": {
+        "seal_state": { "posture": "sealed", "state_log": 3, "pcrs": [11, 13, 22] },
+        "cert_chain": { "leaf": { "not_after": "2027-01-01T00:00:00Z" } }
+      },
+      "must_paint_marker_rows": ["seal_state", "cert_chain"]
+    }
+  },
   "footer": {
     "must_include": [
       "verified in your browser by the service worker",

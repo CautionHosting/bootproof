@@ -50,18 +50,27 @@ pub const BOOTPROOF_HTML: &str = include_str!("../assets/dist/bootproof.html");
 /// by the combiner), NOT hand-copied; never bake a historical value here. The
 /// single-file artifact is a NEW delivery form, so this hash is independent of
 /// the service-worker SW_SHA256 by construction (one file vs two files).
-/// On-chain value: 637503ad (T-E facts tier + honest footer: mapStatus maps
+/// On-chain value: 88630e3b (T-E3 trunc crash-safe: trunc() fails closed to
+/// "not published" on an absent/null field instead of throwing. Before this an
+/// absent envelope field (user_data, seal_state.state_hash, leaf.subject/issuer)
+/// reached trunc -> j(undefined) -> JSON.stringify(undefined) returns the VALUE
+/// undefined -> s.length threw, and because the metadata table is one
+/// synchronous render pass that crash KILLED THE ENTIRE PAGE. A missing source
+/// is an honest NOT PROVEN, never a dead page (AGENTS.md). Byte-for-byte parity
+/// with the service-worker trunc guard; both surfaces gated by
+/// fixtures/system_health/trunc_contract.js).
+/// Predecessor: 637503ad (T-E facts tier + honest footer: mapStatus maps
 /// the server's "proven" to SERVER-ASSERTED — env.facts is unsigned display,
 /// the last tier-blind green after T-B — fact rows gain r-/v-/w- witness ids,
 /// and the footer claim narrows to the browser-verified proofs with the
 /// SERVER-ASSERTED rows named as server-published, not attested).
-/// Predecessor: 195680d4 (T-B trust tiers: renderSections' metadata table
+/// Before that: 195680d4 (T-B trust tiers: renderSections' metadata table
 /// flips presence-PROVEN => SERVER-ASSERTED, the F3 overclaim fix; the metadata
 /// blob is unsigned server display, never browser-verified attestation).
 /// Before that: 4760aa18 (the pending-first pivot: operator-named sources, the
 /// static pending tables, the flip engine, the fleet_domains row; the artifact
 /// moved to assets/dist/), then a3ba3240 (the first canonical bootproof.html).
-pub const BOOTPROOF_SHA256: &str = "637503add524970f05e05a51b90ac9103904d0297902d74c15b45ab5092fd2bb";
+pub const BOOTPROOF_SHA256: &str = "88630e3bcfb33cabc7195e478d4796c59c8017c91d317c28a3bfd082621a2907";
 
 #[cfg(test)]
 mod tests {

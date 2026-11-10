@@ -1467,7 +1467,17 @@ function renderSections(m) {
   rows.push({ label: "spdx_inventory", status: m.spdx_inventory ? SERVER_ASSERTED : NOT_PROVEN, value: m.spdx_inventory ? j(m.spdx_inventory) : "no SBOM shipped with this image (honest null until one exists)" });
   return rows;
 }
-function trunc(v, n) { const s = typeof v === "string" ? v : j(v); return s.length > n ? s.slice(0, n) + "…" : s; }
+// T-E3 (chipmunk ruling 2026-11-10): trunc() failed closed to "not published"
+// on an absent/null field instead of throwing. Before this, an absent field
+// reached trunc -> j(undefined) -> JSON.stringify(undefined) returns the VALUE
+// undefined (not a string) -> s.length threw, and because the whole table is
+// one synchronous render pass that crash KILLED THE ENTIRE PAGE. The reachable
+// sites were m.user_data (absent), m.seal_state.state_hash (absent), and
+// leaf.subject / leaf.issuer (a leaf present without those fields). A missing
+// source is a rendered honest fact, never a dead page (AGENTS.md fail-closed).
+// The guard lives in the helper, not at each call site (the combiner doctrine:
+// fix the source, not the splice). Byte-for-byte parity with verify.js trunc.
+function trunc(v, n) { if (v == null) return "not published"; const s = typeof v === "string" ? v : j(v); return s.length > n ? s.slice(0, n) + "…" : s; }
 function j(v) { try { return JSON.stringify(v); } catch (e) { return String(v); } }
 
 // -----------------------------------------------------------------------------
