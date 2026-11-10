@@ -1365,7 +1365,13 @@ async function runVerification(origin) {
 }
 
 function mapStatus(s) {
-  return s === "proven" ? PROVEN : s === "degraded" ? "DEGRADED" :
+  // T-E2 (chipmunk ruling 2026-11-10, same doctrine as the single-file T-E):
+  // env.facts is the UNSIGNED envelope blob; the server saying "proven" is
+  // the server's own verdict, not a browser-verified fact. 'proven' =>
+  // SERVER-ASSERTED (chip 's'); absent/unknown stays NOT PROVEN (asserted
+  // and absent are different honest states); 'degraded'/'reproducible' keep
+  // their words (vocabulary split is a separate ruling).
+  return s === "proven" ? SERVER_ASSERTED : s === "degraded" ? "DEGRADED" :
          s === "reproducible" ? "REPRODUCIBLE" : NOT_PROVEN;
 }
 // The wire's B64 newtype serializes as a PLAIN base64 string (see
@@ -1387,25 +1393,33 @@ function decodeEvidence(ev) {
 
 // The metadata render: section -> structured rows. A null section is an
 // honest NOT PROVEN row. Everything is escaped at render time.
+// T-E2 (chipmunk ruling 2026-11-10, the verify.js port of the T-B law): this
+// table is SERVER-ASSERTED display, never browser-verified attestation. Its
+// only input is env.metadata, the unsigned blob; metadata fields and signed
+// doc fields share NAMES but are different byte-objects, so a presence-based
+// PROVEN here overclaims (the F3 class) and a name match against the doc
+// would launder it. Presence flips PROVEN => SERVER-ASSERTED; absence stays
+// NOT PROVEN. The verified facts live in the browser-verified proofs table
+// above (channel rows + wardend_state_chain under the doc signature).
 function renderSections(m) {
   const rows = [];
-  rows.push({ label: "instance_id", status: m.instance_id ? PROVEN : NOT_PROVEN, value: m.instance_id || "not set" });
-  rows.push({ label: "user_data", status: m.user_data ? PROVEN : NOT_PROVEN, value: trunc(m.user_data, 120) });
-  rows.push({ label: "stagex_commit", status: m.stagex_commit ? PROVEN : NOT_PROVEN,
+  rows.push({ label: "instance_id", status: m.instance_id ? SERVER_ASSERTED : NOT_PROVEN, value: m.instance_id || "not set" });
+  rows.push({ label: "user_data", status: m.user_data ? SERVER_ASSERTED : NOT_PROVEN, value: trunc(m.user_data, 120) });
+  rows.push({ label: "stagex_commit", status: m.stagex_commit ? SERVER_ASSERTED : NOT_PROVEN,
     value: (m.stagex_commit || "no wardend-commit line in user-data") + (m.stagex_commit ? "  (a parsed CLAIM from user-data: pair it with the measured-boot facts)" : "") });
-  rows.push({ label: "instance_identity", status: m.instance_identity ? PROVEN : NOT_PROVEN,
+  rows.push({ label: "instance_identity", status: m.instance_identity ? SERVER_ASSERTED : NOT_PROVEN,
     value: m.instance_identity ? "signed IMDS document present (verifiable only against AWS's signing key)" : "absent (not an AWS instance, or IMDS was unreachable)" });
-  rows.push({ label: "disk_encryption", status: m.disk_encryption ? PROVEN : NOT_PROVEN, value: j(m.disk_encryption) });
-  rows.push({ label: "units", status: Array.isArray(m.units) && m.units.length ? PROVEN : NOT_PROVEN,
+  rows.push({ label: "disk_encryption", status: m.disk_encryption ? SERVER_ASSERTED : NOT_PROVEN, value: j(m.disk_encryption) });
+  rows.push({ label: "units", status: Array.isArray(m.units) && m.units.length ? SERVER_ASSERTED : NOT_PROVEN,
     value: Array.isArray(m.units) && m.units.length
       ? m.units.map(function (u) { return u.name + ": " + (u.state || u.health || "?"); }).join(", ")
       : "the node published no unit table" });
-  rows.push({ label: "hsm_keys", status: Array.isArray(m.hsm_keys) && m.hsm_keys.length ? PROVEN : NOT_PROVEN,
+  rows.push({ label: "hsm_keys", status: Array.isArray(m.hsm_keys) && m.hsm_keys.length ? SERVER_ASSERTED : NOT_PROVEN,
     value: Array.isArray(m.hsm_keys) && m.hsm_keys.length
       ? m.hsm_keys.map(function (k) { return k.name + (k.pcr_gated ? " [PCR-gated " + (k.pcrs || []).join(",") + "]" : " [not PCR-gated]"); }).join(", ")
       : "no named secrets registered" });
   if (m.seal_state) {
-    rows.push({ label: "seal_state", status: PROVEN,
+    rows.push({ label: "seal_state", status: SERVER_ASSERTED,
       value: "posture " + (m.seal_state.posture || "?") + ", state_hash " + trunc(m.seal_state.state_hash, 24) +
              ", log entries " + (m.seal_state.state_log != null ? m.seal_state.state_log : "?") +
              ", pcrs [" + ((m.seal_state.pcrs || []).join(",")) + "]" });
@@ -1413,15 +1427,15 @@ function renderSections(m) {
     rows.push({ label: "seal_state", status: NOT_PROVEN, value: "no seal state published" });
   }
   const cc = m.cert_chain;
-  rows.push({ label: "cert_chain", status: cc && cc.leaf ? PROVEN : NOT_PROVEN,
+  rows.push({ label: "cert_chain", status: cc && cc.leaf ? SERVER_ASSERTED : NOT_PROVEN,
     value: cc && cc.leaf ? ("leaf " + trunc(cc.leaf.subject, 60) + ", anchors: " + ((cc.spki_anchors || []).join(", ") || "none")) : "no ACME leaf published" });
   const en = m.endorsement || {};
-  rows.push({ label: "endorsement", status: (en.aws && en.aws.present) || (en.amd && en.amd.present) ? PROVEN : NOT_PROVEN,
+  rows.push({ label: "endorsement", status: (en.aws && en.aws.present) || (en.amd && en.amd.present) ? SERVER_ASSERTED : NOT_PROVEN,
     value: "aws: " + j(en.aws) + " amd: " + j(en.amd) });
-  rows.push({ label: "spdx_inventory", status: m.spdx_inventory ? PROVEN : NOT_PROVEN, value: m.spdx_inventory ? j(m.spdx_inventory) : "no SBOM shipped with this image (honest null until one exists)" });
+  rows.push({ label: "spdx_inventory", status: m.spdx_inventory ? SERVER_ASSERTED : NOT_PROVEN, value: m.spdx_inventory ? j(m.spdx_inventory) : "no SBOM shipped with this image (honest null until one exists)" });
   return rows;
 }
-function trunc(v, n) { const s = typeof v === "string" ? v : j(v); return s.length > n ? s.slice(0, n) + "…" : s; }
+function trunc(v, n) { if (v == null) return "not published"; const s = typeof v === "string" ? v : j(v); return s.length > n ? s.slice(0, n) + "…" : s; }
 function j(v) { try { return JSON.stringify(v); } catch (e) { return String(v); } }
 
 // -----------------------------------------------------------------------------
@@ -1478,8 +1492,9 @@ function render(res) {
   // res.swLen so the local claim always ships alongside the exact bytes+hash it
   // identifies (no self-hash, no claim).
   if (res.swLen) {
-    parts.push('<p class=foot>Every fact on this page was verified in your ' +
-      "browser by the service worker shown below. This page was rendered " +
+    parts.push('<p class=foot>Every browser-verified proof above was verified in your ' +
+      "browser by the service worker shown below; rows marked " + SERVER_ASSERTED +
+      " are published by the server and not attested. This page was rendered " +
       "locally, not by the server. Verifier: " + esc(res.swLen) + " bytes, sha256 " + esc(res.swSha) +
       '. <a href="/verify.js.src">view verifier source</a>. Re-verifies every ' + (REFRESH_MS / 1000) + "s.</p>");
   }

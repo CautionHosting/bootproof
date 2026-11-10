@@ -1,0 +1,58 @@
+{
+  "description": "Trust-tier expectations for the System Health renderers (T-E2 conformance seed, chipmunk R3 2026-11-10). LANGUAGE-NEUTRAL DATA: any surface implementation (verify.js today; the unified JS library and any future Go/Rust-side renderer driver) feeds each input through its own mapping pipeline and must produce the expected verdict WORD and display class. The tier law in one sentence: a value the server PUBLISHES is never browser-VERIFIED; presence maps to SERVER-ASSERTED, absence maps to NOT PROVEN (different honest states), and only local verification may mint PROVEN.",
+  "chip_vocab": {
+    "p": "the browser-verified green tier",
+    "s": "the server-asserted tier (server-published, not attested)",
+    "n": "not proven (absent / unverifiable)",
+    "f": "failed"
+  },
+  "map_status": [
+    { "raw": "proven", "expected_verdict": "SERVER-ASSERTED" },
+    { "raw": "some-unknown-status", "expected_verdict": "NOT PROVEN" }
+  ],
+  "metadata_present": {
+    "user_data": "tier witness user-data",
+    "seal_state": { "posture": "sealed", "state_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "state_log": 3, "pcrs": [11, 13, 22] }
+  },
+  "pass_present": {
+    "checks": [
+      { "name": "memory_encryption", "status": "PROVEN", "expected_verdict": "PROVEN", "expected_chip": "p" },
+      { "name": "wardend_state_chain", "status": "NOT PROVEN", "expected_verdict": "NOT PROVEN", "expected_chip": "n" }
+    ],
+    "server_facts": [
+      { "name": "server-says-proven", "raw_status": "proven", "expected_verdict": "SERVER-ASSERTED", "expected_chip": "s" },
+      { "name": "server-says-degraded", "raw_status": "degraded", "expected_verdict": "DEGRADED", "expected_chip": "s" }
+    ],
+    "section_expectations": [
+      { "label": "user_data", "expected_verdict": "SERVER-ASSERTED", "expected_chip": "s" },
+      { "label": "seal_state", "expected_verdict": "SERVER-ASSERTED", "expected_chip": "s" }
+    ]
+  },
+  "pass_absent": {
+    "metadata": {},
+    "section_expectations": [
+      { "label": "user_data", "expected_verdict": "NOT PROVEN", "expected_chip": "n" },
+      { "label": "seal_state", "expected_verdict": "NOT PROVEN", "expected_chip": "n" }
+    ]
+  },
+  "render_fixture": {
+    "nonce": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "sw_len": 84552,
+    "sw_sha": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+    "t": 1700000000000
+  },
+  "footer": {
+    "must_include": [
+      "verified in your browser by the service worker",
+      "rows marked SERVER-ASSERTED are published by the server and not attested",
+      "href=\"/verify.js.src\""
+    ],
+    "must_not_include_ci": [
+      "every fact on this page was verified",
+      "every fact above was verified",
+      "you are secure",
+      "fully secure",
+      "totally safe"
+    ]
+  }
+}

@@ -19,7 +19,14 @@ pub const SW: &str = include_str!("../assets/system_health/verify.js");
 /// coexist in one verify.js, so this is the FIRST value covering BOTH. It is
 /// DERIVED from the merged bytes (sha256sum of the rebased asset), NOT
 /// hand-copied; never bake any historical value here. On-chain value chain:
-///   5575655a THIS (footer + identity rows, derived at rebase tip 6c5a06c)
+///   f25a581c THIS (T-E2 option A: verify.js joins the tier law - renderSections
+///            and mapStatus render the unsigned envelope as SERVER-ASSERTED,
+///            the footer claim narrows to the browser-verified proofs and
+///            names SERVER-ASSERTED rows as server-published, not attested;
+///            trunc() fails closed to "not published" instead of throwing on
+///            an absent field - a missing source is a rendered honest fact,
+///            never a dead page)
+///   5575655a at the T-B era (footer + identity rows, derived at rebase tip 6c5a06c)
 ///   fbd2bbb0 at 655b202 (identity rows only; this tip's parent)
 ///   4f19d4fb at 0b52091 (I-2b whole-doc-signature gate + canonical_doc_digest)
 ///   b5f422f4 (the result.html contract fix)
@@ -27,7 +34,7 @@ pub const SW: &str = include_str!("../assets/system_health/verify.js");
 /// Footnote: 0013e67f was the footer-only value on the pre-rebase branch tip
 /// 924d33f; the rebase onto 655b202 REWROTE that commit, so 0013e67f never
 /// landed on this chain and is an off-chain orphan, not a predecessor.)
-pub const SW_SHA256: &str = "5575655a2c1655f488b390717c5317c3e0b72973c5db074305824393bc48d01a";
+pub const SW_SHA256: &str = "f25a581ce773f2e54c7c4608d72be31702ef801a4e6bafad6281f7bcec3956b7";
 
 pub mod schema;
 /// The single-file pivot: the canonical bootproof.html (the pending-first
