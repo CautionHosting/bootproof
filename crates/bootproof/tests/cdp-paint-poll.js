@@ -21,6 +21,8 @@
 //   node cdp-paint-poll.js <url> [--marker <substring|regex>] [--bypass-cert]
 //        [--timeout <secs>] [--port <n>]
 //        [--expect-row <label[=VERDICT]>]... [--permissive]
+//        [--chrome <path>]   pin the browser binary (default /usr/bin/google-chrome);
+//                            the path + `--version` are recorded in the output JSON
 //   --expect-row <label>          requires the row to paint PROVEN (fail-closed)
 //   --expect-row <label=VERDICT>  requires that exact verdict (NOT PROVEN etc.)
 //   --permissive                  opt back into the old lenient non-FAILED rule
@@ -77,7 +79,7 @@
 // Exit 0 iff painted and rows pass and the request cap holds.
 
 'use strict';
-const { spawn } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 const http = require('http');
 const net = require('net');
 const crypto = require('crypto');
@@ -123,6 +125,11 @@ const markerRe = marker.startsWith('re:')
 const BYPASS = flag('--bypass-cert');
 const TIMEOUT_MS = parseInt(opt('--timeout', '60'), 10) * 1000;
 const PORT = parseInt(opt('--port', '0'), 10);
+// T-F: the browser is part of the witness. Default is the historical hardcoded
+// path (unchanged behavior); --chrome <path> pins a specific binary so a live
+// acceptance run is reproducible and the emitted JSON records WHICH renderer
+// produced the verdict. The version string is captured at startup and emitted.
+const CHROME_PATH = opt('--chrome', '/usr/bin/google-chrome');
 
 // ---------------- minimal CDP-over-WebSocket client ----------------
 // RFC6455 client, text frames only (CDP is JSON text). No deps because
@@ -220,7 +227,14 @@ function getJson(host, portNo, p) {
 
 // ---------------- main ----------------
 (async () => {
-  const chrome = '/usr/bin/google-chrome';
+  const chrome = CHROME_PATH;
+  // T-F: record the renderer identity. A failure to read --version is NOT
+  // fatal (an absent/odd binary still fails later at launch); we emit null
+  // rather than crash, so the gate's exit contract is unchanged by T-F.
+  let chromeVersion = null;
+  try {
+    chromeVersion = execFileSync(chrome, ['--version'], { encoding: 'utf8', timeout: 5000 }).trim();
+  } catch (e) { chromeVersion = null; }
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'crow-cdp-'));
   const args = [
     '--headless=new', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
@@ -474,6 +488,10 @@ function getJson(host, portNo, p) {
     title, url,
     error: wsErrs.length ? wsErrs[wsErrs.length - 1] : null,
     reconnects: wsErrs.length,
+    // T-F: pin/record the renderer so an acceptance run is reproducible and the
+    // G2 witness says which Chrome produced these verdicts.
+    chromePath: chrome,
+    chromeVersion: chromeVersion,
   };
   console.log(JSON.stringify(out, null, 2));
   try { await cmd('Target.closeTarget', { targetId: cur.id }); } catch {}
