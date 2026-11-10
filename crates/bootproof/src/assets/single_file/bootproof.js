@@ -1390,16 +1390,31 @@ function decodeEvidence(ev) {
 // honest NOT PROVEN row. Everything is escaped at FLIP time (setRow below),
 // never at compute time. The label of every row MUST match a static row id
 // in bootproof.html (row_parity_contract.js asserts both directions).
+// renderSections: the metadata table is SERVER-ASSERTED display, never browser-
+// verified attestation. T-B (option C, chipmunk ruling 2026-11-10): renderSections'
+// ONLY input is env.metadata (:1349, :1670), the server-asserted blob the browser
+// cannot check. It never sees the signed wardend doc; metadata fields and doc
+// fields share NAMES but are DIFFERENT BYTE-OBJECTS (proven on golden:
+// metadata.seal_state {posture,state_hash,...} != doc.seal_state {posture,state},
+// metadata.units {name,state,health} != doc.units {name,up,heartbeat}, and the
+// signed doc has NO user_data key). So a presence-based PROVEN here overclaims
+// (the F3 class), and a "field name is in canonicalDocBytes => PROVEN" rule
+// launders that overclaim through a name collision. Every metadata row therefore
+// flips PROVEN => SERVER-ASSERTED: the server published it, the browser renders
+// it, it is NOT attested. The genuinely-verified facts live where they already
+// surface correctly (wardend_state_chain under the doc signature, and the
+// channel rows). An ABSENT field stays NOT PROVEN: ASSERTED (server said,
+// unattested) and ABSENT (server said nothing) are DIFFERENT honest states.
 function renderSections(m) {
   const rows = [];
-  rows.push({ label: "instance_id", status: m.instance_id ? PROVEN : NOT_PROVEN, value: m.instance_id || "not set" });
-  rows.push({ label: "user_data", status: m.user_data ? PROVEN : NOT_PROVEN, value: trunc(m.user_data, 120) });
-  rows.push({ label: "stagex_commit", status: m.stagex_commit ? PROVEN : NOT_PROVEN,
+  rows.push({ label: "instance_id", status: m.instance_id ? SERVER_ASSERTED : NOT_PROVEN, value: m.instance_id || "not set" });
+  rows.push({ label: "user_data", status: m.user_data ? SERVER_ASSERTED : NOT_PROVEN, value: trunc(m.user_data, 120) });
+  rows.push({ label: "stagex_commit", status: m.stagex_commit ? SERVER_ASSERTED : NOT_PROVEN,
     value: (m.stagex_commit || "no wardend-commit line in user-data") + (m.stagex_commit ? "  (a parsed CLAIM from user-data: pair it with the measured-boot facts)" : "") });
-  rows.push({ label: "instance_identity", status: m.instance_identity ? PROVEN : NOT_PROVEN,
+  rows.push({ label: "instance_identity", status: m.instance_identity ? SERVER_ASSERTED : NOT_PROVEN,
     value: m.instance_identity ? "signed IMDS document present (verifiable only against AWS's signing key)" : "absent (not an AWS instance, or IMDS was unreachable)" });
-  rows.push({ label: "disk_encryption", status: m.disk_encryption ? PROVEN : NOT_PROVEN, value: j(m.disk_encryption) });
-  rows.push({ label: "units", status: Array.isArray(m.units) && m.units.length ? PROVEN : NOT_PROVEN,
+  rows.push({ label: "disk_encryption", status: m.disk_encryption ? SERVER_ASSERTED : NOT_PROVEN, value: j(m.disk_encryption) });
+  rows.push({ label: "units", status: Array.isArray(m.units) && m.units.length ? SERVER_ASSERTED : NOT_PROVEN,
     value: Array.isArray(m.units) && m.units.length
       ? m.units.map(function (u) { return u.name + ": " + (u.state || u.health || "?"); }).join(", ")
       : "the node published no unit table" });
@@ -1413,18 +1428,18 @@ function renderSections(m) {
       const t = l.trim().split(/\s+/);
       return t.length >= 2 && t[0] === "host" && t.join(" ").indexOf("backend=") > 0;
     });
-    rows.push({ label: "fleet_domains", status: PROVEN,
+    rows.push({ label: "fleet_domains", status: SERVER_ASSERTED,
       value: hosts.length + " vhost line(s) in the current user-data" +
              (hosts.length ? ": " + hosts.map(function (l) { return l.trim().split(/\s+/)[1]; }).join(", ") : "") });
   } else {
     rows.push({ label: "fleet_domains", status: NOT_PROVEN, value: "no user-data in the envelope to count vhosts from" });
   }
-  rows.push({ label: "hsm_keys", status: Array.isArray(m.hsm_keys) && m.hsm_keys.length ? PROVEN : NOT_PROVEN,
+  rows.push({ label: "hsm_keys", status: Array.isArray(m.hsm_keys) && m.hsm_keys.length ? SERVER_ASSERTED : NOT_PROVEN,
     value: Array.isArray(m.hsm_keys) && m.hsm_keys.length
       ? m.hsm_keys.map(function (k) { return k.name + (k.pcr_gated ? " [PCR-gated " + (k.pcrs || []).join(",") + "]" : " [not PCR-gated]"); }).join(", ")
       : "no named secrets registered" });
   if (m.seal_state) {
-    rows.push({ label: "seal_state", status: PROVEN,
+    rows.push({ label: "seal_state", status: SERVER_ASSERTED,
       value: "posture " + (m.seal_state.posture || "?") + ", state_hash " + trunc(m.seal_state.state_hash, 24) +
              ", log entries " + (m.seal_state.state_log != null ? m.seal_state.state_log : "?") +
              ", pcrs [" + ((m.seal_state.pcrs || []).join(",")) + "]" });
@@ -1433,15 +1448,15 @@ function renderSections(m) {
   }
   const cc = m.cert_chain;
   const leaf = cc && cc.leaf;
-  rows.push({ label: "cert_chain", status: leaf && !leaf.error ? PROVEN : NOT_PROVEN,
+  rows.push({ label: "cert_chain", status: leaf && !leaf.error ? SERVER_ASSERTED : NOT_PROVEN,
     value: leaf && !leaf.error
       ? ("leaf " + trunc(leaf.subject, 60) + ", issuer " + trunc(leaf.issuer, 48) +
          ", expires " + (leaf.not_after || "?") + ", anchors: " + ((cc.spki_anchors || []).join(", ") || "none"))
       : (cc && cc.leaf_pem ? "server decode failed; the browser decodes the PEM itself" : "no ACME leaf published") });
   const en = m.endorsement || {};
-  rows.push({ label: "endorsement", status: (en.aws && en.aws.present) || (en.amd && en.amd.present) ? PROVEN : NOT_PROVEN,
+  rows.push({ label: "endorsement", status: (en.aws && en.aws.present) || (en.amd && en.amd.present) ? SERVER_ASSERTED : NOT_PROVEN,
     value: "aws: " + j(en.aws) + " amd: " + j(en.amd) });
-  rows.push({ label: "spdx_inventory", status: m.spdx_inventory ? PROVEN : NOT_PROVEN, value: m.spdx_inventory ? j(m.spdx_inventory) : "no SBOM shipped with this image (honest null until one exists)" });
+  rows.push({ label: "spdx_inventory", status: m.spdx_inventory ? SERVER_ASSERTED : NOT_PROVEN, value: m.spdx_inventory ? j(m.spdx_inventory) : "no SBOM shipped with this image (honest null until one exists)" });
   return rows;
 }
 function trunc(v, n) { const s = typeof v === "string" ? v : j(v); return s.length > n ? s.slice(0, n) + "…" : s; }

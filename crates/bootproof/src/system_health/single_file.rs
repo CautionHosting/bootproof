@@ -50,11 +50,14 @@ pub const BOOTPROOF_HTML: &str = include_str!("../assets/dist/bootproof.html");
 /// by the combiner), NOT hand-copied; never bake a historical value here. The
 /// single-file artifact is a NEW delivery form, so this hash is independent of
 /// the service-worker SW_SHA256 by construction (one file vs two files).
-/// On-chain value: 4760aa18 (the pending-first pivot: operator-named sources,
-/// the static pending tables, the flip engine, the fleet_domains row; the
-/// artifact moved to assets/dist/). Predecessor: a3ba3240 (the first canonical
+/// On-chain value: 195680d4 (T-B trust tiers: renderSections' metadata table
+/// flips presence-PROVEN => SERVER-ASSERTED, the F3 overclaim fix; the metadata
+/// blob is unsigned server display, never browser-verified attestation).
+/// Predecessor: 4760aa18 (the pending-first pivot: operator-named sources, the
+/// static pending tables, the flip engine, the fleet_domains row; the artifact
+/// moved to assets/dist/). Before that: a3ba3240 (the first canonical
 /// bootproof.html, whole-page innerHTML render).
-pub const BOOTPROOF_SHA256: &str = "4760aa18ce34f1038276b802cb34909ec97c94c25b08eb2725c39138ff5e07ad";
+pub const BOOTPROOF_SHA256: &str = "195680d475bd332569432d2d4543741e9906d359c722fa1e753844b90b61c250";
 
 #[cfg(test)]
 mod tests {

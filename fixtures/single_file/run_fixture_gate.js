@@ -25,9 +25,11 @@
 //   * identity_link declares NOT PROVEN (ruling iii: the golden fixture
 //     publishes no leaf PEM; NOT PROVEN is the honest pass; the driver now
 //     fails a PROVEN there as an overclaim, and FAILED as a mismatch).
-//   * seal_state declares PROVEN (byte-attested by the wardend doc signature).
+//   * seal_state declares SERVER-ASSERTED (T-B: it renders from the UNSIGNED
+//     metadata blob, not the signed wardend doc; the verified chain is the
+//     separate wardend_state_chain row). Same for user_data: the golden
+//     envelope publishes user-data, so it paints SERVER-ASSERTED, never PROVEN.
 //   * cert_chain declares NOT PROVEN (no leaf PEM published; the honest render).
-//   * user_data declares PROVEN (the golden envelope publishes user-data).
 //   The wrapper below re-asserts each independently (belt and suspenders): the
 //   driver being green is necessary, never sufficient, for THIS gate to pass.
 // Chrome requirement: /usr/bin/google-chrome (same as the cert-night driver).
@@ -105,8 +107,8 @@ function drive(args, timeout) {
     '--expect-row', 'wardend_state_chain',
     '--expect-row', 'nonce_freshness',
     '--expect-row', 'identity_link=NOT PROVEN',
-    '--expect-row', 'user_data',
-    '--expect-row', 'seal_state',
+    '--expect-row', 'user_data=SERVER-ASSERTED',
+    '--expect-row', 'seal_state=SERVER-ASSERTED',
     '--expect-row', 'cert_chain=NOT PROVEN',
   ], 90000);
 
@@ -127,13 +129,16 @@ function drive(args, timeout) {
     const v = j.rows[lc] && j.rows[lc].verdict;
     if (!v || v === 'PENDING') fail(`lifecycle row ${lc} never flipped (verdict ${v})`);
   }
-  // The user_data row witnesses the envelope's CURRENT user-data text (the
+  // The user_data row witnesses the envelope's SERVED user-data text (the
   // hot-add witness): the flip wrote the envelope value into the row's why
   // span, and the driver dumped the painted text. The value must be THERE
   // (trunc() cuts at 120 chars + an ellipsis; the golden value is shorter
-  // than that, so the full string must appear).
+  // than that, so the full string must appear). The verdict is
+  // SERVER-ASSERTED, never PROVEN: the metadata blob is unsigned server
+  // display (T-B); the witness property is the BYTES being present, not a
+  // signature the browser never checked.
   const udRow = j.rows.user_data;
-  if (udRow.verdict !== 'PROVEN') fail(`user_data verdict ${udRow.verdict} != PROVEN (the golden envelope publishes user-data)`);
+  if (udRow.verdict !== 'SERVER-ASSERTED') fail(`user_data verdict ${udRow.verdict} != SERVER-ASSERTED (the golden envelope publishes user-data; T-B tier)`);
   if (!UD) fail('the golden envelope lost its user_data (the witness check needs it)');
   if (!udRow.why_text || udRow.why_text.indexOf(UD) < 0) {
     fail(`user_data row does not carry the envelope value. painted: ${JSON.stringify(udRow.why_text)} envelope: ${JSON.stringify(UD.slice(0, 80))}`);
