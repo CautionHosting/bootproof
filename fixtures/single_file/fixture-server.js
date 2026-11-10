@@ -28,7 +28,22 @@ const fi = argv.indexOf('--fixture');
 const FIXTURE = fi >= 0 ? path.resolve(argv[fi + 1]) : path.join(ROOT, 'fixtures', 'system_health', 'golden.json');
 const META = path.join(path.dirname(FIXTURE), (path.basename(FIXTURE).replace(/\.json$/, '')) + '.meta.json');
 
+// --facts-overlay '<json array>': replace envelope.facts with the given array
+// BEFORE SERVING (T-E witness). envelope.facts is UNSIGNED display data: it
+// lives outside the signed bundle, so overlaying facts breaks no signature and
+// exercises mapStatus without touching golden.json's bytes. The nonce echo and
+// everything signed are served verbatim from disk.
+const foi = argv.indexOf('--facts-overlay');
+let factsOverlay = null;
+if (foi >= 0) {
+  try { factsOverlay = JSON.parse(argv[foi + 1]); } catch (e) {
+    console.error('bad --facts-overlay JSON: ' + e.message); process.exit(2);
+  }
+}
+
 const envelope = fs.readFileSync(FIXTURE);
+const envelopeServed = factsOverlay === null ? envelope : Buffer.from(JSON.stringify(
+  Object.assign(JSON.parse(envelope.toString('utf8')), { facts: factsOverlay })), 'utf8');
 // The frozen nonce: golden.meta.json carries nonce_hex; tamper twins share the
 // golden meta (their tampering is inside the envelope, not the nonce).
 const metaPath = fs.existsSync(META) ? META : path.join(ROOT, 'fixtures', 'system_health', 'golden.meta.json');
@@ -43,7 +58,7 @@ const srv = http.createServer((req, res) => {
     res.end(fs.readFileSync(HTML));
   } else if (p === '/health/api') {
     res.setHeader('Content-Type', 'application/json');
-    res.end(envelope);
+    res.end(envelopeServed);
   } else if (p === '/fixture.nonce') {
     res.setHeader('Content-Type', 'text/plain');
     res.end(nonce);

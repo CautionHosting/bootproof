@@ -1503,7 +1503,15 @@ async function runVerification(origin) {
 }
 
 function mapStatus(s) {
-  return s === "proven" ? PROVEN : s === "degraded" ? "DEGRADED" :
+  // T-E (chipmunk ruling 2026-11-10): env.facts is an UNSIGNED envelope field.
+  // The server saying "proven" is the server's own verdict, not a browser-
+  // verified fact; mapping it to PROVEN was the LAST tier-blind green after
+  // T-B. 'proven' => SERVER-ASSERTED (chip 's'). Absent/unknown stays NOT
+  // PROVEN: asserted (server said, unattested) and absent (server said
+  // nothing) remain different honest states. 'degraded'/'reproducible' keep
+  // their own words (they already render the 's' class; separating that
+  // vocabulary from SERVER-ASSERTED is a separate ruling, untouched here).
+  return s === "proven" ? SERVER_ASSERTED : s === "degraded" ? "DEGRADED" :
          s === "reproducible" ? "REPRODUCIBLE" : NOT_PROVEN;
 }
 // The wire's B64 newtype serializes as a PLAIN base64 string (see
@@ -1673,8 +1681,16 @@ function fillServerFacts(facts) {
   }
   const parts = [];
   for (const f of facts) {
-    parts.push('<tr><td class=k>' + esc(f.name) + '</td><td><span class="verdict ' + cls(f.status) + '">' +
-      esc(f.status) + '</span> <span class=why>"' + esc(f.value) + '" [' + esc((f.anchors || []).join("+")) + "]</span></td></tr>");
+    // T-E witness contract: each fact row carries the driver's id convention
+    // (r-/v-/w-<label>, label = "fact.<name>" with non [A-Za-z0-9_.-] bytes
+    // replaced), so cdp-paint-poll can read the PAINTED verdict + chip class
+    // of a fact row by id — never by a text window. The sanitizer keeps
+    // server-supplied names from minting arbitrary ids; a name that collides
+    // after sanitizing is the server mangling its own witness, never the
+    // browser's (ids are write-only for the renderer).
+    const fl = "fact." + String(f.name).replace(/[^A-Za-z0-9_.-]/g, "-");
+    parts.push('<tr id="r-' + esc(fl) + '"><td class=k>' + esc(f.name) + '</td><td><span class="verdict ' + cls(f.status) + '" id="v-' + esc(fl) + '">' +
+      esc(f.status) + '</span> <span class=why id="w-' + esc(fl) + '">"' + esc(f.value) + '" [' + esc((f.anchors || []).join("+")) + "]</span></td></tr>");
   }
   body.innerHTML = parts.join("");
 }
@@ -1690,8 +1706,10 @@ function setFooter(swLen, swSha) {
     " (a measurement of what the server returned, not a self-claim). " +
     "Whether that hash matches the build-time pin / UKI measurement is checked " +
     "<em>outside</em> this page, by the boot-chain and the pinned constant, not " +
-    "by the page asserting it. Every fact above was verified in your browser, " +
-    "locally, not by the server. Re-verifies every " + (REFRESH_MS / 1000) + "s.";
+    "by the page asserting it. " +
+    "Every browser-verified proof above was verified in your browser, locally; " +
+    "rows marked " + SERVER_ASSERTED + " are published by the server and not " +
+    "attested. Re-verifies every " + (REFRESH_MS / 1000) + "s.";
 }
 
 // Flip a full verification result into the static rows. Order matters for

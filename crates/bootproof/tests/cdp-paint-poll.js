@@ -450,7 +450,7 @@ function getJson(host, portNo, p) {
     else if (v === 'PENDING') why = ALLOW_PENDING ? 'pending pass allowed (static paint)' : 'row never flipped';
     else if (v === expected) why = 'matches declared expectation';
     else why = 'MISMATCH: painted ' + v + ' but harness declared ' + expected;
-    rows[label] = { verdict: v, expected: expected, why_text: ent.why == null ? null : String(ent.why).slice(0, 300), pass: pass, why: why };
+    rows[label] = { verdict: v, expected: expected, cls: ent.cls == null ? null : String(ent.cls), why_text: ent.why == null ? null : String(ent.why).slice(0, 300), pass: pass, why: why };
     if (!pass) rowsOk = false;
   }
 
