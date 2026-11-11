@@ -524,14 +524,37 @@ const digestRowsSection = (evidence) => {
   for (const r of rows) parts.push(Buffer.from([1]), sha256(canonicalRowBytes(r)));
   return Buffer.concat(parts);
 };
+// The status cascade (bake-11): the daemon's channel account folds LAST (the
+// anti-MITM transport defense; see the verify.js mirror for the threat
+// model). Mirror of the Rust canonical_status_bytes / digest_status_section.
+// Outcome tag 0=collected, 1=absent, 2=failed (the discriminant); rows sort
+// by (channel, canonical bytes): order-invariant.
+const canonicalStatusBytes = (st) => {
+  const tag = st.outcome === 'failed' ? 2 : st.outcome === 'absent' ? 1 : 0;
+  return Buffer.concat([
+    pushBytes(Buffer.from(st.channel, 'utf8')),
+    Buffer.from([tag]),
+    pushBytes(Buffer.from(st.reason || '', 'utf8')),
+  ]);
+};
+const digestStatusSection = (status) => {
+  const rows = (status || []).slice().sort((x, y) => {
+    const c = Buffer.from(x.channel, 'utf8').compare(Buffer.from(y.channel, 'utf8'));
+    return c !== 0 ? c : canonicalStatusBytes(x).compare(canonicalStatusBytes(y));
+  });
+  const parts = [u32(rows.length)];
+  for (const st of rows) parts.push(Buffer.from([1]), sha256(canonicalStatusBytes(st)));
+  return Buffer.concat(parts);
+};
 const canonicalDocDigest = (doc) => sha256(Buffer.concat([DOC_DIGEST_PREFIX, canonicalFieldBytes(doc, false)]));
 // D4: digest v2 = the v2 marker || the 32-byte challenge the response
-// answers || the fields INCLUDING the user-data section || the rows fold.
+// answers || the fields INCLUDING the user-data section || the rows fold
+// || the status fold (the status cascade, folded LAST).
 // THIS is what the fixture's HSM signs (one signature over the challenge AND
 // the other channels' rows: the A7 replay close plus the D4 drop/swap
 // close), and what both verifiers recompute with the bundle's nonce and
 // evidence.
-const canonicalDocDigestV2 = (doc, nonce32, evidence) => sha256(Buffer.concat([DOC_DIGEST_PREFIX_V2, Buffer.from(nonce32), canonicalFieldBytes(doc, true), digestRowsSection(evidence)]));
+const canonicalDocDigestV2 = (doc, nonce32, evidence, status) => sha256(Buffer.concat([DOC_DIGEST_PREFIX_V2, Buffer.from(nonce32), canonicalFieldBytes(doc, true), digestRowsSection(evidence), digestStatusSection(status)]));
 
 // The doc's JSON: the serde shape. A BigInt handle must serialize as a
 // BARE NUMBER TOKEN (serde_json writes u64 as a bare integer; a quoted
@@ -714,18 +737,32 @@ const EK_BLOB = Buffer.from('bootproof golden fixture EK-cert blob (presence onl
 const snpRow = { channel: 'snp', doc: b64(REPORT), anchors: { vlek: b64(VLEK_DER), asvk: b64(ASVK_DER), ark: b64(ARK_DER) } };
 const tpmRow = { channel: 'tpm2', doc: b64(TPM_DOC), anchors: { ek_cert: b64(EK_BLOB) } };
 const foldRows = [snpRow, tpmRow];
-const WARDEND_DOC_DIGEST = canonicalDocDigestV2(wardendDocObj, NONCE, foldRows);
+// The status cascade (bake-11): the golden's honest posture is a full-
+// hardware box — every registered channel collected. The account rides the
+// bundle AND folds into the signature below (the anti-MITM transport
+// contract: the status-tamper fixture proves both verifiers reject a
+// rewritten account; the Rust verify_bundle renders non-Collected rows as
+// loud daemon_account facts).
+const channelStatus = [
+  { channel: 'snp', outcome: 'collected', reason: '' },
+  { channel: 'tpm2', outcome: 'collected', reason: '' },
+  { channel: 'wardend', outcome: 'collected', reason: '' },
+];
+const WARDEND_DOC_DIGEST = canonicalDocDigestV2(wardendDocObj, NONCE, foldRows, channelStatus);
 const WARDEND_DOC_SIG = signDetPrehashed(HSM.pub, HSM.d, WARDEND_DOC_DIGEST);
 // D4 rows-fold parity pin (the cross-implementation witness for the rows
 // fold): the JS canonicalDocDigestV2 over the fixture doc + nonce + rows
 // MUST equal the Rust canonical_doc_digest_v2 recomputed in the plugin
-// integration test. 36320364... supersedes the census-less v2 vector
-// 68df3fae3b466f8b189bb059b1db0dc6c9715eacce8c44ff515572600f163023 (the D6
-// HSM key-registry census folded into the v2 walk moves the digest; v1 stays
-// byte-identical at c957... — the freeze witness above proves the census
-// entered v2 ONLY). A JS/Rust fold drift throws HERE at generation, before
-// any fixture is written.
-const FIXTURE_DOC_DIGEST_V2_HEX = "36320364c54ffe6175b7869142a0d9c0e5f9838e2add340726c66fce9bb31c38";
+// integration test. 5e25f96c... supersedes 36320364... (the status
+// cascade: the daemon's channel_status account now folds LAST — even the
+// empty account moves the digest, its u32 count is folded (the plugin's
+// empty-rows vector moved 554a8a18 -> 08a995c1 for exactly that), and the
+// golden ships three Collected rows on top of it; the census-less vector
+// 68df3fae... stays history two moves back; v1 stays byte-identical at
+// c957... — the freeze witness above proves both v2-only sections entered
+// v2 ONLY). A JS/Rust fold drift throws HERE at generation, before any
+// fixture is written.
+const FIXTURE_DOC_DIGEST_V2_HEX = "5e25f96c9a2927d44863e5c8fdc7bb9227fe57bba83c63c43f4fa99f4d0f8b33";
 if (hexOf(WARDEND_DOC_DIGEST) !== FIXTURE_DOC_DIGEST_V2_HEX) {
   throw new Error(
     'digest v2 rows-fold parity FAILED: the JS canonicalDocDigestV2 drifted from the pinned Rust vector\n' +
@@ -739,6 +776,7 @@ const bundle = {
   nonce: b64(NONCE),
   node: { id: 'i-0golden0000000000', platform: 'aws-snp' },
   evidence: [snpRow, tpmRow, wardendRow],
+  channel_status: channelStatus,
   keys: { sign: { pub_: b64(signPublic), curve: 'P-256', scheme: 'ecdsa-sha256', pcr_policy: Array.from(PCR_INDICES) } },
 };
 const HSM_PIN = hexOf(sha256(Buffer.concat([P256_SPKI_PREFIX, HSM.point])));
@@ -825,6 +863,20 @@ const tV1 = clone(envelope);     // v1-signed: the RETIRED contract, honestly
   ev.anchors.doc_signature = b64(signDetPrehashed(HSM.pub, HSM.d, WARDEND_DOC_DIGEST_V1));
 }
 
+const tStatus = clone(envelope); // status-tamper (the status cascade): a
+{
+  // TRANSPORT rewrites the daemon's account — the healthy tpm2 channel
+  // flipped to failed with a fabricated reason (the on-the-wire
+  // misdiagnosis attack). The doc and rows are untouched: only the
+  // signature's status fold can catch it. Both verifiers must reject the
+  // wardend channel (the recomputed digest differs); a transport cannot
+  // rewrite an account the box did not sign.
+  const row = tStatus.bundle.channel_status.find((s) => s.channel === 'tpm2');
+  if (!row) throw new Error('status-tamper: the tpm2 status row is missing');
+  row.outcome = 'failed';
+  row.reason = 'open tpm: Permission denied';
+}
+
 // ---------------------------------------------------------------------------
 // Write.
 // ---------------------------------------------------------------------------
@@ -836,6 +888,7 @@ write('golden.log-tamper.json', tLog);
 write('golden.missing-snp.json', tNoSnp);
 write('golden.unsigned-doc.json', tNoSig);
 write('golden.v1-signed.json', tV1);
+write('golden.status-tamper.json', tStatus);
 write('golden.meta.json', {
   // The harness + tests read the frozen nonce from here. The expected
   // VERDICTS deliberately do NOT live here: they are hardcoded in the

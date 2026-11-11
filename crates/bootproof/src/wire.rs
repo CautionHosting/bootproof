@@ -89,6 +89,45 @@ pub struct Node {
     pub platform: String,
 }
 
+/// What one registered channel reported during a collect (the daemon's OWN
+/// claim: TIER 2, daemon-proven — it asserts what its open()/collect() saw;
+/// an absence has no hardware bytes to sign). Transmitted on the collect
+/// socket + the Bundle, and folded into the wardend v2 digest (see
+/// `Bundle::channel_status`) so the transport can neither drop nor rewrite
+/// it — the anti-MITM defense. The anti-LYING-daemon defense is separate
+/// and load-bearing: the client's out-of-band required-channel set. The
+/// trust anchor is the required-set gap, NEVER this row's reason prose.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChannelStatus {
+    /// The channel this row is about (the registration name).
+    pub channel: String,
+    /// What happened (serialized as "collected" | "absent" | "failed").
+    pub outcome: ChannelOutcome,
+    /// The daemon's reason (empty unless there is one to give). Rides the
+    /// fold: a MITM cannot rewrite "open tpm: Permission denied" into
+    /// "device not present" — the misdiagnosis attack, which sends the
+    /// fleet chasing hardware absence while a permissions fault runs free.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+}
+
+/// The three outcomes a channel can report. Every registered channel
+/// reports exactly one per collect (the preserve-and-mark contract:
+/// absence on the wire is never silence).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelOutcome {
+    /// The channel produced its evidence row. A false claim here is
+    /// self-destructing: the evidence row must crypto-verify or the
+    /// channel renders FAILED regardless of this row.
+    Collected,
+    /// `detect()` said the hardware is not present on this host.
+    Absent,
+    /// `collect()` returned an error (the reason carries the daemon's
+    /// explanation: EACCES, ioctl failure, ...).
+    Failed,
+}
+
 /// The attestation bundle: the only substantive response the node returns.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bundle {
@@ -99,6 +138,23 @@ pub struct Bundle {
     pub node: Node,
     /// One entry per active channel.
     pub evidence: Vec<Evidence>,
+    /// The daemon's per-channel collection account: EVERY registered
+    /// channel appears exactly once (collected / absent / failed), so the
+    /// auditor sees absence WITH its cause instead of inferring it from a
+    /// hole in `evidence` (the preserve-and-mark law: collection never
+    /// destroys evidence, and absence is never silent — the BUG-8 family:
+    /// absence-dressed-as-honest-degradation). Tier 2 (daemon-proven):
+    /// folded into the wardend v2 digest (presence-tagged, channel-sorted,
+    /// LAST — same anti-MITM discipline as the D4 rows fold: a transport
+    /// can neither drop a failed row nor rewrite its reason), and
+    /// cross-checked by the client's out-of-band REQUIRED set (the
+    /// distrust-the-daemon anchor — the fold defends the TRANSMISSION, the
+    /// required-set gap defends against the daemon LYING).
+    /// serde-defaulted: a pre-status Bundle (any older daemon) simply has
+    /// none, and the client falls back to the infer-absence-from-the-hole
+    /// path + its required-set gap.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channel_status: Vec<ChannelStatus>,
     /// State-bound TPM keys, if a TPM is present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keys: Option<Keys>,

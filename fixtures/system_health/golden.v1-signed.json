@@ -32,6 +32,23 @@
     }
    }
   ],
+  "channel_status": [
+   {
+    "channel": "snp",
+    "outcome": "collected",
+    "reason": ""
+   },
+   {
+    "channel": "tpm2",
+    "outcome": "collected",
+    "reason": ""
+   },
+   {
+    "channel": "wardend",
+    "outcome": "collected",
+    "reason": ""
+   }
+  ],
   "keys": {
    "sign": {
     "pub_": "ACMACwAAAEQAIEWCVPoVuHDVKoVRLjsd/40TtfejztvaNwjP8/TNJJO+ABAAGAALAAMAEAAgZOkvQ4mrf7+TWAMFB5lcBK3ZQsEOjYWTRNro8WmTrVMAIMs/324/LDvQ7CQpgrvXv3S06AXJIrwDO28SPyiZ0Uwq",

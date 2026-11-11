@@ -535,6 +535,7 @@ mod offline_tests {
                 platform: "baremetal".into(),
             },
             evidence: vec![],
+            channel_status: Vec::new(),
             keys: None,
             metadata: None,
         };
@@ -564,6 +565,7 @@ mod offline_tests {
                 doc: B64::new(vec![]),
                 anchors: BTreeMap::new(),
             }],
+            channel_status: Vec::new(),
             keys: None,
             metadata: None,
         };
@@ -586,6 +588,7 @@ mod offline_tests {
                 platform: "baremetal".into(),
             },
             evidence: vec![],
+            channel_status: Vec::new(),
             keys: None,
             metadata: None,
         };

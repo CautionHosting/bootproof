@@ -332,21 +332,29 @@ async fn attestation(
     // the node's HW channels as NOT PROVEN for this request) and the
     // request still succeeds.
     let transport = app.transport.clone();
-    let collected: Option<Vec<Collected>> = match transport.collect(&challenge).await {
-        Ok(cols) => Some(cols),
-        Err(e) => {
-            warn!(%e, "collect daemon unreachable; serving with no hardware evidence (NOT PROVEN)");
-            None
-        }
-    };
+    // The preserve-and-mark pair moves together: rows + the daemon's
+    // channel account. A daemon we cannot reach has no account to show
+    // for itself (the bundle then carries NO channel_status: the pre-status
+    // shape, where the client falls back to infer-absence-from-the-hole
+    // plus its own required-set gap).
+    let collected: Option<(Vec<Collected>, Vec<crate::wire::ChannelStatus>)> =
+        match transport.collect(&challenge).await {
+            Ok(pair) => Some(pair),
+            Err(e) => {
+                warn!(%e, "collect daemon unreachable; serving with no hardware evidence (NOT PROVEN)");
+                None
+            }
+        };
 
     let mut evidence = Vec::new();
+    let mut channel_status = Vec::new();
     let mut keys = None;
-    if let Some(cols) = collected {
+    if let Some((cols, status)) = collected {
         for col in cols {
             keys = keys.or(col.keys);
             evidence.push(col.evidence);
         }
+        channel_status = status;
     }
 
     let bundle = Bundle {
@@ -357,6 +365,7 @@ async fn attestation(
             platform: app.platform.clone(),
         },
         evidence,
+        channel_status,
         keys,
         metadata: app.metadata.clone(),
     };
@@ -436,7 +445,7 @@ pub async fn run(opts: Opts) -> anyhow::Result<()> {
     // none and /attestation keeps retrying the transport per request).
     let probe = [0u8; 64];
     let channels = match opts.transport.clone().collect(&probe).await {
-        Ok(cols) => {
+        Ok((cols, _status)) => {
             let mut names: Vec<String> = cols.iter().map(|c| c.evidence.channel.clone()).collect();
             names.sort();
             names.dedup();
@@ -510,21 +519,29 @@ pub async fn one_shot(
     rand::RngCore::fill_bytes(&mut rand::rng(), &mut nonce);
     let challenge = challenge_from_nonce(&nonce);
 
-    let collected: Option<Vec<Collected>> = match transport.collect(&challenge).await {
-        Ok(cols) => Some(cols),
-        Err(e) => {
-            warn!(%e, "collect daemon unreachable; serving with no hardware evidence (NOT PROVEN)");
-            None
-        }
-    };
+    // The preserve-and-mark pair moves together: rows + the daemon's
+    // channel account. A daemon we cannot reach has no account to show
+    // for itself (the bundle then carries NO channel_status: the pre-status
+    // shape, where the client falls back to infer-absence-from-the-hole
+    // plus its own required-set gap).
+    let collected: Option<(Vec<Collected>, Vec<crate::wire::ChannelStatus>)> =
+        match transport.collect(&challenge).await {
+            Ok(pair) => Some(pair),
+            Err(e) => {
+                warn!(%e, "collect daemon unreachable; serving with no hardware evidence (NOT PROVEN)");
+                None
+            }
+        };
 
     let mut evidence = Vec::new();
+    let mut channel_status = Vec::new();
     let mut keys = None;
-    if let Some(cols) = collected {
+    if let Some((cols, status)) = collected {
         for col in cols {
             keys = keys.or(col.keys);
             evidence.push(col.evidence);
         }
+        channel_status = status;
     }
 
     Bundle {
@@ -535,6 +552,7 @@ pub async fn one_shot(
             platform: platform.to_string(),
         },
         evidence,
+        channel_status,
         keys,
         metadata,
     }

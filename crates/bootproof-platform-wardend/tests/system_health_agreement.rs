@@ -160,6 +160,49 @@ fn log_tamper_rejected_by_both() {
     );
 }
 
+/// The status tamper (the status cascade): a TRANSPORT rewrote the daemon's
+/// account (tpm2 flipped collected -> failed with a fabricated reason) while
+/// the doc and rows are untouched. ONLY the signature's status fold can see
+/// it, so this fixture is the fold's reason-for-existing witness: BOTH
+/// verifiers must reject the wardend channel through the recomputed digest
+/// (the same mapping as the log-tamper: Rust errors the channel with the
+/// honest NOT PROVEN; JS rolls wardend_state_chain to FAILED). The
+/// crosswalk rule holds: agreement is asserted on the REJECTION (the
+/// security property); the daemon_account fact PLACEMENT is Rust-only until
+/// the page render module ships (documented divergence, not a gate failure).
+#[test]
+fn status_tamper_rejected_by_both() {
+    let g = fixtures_dir().join("golden.status-tamper.json");
+    let (rust, errors) = rust_wardend_facts(&g);
+    assert!(
+        errors.iter().any(|e| e.starts_with("wardend:")),
+        "rust must error the wardend channel when the shipped status account \
+         differs from the signed one: {errors:?}"
+    );
+    let me = rust.get("wardend").map(String::as_str);
+    assert_eq!(
+        me,
+        Some("NOT PROVEN"),
+        "the failed-fact is the honest NOT PROVEN: {rust:?}"
+    );
+    let js = js_facts(&g);
+    assert_eq!(
+        js.get("wardend_state_chain").map(String::as_str),
+        Some("FAILED"),
+        "js must roll wardend_state_chain to FAILED on the rewritten account"
+    );
+    // The engine-side loud fact (the status cascade's render leg): the
+    // rewritten row is non-Collected, so verify_bundle MUST carry the
+    // daemon_account row (loud T2 Degraded, reason included) even though
+    // the wardend channel itself was rejected — the account renders from
+    // the bundle, never from the verifier.
+    assert_eq!(
+        rust.get("channel.tpm2.daemon_account").map(String::as_str),
+        Some("DEGRADED"),
+        "the failed status row must render as a loud daemon_account fact: {rust:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // I-2: the whole-doc signature legs (byte-attestation of the platform
 // doc). The parity pin (the cross-implementation witness), the
@@ -361,6 +404,28 @@ fn the_browser_doc_digest_matches_rust_and_the_naive_path_diverges() {
         !tok.is_empty() && tok != naive,
         "token-safe and naive digests must both be present AND differ: tok={tok:?} naive={naive:?}"
     );
+    // The v2 twin (self-arrest, the status cascade): the harness has emitted
+    // token_safe_v2 since the D4 rows fold, and NO Rust gate ever asserted
+    // the flag: the browser's v2 canonicalizer was JS-reported but
+    // Rust-unwitnessed through this door (the fixture-signature test covers
+    // the Rust side; this closes the JS side). The shipped canonicalizer
+    // driven over the fixture doc + nonce + rows + channel_status must
+    // reproduce the v2 pin the fixture's signature closes under, and the
+    // v1/v2 byte streams must stay distinct (the marker/nonce close).
+    assert!(
+        g("token_safe_v2_matches_pin"),
+        "the shipped v2 canonicalizer over the fixture's doc + nonce + rows + \
+         channel_status must equal the committed v2 pin (the same digest the \
+         Rust canonical_doc_digest_v2 and the fixture's signature close under): {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let pin_v2 = v.get("pin_v2").and_then(|x| x.as_str()).unwrap_or("");
+    let tok_v2 = v.get("token_safe_v2").and_then(|x| x.as_str()).unwrap_or("");
+    assert!(
+        !pin_v2.is_empty() && !tok_v2.is_empty() && pin_v2 != tok && tok_v2 != tok,
+        "the v2 pin must be present and distinct from the v1 digest (a v1 byte \
+         stream never closes a v2 signature): pin_v2={pin_v2:?} tok_v2={tok_v2:?} tok={tok:?}"
+    );
 }
 
 /// I-2b (browser-side FAILED-vs-NOT-PROVEN distinction): the doc gate has TWO
@@ -462,11 +527,13 @@ fn the_digest_v2_parity_pin_rust_equals_js_and_the_sig_closes_under_it() {
     let nonce = base64_decode(&nonce_b64);
     assert_eq!(nonce.len(), 32, "the fixture nonce must be 32 bytes");
 
-    let rows = fixture_bundle(&g).evidence;
+    let fx_bundle = fixture_bundle(&g);
+    let rows = fx_bundle.evidence;
     let d2 = canonical_doc_digest_v2(
         &doc,
         nonce.as_slice().try_into().expect("32-byte nonce"),
         &rows,
+        &fx_bundle.channel_status,
     );
     let hex2: String = d2.iter().map(|b| format!("{b:02x}")).collect();
     let meta: serde_json::Value = serde_json::from_str(

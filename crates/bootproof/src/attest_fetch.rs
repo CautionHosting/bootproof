@@ -353,6 +353,7 @@ mod tests {
                 id: "tvc.example".into(),
                 platform: "third-party-tvc".into(),
             },
+            channel_status: Vec::new(),
             evidence: vec![Evidence {
                 channel: "turnkey-tee".into(),
                 doc: B64::new(b"opaque third-party evidence".to_vec()),

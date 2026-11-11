@@ -452,3 +452,67 @@ fn log_tamper_breaks_the_fold_on_both() {
     assert_eq!(js.get("tpm_quote").map(String::as_str), Some("FAILED (mapped)"));
     assert_eq!(js.get("wardend_state_chain").map(String::as_str), Some("FAILED (mapped)"));
 }
+
+/// The status tamper in CORE scope (the status cascade). Two properties,
+/// both cross-verifier:
+/// 1. The loud daemon_account fact: the fixture ships a tpm2=Failed row
+///    (the transport's rewrite), and verify_bundle MUST render it as a
+///    DEGRADED `channel.tpm2.daemon_account` fact with the reason text,
+///    from the BUNDLE (the account is data, never a verifier output).
+///    The JS verifier's page module for the account display ships later
+///    (the D6 render lane) — the documented placement divergence; the
+///    REJECTION-side agreement (wardend FAILED) is pinned in the plugin's
+///    status_tamper_rejected_by_both.
+/// 2. Independence: the rewrite touches only the status section, so the
+///    snp/tpm2 hardware verdicts must NOT move — Rust and JS agree exactly
+///    on what the rewrite leaves alone (PROVEN snp both sides; the tpm
+///    fold-damage is the wardend signature's job, asserted in the plugin).
+#[test]
+fn status_rewrite_renders_loud_and_leaves_hardware_facts_alone() {
+    let g = fixture("golden.status-tamper.json");
+    #[cfg(feature = "system-health")]
+    let _ = typed_envelope(&g);
+    assert_identity_leaf_claim_explicit(&g, false);
+    let (rust, errors) = rust_facts(&g);
+    // The loud account row (with the misdiagnosis reason preserved).
+    assert_eq!(
+        rust.get("channel.tpm2.daemon_account").map(String::as_str),
+        Some("DEGRADED"),
+        "the failed status row must render loud regardless of channel verdicts: {rust:?}"
+    );
+    // The Collected rows get NO extra fact (self-destructing claims).
+    assert!(
+        !rust.contains_key("channel.snp.daemon_account"),
+        "a Collected claim gets no daemon_account row: {rust:?}"
+    );
+    // Hardware independence: snp verifies exactly as on the golden (the
+    // status section is not fold input for the snp channel).
+    assert_eq!(
+        rust.get("memory_encryption").map(String::as_str),
+        Some("PROVEN"),
+        "the status rewrite must not touch snp (errors: {errors:?})"
+    );
+    // tpm2 stays clean in core scope: the tpm fold reads the other
+    // channels' ROWS (the PCR22 chain), never the status section, so the
+    // rewrite leaves it exactly as on the golden. The status fold lives
+    // ONLY in the wardend signature (asserted in the plugin's test).
+    assert_eq!(
+        rust.get("tpm_quote").map(String::as_str),
+        Some("PROVEN"),
+        "the tpm2 fold reads rows, not status: unaffected (errors: {errors:?})"
+    );
+    // JS agreement on the untouched facts: identical verdicts.
+    let js = js_facts(&g);
+    assert_eq!(js.get("memory_encryption").map(String::as_str), Some("PROVEN"));
+    assert_eq!(js.get("tpm_quote").map(String::as_str), Some("PROVEN"));
+    // And the REJECTION crosswalk (independent of the wardend verifier
+    // ownership): the core registry cannot verify the wardend channel, but
+    // the JS verifier reads the rewritten account against the signature
+    // and rolls FAILED — the same rejection the plugin test pins from the
+    // Rust side.
+    assert_eq!(
+        js.get("wardend_state_chain").map(String::as_str),
+        Some("FAILED (mapped)"),
+        "the browser must reject the rewritten account through the v2 fold"
+    );
+}

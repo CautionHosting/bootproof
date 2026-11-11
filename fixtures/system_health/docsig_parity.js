@@ -68,14 +68,19 @@ if (!V || !V.docDigestTokenSafe || !V.docDigestNaive) {
 
   // D4: the digest v2 twin. The fixture's doc plus the fixture's OWN
   // bundle nonce AND the fixture's FULL evidence vector (the rows fold)
+  // AND the fixture's channel_status account (the status cascade fold)
   // must reproduce wardend_doc_digest_v2_hex through the SHIPPED v2
   // canonicalizer — the same value the fixture's signature closes under and
   // the Rust canonical_doc_digest_v2 recomputes (over the decoded doc, the
-  // nonce, and the same rows). If the JS v2 canonicalizer or the rows fold
-  // drifts, this diverges and the gate fails.
+  // nonce, and the same rows + status). If the JS v2 canonicalizer or the
+  // rows/status fold drifts, this diverges and the gate fails. The
+  // channel_status argument is LOAD-BEARING: an omitted one folds the
+  // empty section and produces a silently-wrong digest (the undefined
+  // swallows — a contract argument must never default to a different
+  // fold), so the parity JSON's match flags below are the gate.
   const pinV2 = String(meta.wardend_doc_digest_v2_hex).toLowerCase();
   const fixtureNonce = String(env.bundle.nonce);
-  const tokenSafeV2 = (await V.docDigestV2TokenSafe(docText, fixtureNonce, env.bundle.evidence)).toLowerCase();
+  const tokenSafeV2 = (await V.docDigestV2TokenSafe(docText, fixtureNonce, env.bundle.evidence, env.bundle.channel_status)).toLowerCase();
   // The v2 fail-closed property, computed here rather than asserted
   // blind: the SAME doc under the v1 canonicalizer and under v2 must be
   // two different digests (marker + nonce inputs), which is exactly why

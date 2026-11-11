@@ -456,6 +456,7 @@ mod tests {
                     anchors: Default::default(),
                 },
             ],
+            channel_status: Vec::new(),
             keys: Some(Keys { enc: None, sign: None }),
             metadata: None,
         }
@@ -776,6 +777,7 @@ mod tests {
             nonce: B64(vec![0u8; 32]),
             node: Node { id: "n".to_string(), platform: "baremetal".to_string() },
             evidence: vec![],
+            channel_status: Vec::new(),
             keys: None,
             metadata: None,
         };

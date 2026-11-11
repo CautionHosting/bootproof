@@ -51,9 +51,13 @@ pub enum Transport {
 
 impl Transport {
     /// Collect evidence for one 64-byte challenge over whichever transport
-    /// this is. Returns the parsed `Vec<Collected>` (the framing is opaque to
-    /// the caller — both paths go through `parse_response`).
-    pub async fn collect(&self, challenge: &[u8; CHALLENGE_LEN]) -> anyhow::Result<Vec<Collected>> {
+    /// this is. Returns the parsed evidence rows PLUS the daemon's
+    /// per-channel status account (the preserve-and-mark pair, the framing
+    /// is opaque to the caller — both paths go through `parse_response`).
+    pub async fn collect(
+        &self,
+        challenge: &[u8; CHALLENGE_LEN],
+    ) -> anyhow::Result<(Vec<Collected>, Vec<crate::wire::ChannelStatus>)> {
         match self {
             Transport::Socket(sock) => request(sock, challenge).await,
             Transport::Bridge(dir) => {
@@ -214,6 +218,10 @@ async fn handle_conn(
         payload.as_slice().try_into().expect("length checked above");
 
     // Collect off the async executor: the channels read devices (blocking I/O).
+    // The collect itself never fails (preserve-and-mark): a channel fault is
+    // a status row INSIDE the result, so the daemon answers RESP_OK with the
+    // full account. RESP_ERR stays for the join failure (the executor died),
+    // never for a channel fault.
     let result = tokio::task::spawn_blocking({
         let channels = channels.clone();
         move || collect_all(&channels, &challenge)
@@ -221,11 +229,10 @@ async fn handle_conn(
     .await;
 
     let (status, payload): (u8, Vec<u8>) = match result {
-        Ok(Ok(collected)) => (
+        Ok((collected, ch_status)) => (
             RESP_OK,
-            serde_json::to_vec(&collected).unwrap_or_default(),
+            serde_json::to_vec(&(collected, ch_status)).unwrap_or_default(),
         ),
-        Ok(Err(e)) => (RESP_ERR, e.into_bytes()),
         Err(e) => (RESP_ERR, e.to_string().into_bytes()),
     };
 
@@ -242,8 +249,12 @@ async fn handle_conn(
 /// this one function and can never drift on status handling.
 ///
 /// The response bytes are opaque to the caller: only this understands the
-/// status byte (RESP_OK -> `Vec<Collected>` JSON, RESP_ERR -> error).
-pub fn parse_response(frame: &[u8]) -> anyhow::Result<Vec<Collected>> {
+/// status byte (RESP_OK -> the `(Vec<Collected>, Vec<ChannelStatus>)` pair
+/// JSON — the preserve-and-mark account travels WITH the evidence so the
+/// client can never see a silent hole — RESP_ERR -> error).
+pub fn parse_response(
+    frame: &[u8],
+) -> anyhow::Result<(Vec<Collected>, Vec<crate::wire::ChannelStatus>)> {
     // `decode` is the in-memory twin of `read_frame`: same `[tag, len, payload]`
     // shape and the same `MAX_PAYLOAD` cap.
     let (status, buf) = crate::protocol::decode(frame)
@@ -260,10 +271,13 @@ pub fn parse_response(frame: &[u8]) -> anyhow::Result<Vec<Collected>> {
 }
 
 /// Client: connect to the collect daemon, send one 64-byte challenge, and
-/// receive the collected evidence. Single attempt (a connect failure means the
-/// daemon is not up; the caller — the `attest` node — decides whether to fall
-/// back to the in-process path).
-pub async fn request(socket: &Path, challenge: &[u8; CHALLENGE_LEN]) -> anyhow::Result<Vec<Collected>> {
+/// receive the collected evidence + the daemon's channel account. Single
+/// attempt (a connect failure means the daemon is not up; the caller — the
+/// `attest` node — decides whether to fall back to the in-process path).
+pub async fn request(
+    socket: &Path,
+    challenge: &[u8; CHALLENGE_LEN],
+) -> anyhow::Result<(Vec<Collected>, Vec<crate::wire::ChannelStatus>)> {
     let mut stream = tokio::net::UnixStream::connect(socket).await?;
 
     // Request: [OP_COLLECT, 4-byte BE len, 64-byte challenge].
@@ -375,12 +389,21 @@ mod tests {
     fn collect_all_orders_snp_first_tpm2_last_with_fold() {
         let (ch, order) = channels();
         let c = challenge_from_nonce(&[7u8; 32]);
-        let out = collect_all(&ch, &c).unwrap();
+        let (out, status) = collect_all(&ch, &c);
 
         // The absent channel degraded; snp first, tpm2 last.
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].evidence.channel, "snp");
         assert_eq!(out[1].evidence.channel, "tpm2");
+
+        // Preserve-and-mark: EVERY registered channel is accounted, the
+        // absent one as a loud Absent row (never a silent hole).
+        assert_eq!(status.len(), 3, "one row per registered channel");
+        let absent = status
+            .iter()
+            .find(|s| s.channel == "aws-cp")
+            .expect("the absent channel must have a status row");
+        assert_eq!(absent.outcome, crate::wire::ChannelOutcome::Absent);
 
         // Slot-link order: snp saw no other docs; tpm2 saw [snp doc] so it can
         // fold the other channel's doc into PCR22 before quoting.
@@ -454,7 +477,7 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
 
-        let out = out.unwrap();
+        let (out, _status) = out.unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].evidence.channel, "snp");
         assert_eq!(out[1].evidence.channel, "tpm2");
@@ -519,19 +542,27 @@ mod tests {
         // The same framed bytes the UDS path produces go through the SAME
         // parse for both transports: build the exact frame the daemon writes
         // for an OK response and run the shared parse.
-        let payload = serde_json::to_vec(&[Collected {
-            evidence: Evidence {
+        let payload = serde_json::to_vec(&(
+            vec![Collected {
+                evidence: Evidence {
+                    channel: "snp".into(),
+                    doc: B64::new(b"x".to_vec()),
+                    anchors: BTreeMap::new(),
+                },
+                keys: None,
+            }],
+            vec![crate::wire::ChannelStatus {
                 channel: "snp".into(),
-                doc: B64::new(b"x".to_vec()),
-                anchors: BTreeMap::new(),
-            },
-            keys: None,
-        }])
+                outcome: crate::wire::ChannelOutcome::Collected,
+                reason: String::new(),
+            }],
+        ))
         .unwrap();
         let frame = crate::protocol::encode(RESP_OK, &payload);
-        let parsed = parse_response(&frame).unwrap();
+        let (parsed, status) = parse_response(&frame).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].evidence.channel, "snp");
+        assert_eq!(status.len(), 1, "the account rides the wire WITH the rows");
     }
 
     #[test]

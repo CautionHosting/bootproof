@@ -1210,16 +1210,50 @@ async function digestRowsSection(evidence) {
   }
   return concat.apply(null, parts);
 }
+// The status cascade (bake-11): the daemon's channel account (one row per
+// registered channel: Collected/Absent/Failed + the reason). The fold is the
+// ANTI-MITM defense on the TRANSMISSION (a transport cannot drop a Failed row
+// nor rewrite its reason without moving the digest) — never the anti-lying
+// defense (the daemon can always sign a false account; the client's
+// out-of-band required-channel set is that check). Mirror of the Rust
+// canonical_status_bytes + digest_status_section. Outcome tag 0=Collected,
+// 1=Absent, 2=Failed (the discriminant). Rows sort by (channel, canonical
+// bytes): order-invariant like the rows fold.
+function canonicalStatusBytesOf(st) {
+  const chan = new TextEncoder().encode(st.channel);
+  const tag = st.outcome === "failed" ? 2 : st.outcome === "absent" ? 1 : 0;
+  const reason = new TextEncoder().encode(st.reason || "");
+  return concat(pushBytes(chan), new Uint8Array([tag]), pushBytes(reason));
+}
+async function digestStatusSection(status) {
+  const rows = status || [];
+  const keyed = rows.map((st) => ({
+    ch: new TextEncoder().encode(st.channel),
+    sb: canonicalStatusBytesOf(st),
+  }));
+  keyed.sort((x, y) => {
+    const c = byteCompare(x.ch, y.ch);
+    return c !== 0 ? c : byteCompare(x.sb, y.sb);
+  });
+  const parts = [u32be(keyed.length)];
+  for (const k of keyed) {
+    const sh = new Uint8Array(await crypto.subtle.digest("SHA-256", k.sb));
+    parts.push(new Uint8Array([1]), sh);
+  }
+  return concat.apply(null, parts);
+}
 // The v2 canonical bytes: v2 marker || the 32-byte challenge || the fields
-// (including the user-data section) || the rows fold. nonce32 is the
-// bundle's nonce bytes (the challenge THIS view drew; the envelope echo and
-// bundle.nonce are already gated equal to it). evidence is the bundle's
-// full row list (the wardend row is dropped inside digestRowsSection).
-// ASYNC: the fold hashes each row with WebCrypto.
-async function canonicalDocBytesV2(doc, nonce32, evidence) {
+// (including the user-data section) || the rows fold || the status fold.
+// nonce32 is the bundle's nonce bytes (the challenge THIS view drew; the
+// envelope echo and bundle.nonce are already gated equal to it). evidence is
+// the bundle's full row list (the wardend row is dropped inside
+// digestRowsSection); status is the bundle's channel_status array (folded
+// LAST, after the rows it describes). ASYNC: both folds hash with WebCrypto.
+async function canonicalDocBytesV2(doc, nonce32, evidence, status) {
   return concat(
     new TextEncoder().encode(DOC_DIGEST_PREFIX_V2), nonce32,
-    canonicalFieldBytes(doc, true), await digestRowsSection(evidence));
+    canonicalFieldBytes(doc, true), await digestRowsSection(evidence),
+    await digestStatusSection(status));
 }
 // The hex canonical digest (SHA-256 of the canonical bytes). Exposed on the
 // test seam so the parity pin is driven by THIS mirror against the committed
@@ -1227,8 +1261,8 @@ async function canonicalDocBytesV2(doc, nonce32, evidence) {
 function canonicalDocDigestHex(doc) {
   return crypto.subtle.digest("SHA-256", canonicalDocBytes(doc)).then(bufToHex);
 }
-function canonicalDocDigestHexV2(doc, nonce32, evidence) {
-  return canonicalDocBytesV2(doc, nonce32, evidence)
+function canonicalDocDigestHexV2(doc, nonce32, evidence, status) {
+  return canonicalDocBytesV2(doc, nonce32, evidence, status)
     .then((bytes) => crypto.subtle.digest("SHA-256", bytes)).then(bufToHex);
 }
 
@@ -1269,7 +1303,7 @@ async function checkStateLog(env) {
       // (the drop/swap close). The fold reads the SAME bundle.evidence the
       // snp/tpm2 verifiers read, so a row presented to the browser is the
       // row folded into the wardend signature it is shown beside.
-      doc.__docDigestV2 = await canonicalDocBytesV2(parseDocTokens(text), doc.__docNonce32, (env.bundle || {}).evidence);
+      doc.__docDigestV2 = await canonicalDocBytesV2(parseDocTokens(text), doc.__docNonce32, (env.bundle || {}).evidence, (env.bundle || {}).channel_status);
     }
   } catch (e) {
     return finishFact("wardend_state_chain", [sub("wardend.evidence", FAILED, "the wardend evidence doc is not decodable JSON: " + e)], "");
@@ -1799,10 +1833,10 @@ try {
     // actually closes under) — the v2 twin of docDigestTokenSafe. evidence
     // is the raw bundle.evidence array (wire shape); the wardend row is
     // dropped inside the fold.
-    docDigestV2TokenSafe: function (text, nonceWire, evidence) {
+    docDigestV2TokenSafe: function (text, nonceWire, evidence, status) {
       const n = wireBytes(nonceWire);
       if (!n || n.length !== 32) return Promise.reject(new Error("v2 digest needs a 32-byte nonce"));
-      return canonicalDocDigestHexV2(parseDocTokens(text), n, evidence);
+      return canonicalDocDigestHexV2(parseDocTokens(text), n, evidence, status);
     },
   };
 } catch (e) { /* non-browser context without self: fine */ }

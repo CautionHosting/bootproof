@@ -34,6 +34,11 @@ pub trait Channel {
     fn collect(&self, nonce: &[u8; 64], other_docs: &[Vec<u8>]) -> Result<Collected, String>;
 }
 
+/// The channel-status types are WIRE types (they ride the Bundle + the
+/// collect socket), so they live in `wire`; re-exported here so the collect
+/// path and every consumer names them as `channel::ChannelStatus`.
+pub use crate::wire::{ChannelOutcome, ChannelStatus};
+
 /// What a channel produced for a challenge: its evidence plus any
 /// state-bound keys it publishes in the Bundle. Serialized (as one entry of
 /// the collect UDS payload) so the `collect` daemon and the `attest` node can
@@ -45,40 +50,55 @@ pub struct Collected {
 }
 
 /// Collect from every channel in the order the slot-link fold requires:
-/// the non-tpm2 channels first (best-effort, so an absent channel degrades
-/// rather than failing the request), then the tpm2 channel LAST with
-/// `other_docs` set to the non-tpm2 channels' raw doc bytes in channel-name
-/// order. The tpm2 channel folds those into the slot link (PCR22) before
-/// quoting, which is what binds every channel to one TPM at one moment.
+/// the non-tpm2 channels first (so their doc bytes are available for the
+/// tpm2 slot-link fold), then the tpm2 channel LAST with `other_docs` set
+/// to the non-tpm2 channels' raw doc bytes in channel-name order. The tpm2
+/// channel folds those into the slot link (PCR22) before quoting, which is
+/// what binds every channel to one TPM at one moment.
 ///
 /// `channels` is the shared registration (built once by `attest::build_channels`
 /// and used by both the `collect` daemon and the `attest` in-process fallback).
 /// Returns the collected entries in collect order (non-tpm2 channels, then
-/// tpm2). The tpm2 channel's failure is propagated: it is the mandatory core.
-///
-/// This is the SINGLE place the collect ordering + slot-link fold is defined,
-/// so the `collect` daemon and the `attest` node can never drift apart.
+/// tpm2) PLUS one status row per registered channel: the PRESERVE-AND-MARK
+/// contract (the old signature returned `Result` and the tpm2 failure
+/// propagated with `?`, which made the caller discard the WHOLE vec —
+/// a valid snp row already collected was destroyed by an unrelated tpm
+/// fault: collateral-discard, absence dressed as honest degradation).
+/// Collection NEVER destroys evidence; the VERDICT layer (verify_bundle +
+/// the browser verifier) owns mandatory semantics and decides what a
+/// missing required channel means. A tpm2 failure is still LOUD — it is a
+/// Failed status row, folded + transmitted — it is just no longer fatal to
+/// the other channels' evidence.
 pub fn collect_all(
     channels: &Arc<Vec<Box<dyn Channel + Send + Sync>>>,
     challenge: &[u8; 64],
-) -> Result<Vec<Collected>, String> {
+) -> (Vec<Collected>, Vec<ChannelStatus>) {
     let mut docs: Vec<Vec<u8>> = Vec::new();
     let mut out: Vec<Collected> = Vec::new();
+    let mut status: Vec<ChannelStatus> = Vec::new();
+    let status_row = |channel: &str, outcome: ChannelOutcome, reason: String| ChannelStatus {
+        channel: channel.to_string(),
+        outcome,
+        reason,
+    };
     for c in channels.iter() {
         if c.name() == "tpm2" {
             continue;
         }
         if !c.detect() {
             warn!(channel = c.name(), "channel inactive (hardware absent); degrading");
+            status.push(status_row(c.name(), ChannelOutcome::Absent, String::new()));
             continue;
         }
         match c.collect(challenge, &docs) {
             Ok(col) => {
                 docs.push(col.evidence.doc.0.clone());
+                status.push(status_row(c.name(), ChannelOutcome::Collected, String::new()));
                 out.push(col);
             }
             Err(e) => {
                 warn!(channel = c.name(), %e, "channel collect failed; degrading");
+                status.push(status_row(c.name(), ChannelOutcome::Failed, e));
             }
         }
     }
@@ -86,10 +106,22 @@ pub fn collect_all(
         if c.name() != "tpm2" {
             continue;
         }
-        let col = c.collect(challenge, &docs)?;
-        out.push(col);
+        // The mandatory channel: a failure is preserved-and-marked, never
+        // propagated (the `?` here used to destroy every row collected
+        // above — the collateral-discard defect). The verdict layer renders
+        // the mandatory failure; the evidence layer never destroys it.
+        match c.collect(challenge, &docs) {
+            Ok(col) => {
+                status.push(status_row(c.name(), ChannelOutcome::Collected, String::new()));
+                out.push(col);
+            }
+            Err(e) => {
+                warn!(channel = c.name(), %e, "mandatory channel collect failed");
+                status.push(status_row(c.name(), ChannelOutcome::Failed, e));
+            }
+        }
     }
-    Ok(out)
+    (out, status)
 }
 
 /// Expand the client's 32-byte nonce into the 64-byte challenge the channels

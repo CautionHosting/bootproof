@@ -153,36 +153,39 @@ impl VerifiedFacts {
 /// code path re-implementing the collect ordering or the Bundle assembly
 /// (the two-code-paths law: one collect, one assembly, every platform).
 ///
-/// An absent channel degrades (is skipped); a tpm2 failure is a real device
-/// error: the Bundle degrades to no hardware evidence (the honest NOT PROVEN
-/// boundary) and the reason is reported (never a panic, never a hang).
+/// An absent channel degrades (an Absent status row); a channel collect
+/// failure is a Failed status row WITH the daemon's reason. NEITHER
+/// destroys another channel's evidence (the preserve-and-mark law — the
+/// old `Result` + eprintln path discarded the whole vec on a tpm2 fault;
+/// the verdict layer owns mandatory semantics now, not the collector).
 pub fn collect_channels(
     nonce: &[u8; NONCE_LEN],
     channels: &std::sync::Arc<Vec<Box<dyn crate::channel::Channel + Send + Sync>>>,
-) -> Vec<crate::channel::Collected> {
+) -> (
+    Vec<crate::channel::Collected>,
+    Vec<crate::wire::ChannelStatus>,
+) {
     let challenge = crate::channel::challenge_from_nonce(nonce);
-    match crate::channel::collect_all(channels, &challenge) {
-        Ok(cols) => cols,
-        Err(e) => {
-            eprintln!("[engine] collect failed: {e}");
-            Vec::new()
-        }
-    }
+    crate::channel::collect_all(channels, &challenge)
 }
 
-/// Assemble a Bundle from already-collected hardware rows + the platform's
-/// additional evidence. PURE (no I/O, no collect): it fixes the Bundle's
-/// byte layout — the hardware rows first in collect order, the platform
-/// evidence spliced after, and the FIRST channel that publishes keys owns
-/// the Bundle keys. `produce` is exactly `collect_channels` then `assemble`,
-/// so a platform that collects-then-signs-then-assembles produces
-/// BYTE-IDENTICAL Bundle bytes to a platform that calls `produce` (the
-/// proof is `assembler_is_byte_identical_to_the_monolithic_produce`).
+/// Assemble a Bundle from already-collected hardware rows + their status
+/// rows + the platform's additional evidence. PURE (no I/O, no collect):
+/// it fixes the Bundle's byte layout — the hardware rows first in collect
+/// order, the platform evidence spliced after, the FIRST channel that
+/// publishes keys owns the Bundle keys, and the channel-status account
+/// rides verbatim (collect order on the wire; the v2 FOLD sorts, the wire
+/// does not — the client sees the daemon's order, the digest is
+/// order-independent). `produce` is exactly `collect_channels` then
+/// `assemble`, so a platform that collects-then-signs-then-assembles
+/// produces BYTE-IDENTICAL Bundle bytes to a platform that calls `produce`
+/// (the proof is `assembler_paths_are_byte_equivalent`).
 pub fn assemble(
     nonce: &[u8; NONCE_LEN],
     node_id: &str,
     platform: &str,
     collected: Vec<crate::channel::Collected>,
+    status: Vec<crate::wire::ChannelStatus>,
     extra_evidence: Vec<crate::wire::Evidence>,
 ) -> Bundle {
     let mut evidence = Vec::new();
@@ -200,6 +203,7 @@ pub fn assemble(
             platform: platform.to_string(),
         },
         evidence,
+        channel_status: status,
         keys,
         metadata: None,
     }
@@ -212,8 +216,8 @@ pub fn produce(
     channels: &std::sync::Arc<Vec<Box<dyn crate::channel::Channel + Send + Sync>>>,
     extra_evidence: Vec<crate::wire::Evidence>,
 ) -> Bundle {
-    let collected = collect_channels(nonce, channels);
-    assemble(nonce, node_id, platform, collected, extra_evidence)
+    let (collected, status) = collect_channels(nonce, channels);
+    assemble(nonce, node_id, platform, collected, status, extra_evidence)
 }
 
 /// Verify a bundle offline: run the matching verifier for each evidence
@@ -274,6 +278,44 @@ pub fn verify_bundle(
                 errors.push(format!("no verifier for channel {}", ev.channel));
             }
         }
+    }
+
+    // The daemon's own collection account (preserve-and-mark): every
+    // non-Collected status row renders as a LOUD fact, so a degraded or
+    // destroyed channel is a VISIBLE row on the audit, never an inferred
+    // hole. Tier 2 by construction: this is the daemon ASSERTING what its
+    // open()/collect() saw (an absence has no hardware bytes to sign).
+    // Where the wardend channel is present, the v2 fold makes the account
+    // signature-covered against transport tampering (drop or rewrite);
+    // it is NEVER the trust anchor — the anchor is the required-set gap
+    // below, which catches a LYING daemon by omission. `Collected` claims
+    // self-destruct if false (the evidence row must crypto-verify), so
+    // they get no extra fact.
+    for st in &bundle.channel_status {
+        let (value, status) = match &st.outcome {
+            crate::wire::ChannelOutcome::Collected => continue,
+            crate::wire::ChannelOutcome::Absent => (
+                "daemon report: hardware absent at collect".to_string(),
+                crate::wire::Status::Degraded,
+            ),
+            crate::wire::ChannelOutcome::Failed => (
+                format!(
+                    "daemon report: collect failed: {}",
+                    if st.reason.is_empty() {
+                        "(no reason given)"
+                    } else {
+                        &st.reason
+                    }
+                ),
+                crate::wire::Status::Degraded,
+            ),
+        };
+        facts.push(crate::wire::Fact {
+            name: format!("channel.{}.daemon_account", st.channel),
+            value,
+            anchors: vec![st.channel.clone()],
+            status,
+        });
     }
 
     // A required channel that is ABSENT from the bundle is an honest NOT
@@ -502,18 +544,29 @@ mod tests {
         )
     }
 
-    /// The byte-equality proof for the assembler factoring. `produce` is now
-    /// `collect_channels` then `assemble`; a platform (wardend `attest`) that
-    /// must sign its own channel OVER the hardware rows cannot call `produce`
-    /// (the rows it signs are produced inside `produce`), so it collects,
-    /// signs, and assembles. That path MUST yield byte-identical Bundle bytes,
-    /// or the platform's signature would be over a different bundle than the
-    /// one it ships (the rows-fold contract broken). This is the differential
-    /// witness for that property across: hardware rows present + keys-published
-    /// + channel degradation (an absent channel skipped) + extra platform
-    /// evidence spliced after the hardware rows.
+    /// PATH EQUIVALENCE (the permanent contract): the two produce paths —
+    /// `produce` (collect then assemble) and a sign-over-rows platform's
+    /// collect -> sign -> assemble — MUST yield byte-identical Bundle
+    /// bytes, forever. A platform (wardend `attest`) cannot call `produce`
+    /// (the rows it signs are produced inside it), so it splits the same
+    /// two calls around its signature; if the paths' bytes ever differ,
+    /// the platform signs a different bundle than it ships (the rows-fold
+    /// contract broken). Witnessed across: hardware rows present +
+    /// keys-published + channel degradation (now an Absent status ROW, not
+    /// a skip) + extra platform evidence spliced after the hardware rows.
+    ///
+    /// (Two contracts used to share this test's name — the chipmunk
+    /// ruling separates them. The OTHER one, REFACTOR NEUTRALITY ("the
+    /// factored produce == the pre-refactor produce's exact bytes"), was
+    /// satisfied at the factoring landing (pinned then: 3a9e8c47), was
+    /// legitimately RETIRED by the status cascade (channel_status
+    /// intentionally moves the assembled bytes — the degraded channel now
+    /// serializes its Absent row), and lives only as this footnote. Do NOT
+    /// re-pin back toward the old digest to "fix a freeze": the frozen
+    /// contract here is path-vs-path, not history-vs-now. The historical
+    /// freezes that DO bind: v1 1a6c06ff, untouched by every v2 section.)
     #[test]
-    fn assembler_is_byte_identical_to_the_monolithic_produce() {
+    fn assembler_paths_are_byte_equivalent() {
         let nonce = [0x42u8; 32];
         // Non-tpm2 present-and-publishes-keys, a degraded (absent) channel,
         // and the tpm2 channel (last in collect order, folds the others).
@@ -535,12 +588,13 @@ mod tests {
         // assemble. (The real attest() signs over `collected` between these
         // two calls; the signature does not change the Bundle ASSEMBLY, so
         // byte-equality of the assembly is exactly the property to prove.)
-        let collected = collect_channels(&nonce, &channels);
+        let (collected, status) = collect_channels(&nonce, &channels);
         let b = assemble(
             &nonce,
             "node-1",
             "aws-snp",
             collected,
+            status,
             extra.clone(),
         );
 
@@ -567,9 +621,17 @@ mod tests {
         let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "3a9e8c47d5deabc9b2063282a6a334b8e4d4c07e101f808be291f552d459dd66",
+            "416c88a378114a2001ce3fb942620c97a8018d26191aacc341f972550ae1ee12",
             "the assembled bundle bytes digest moved: the assembly layout is a frozen contract, re-pin ONLY with the golden fixtures in the same commit"
         );
+        // (Supersession edge: 3a9e8c47...459dd66 -> 416c88a3...0ae1ee12 at
+        // the status-cascade landing — the degraded aws-cp channel now
+        // serializes its Absent status row into the bundle bytes, which is
+        // exactly the preserve-and-mark contract: the degradation is
+        // data, not silence.)
+        assert_eq!(b.channel_status.len(), 3, "every registered channel accounted");
+        assert!(b.channel_status.iter().any(|s| s.channel == "aws-cp"
+            && s.outcome == crate::wire::ChannelOutcome::Absent));
 
         // The layout invariants, spelled out so a reviewer sees WHAT was
         // proven identical: hardware rows first (in collect order, degraded
@@ -600,6 +662,7 @@ mod tests {
                 platform: "baremetal".into(),
             },
             evidence,
+            channel_status: Vec::new(),
             keys: None,
             metadata: None,
         }
@@ -706,6 +769,7 @@ mod tests {
                 platform: "baremetal".into(),
             },
             evidence: Vec::new(),
+            channel_status: Vec::new(),
             keys: None,
             metadata: None,
         };
