@@ -144,42 +144,54 @@ impl VerifiedFacts {
 /// hardware channels and spliced into the Bundle. The platform produces
 /// these in-process (they are not hardware channels; they are the
 /// platform's own signed facts).
-pub fn produce(
+/// Collect the hardware channels for a nonce: the in-process snp + tpm2,
+/// in the slot-link order (non-tpm2 first, tpm2 last with the other docs
+/// folded). This is the collect HALF of `produce`, factored out so a
+/// platform that must SIGN its own channel OVER the hardware rows (the
+/// wardend doc-sig folds the snp/tpm2 rows into its v2 digest) can collect
+/// ONCE, sign over the returned rows, then `assemble` — WITHOUT a second
+/// code path re-implementing the collect ordering or the Bundle assembly
+/// (the two-code-paths law: one collect, one assembly, every platform).
+///
+/// An absent channel degrades (is skipped); a tpm2 failure is a real device
+/// error: the Bundle degrades to no hardware evidence (the honest NOT PROVEN
+/// boundary) and the reason is reported (never a panic, never a hang).
+pub fn collect_channels(
+    nonce: &[u8; NONCE_LEN],
+    channels: &std::sync::Arc<Vec<Box<dyn crate::channel::Channel + Send + Sync>>>,
+) -> Vec<crate::channel::Collected> {
+    let challenge = crate::channel::challenge_from_nonce(nonce);
+    match crate::channel::collect_all(channels, &challenge) {
+        Ok(cols) => cols,
+        Err(e) => {
+            eprintln!("[engine] collect failed: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// Assemble a Bundle from already-collected hardware rows + the platform's
+/// additional evidence. PURE (no I/O, no collect): it fixes the Bundle's
+/// byte layout — the hardware rows first in collect order, the platform
+/// evidence spliced after, and the FIRST channel that publishes keys owns
+/// the Bundle keys. `produce` is exactly `collect_channels` then `assemble`,
+/// so a platform that collects-then-signs-then-assembles produces
+/// BYTE-IDENTICAL Bundle bytes to a platform that calls `produce` (the
+/// proof is `assembler_is_byte_identical_to_the_monolithic_produce`).
+pub fn assemble(
     nonce: &[u8; NONCE_LEN],
     node_id: &str,
     platform: &str,
-    channels: &std::sync::Arc<Vec<Box<dyn crate::channel::Channel + Send + Sync>>>,
+    collected: Vec<crate::channel::Collected>,
     extra_evidence: Vec<crate::wire::Evidence>,
 ) -> Bundle {
-    let challenge = crate::channel::challenge_from_nonce(nonce);
     let mut evidence = Vec::new();
     let mut keys = None;
-
-    // The hardware channels (the in-process snp + tpm2), in the slot-link
-    // order (non-tpm2 first, tpm2 last with the other docs folded). An
-    // absent channel degrades (is skipped); a tpm2 failure is propagated
-    // (it is the mandatory core) — but for a point-in-time snapshot the
-    // platform may pass an empty channel set, in which case the Bundle
-    // carries no hardware evidence (the honest NOT PROVEN boundary).
-    match crate::channel::collect_all(channels, &challenge) {
-        Ok(cols) => {
-            for col in cols {
-                keys = keys.or(col.keys);
-                evidence.push(col.evidence);
-            }
-        }
-        Err(e) => {
-            // A tpm2 failure is a real device error: the Bundle degrades to
-            // no hardware evidence (the honest NOT PROVEN boundary), and the
-            // reason is reported (never a panic, never a hang).
-            eprintln!("[engine] collect failed: {e}");
-        }
+    for col in collected {
+        keys = keys.or(col.keys);
+        evidence.push(col.evidence);
     }
-
-    // The platform's additional evidence channels (the wardend / stagex
-    // facts) — spliced after the hardware channels.
     evidence.extend(extra_evidence);
-
     Bundle {
         v: crate::wire::BUNDLE_V,
         nonce: crate::wire::B64::new(nonce.to_vec()),
@@ -191,6 +203,17 @@ pub fn produce(
         keys,
         metadata: None,
     }
+}
+
+pub fn produce(
+    nonce: &[u8; NONCE_LEN],
+    node_id: &str,
+    platform: &str,
+    channels: &std::sync::Arc<Vec<Box<dyn crate::channel::Channel + Send + Sync>>>,
+    extra_evidence: Vec<crate::wire::Evidence>,
+) -> Bundle {
+    let collected = collect_channels(nonce, channels);
+    assemble(nonce, node_id, platform, collected, extra_evidence)
 }
 
 /// Verify a bundle offline: run the matching verifier for each evidence
@@ -401,6 +424,163 @@ mod tests {
                 status: Status::NotProven,
             })
         }
+    }
+
+    /// A DETERMINISTIC mock hardware channel: it returns a fixed evidence
+    /// doc derived from the challenge (so the same nonce yields byte-identical
+    /// output on every call), and either publishes keys or not. This is the
+    /// stand-in that lets the assembler byte-equality test be a real witness
+    /// rather than a tautology: `produce` calls `collect_all` (which drives
+    /// this channel) once; the split path calls the SAME `collect_all` once;
+    /// if the two produce byte-identical Bundles, the collect+assemble
+    /// decomposition — the exact shape `attest()` uses to sign-over-rows —
+    /// is proven byte-neutral against the monolithic `produce`.
+    struct MockHwChannel {
+        name: &'static str,
+        present: bool,
+        publish_keys: bool,
+    }
+
+    impl crate::channel::Channel for MockHwChannel {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn detect(&self) -> bool {
+            self.present
+        }
+        fn collect(
+            &self,
+            nonce: &[u8; 64],
+            other_docs: &[Vec<u8>],
+        ) -> Result<crate::channel::Collected, String> {
+            // A fixed doc: the challenge front-32 XOR a per-name salt, plus
+            // the count of other_docs (so the tpm2 slot-link fold is visible
+            // in the bytes). Deterministic: same inputs -> same output.
+            let mut doc = nonce[..32].to_vec();
+            for (i, b) in doc.iter_mut().enumerate() {
+                *b ^= self.name.as_bytes()[i % self.name.len()];
+            }
+            doc.push(other_docs.len() as u8);
+            let keys = if self.publish_keys {
+                Some(crate::wire::Keys {
+                    enc: None,
+                    sign: Some(crate::wire::KeyInfo {
+                        pub_: B64::new(vec![self.name.as_bytes()[0]; 4]),
+                        curve: "P-256".to_string(),
+                        scheme: "ecdsa-sha256".to_string(),
+                        pcr_policy: vec![4, 5, 7, 9],
+                        cert_by_ek: None,
+                    }),
+                })
+            } else {
+                None
+            };
+            Ok(crate::channel::Collected {
+                evidence: Evidence {
+                    channel: self.name.to_string(),
+                    doc: B64::new(doc),
+                    anchors: BTreeMap::new(),
+                },
+                keys,
+            })
+        }
+    }
+
+    fn mock_channels(spec: &[(&'static str, bool, bool)]) -> std::sync::Arc<
+        Vec<Box<dyn crate::channel::Channel + Send + Sync>>,
+    > {
+        std::sync::Arc::new(
+            spec.iter()
+                .map(|(n, present, keys)| {
+                    Box::new(MockHwChannel {
+                        name: n,
+                        present: *present,
+                        publish_keys: *keys,
+                    }) as Box<dyn crate::channel::Channel + Send + Sync>
+                })
+                .collect(),
+        )
+    }
+
+    /// The byte-equality proof for the assembler factoring. `produce` is now
+    /// `collect_channels` then `assemble`; a platform (wardend `attest`) that
+    /// must sign its own channel OVER the hardware rows cannot call `produce`
+    /// (the rows it signs are produced inside `produce`), so it collects,
+    /// signs, and assembles. That path MUST yield byte-identical Bundle bytes,
+    /// or the platform's signature would be over a different bundle than the
+    /// one it ships (the rows-fold contract broken). This is the differential
+    /// witness for that property across: hardware rows present + keys-published
+    /// + channel degradation (an absent channel skipped) + extra platform
+    /// evidence spliced after the hardware rows.
+    #[test]
+    fn assembler_is_byte_identical_to_the_monolithic_produce() {
+        let nonce = [0x42u8; 32];
+        // Non-tpm2 present-and-publishes-keys, a degraded (absent) channel,
+        // and the tpm2 channel (last in collect order, folds the others).
+        let channels = mock_channels(&[
+            ("snp", true, true),
+            ("aws-cp", false, false),
+            ("tpm2", true, true),
+        ]);
+        let extra = vec![Evidence {
+            channel: "wardend".to_string(),
+            doc: B64::new(b"the wardend doc".to_vec()),
+            anchors: BTreeMap::new(),
+        }];
+
+        // Path A: the monolithic produce (what a platform with no sign-over-
+        // rows need calls today).
+        let a = produce(&nonce, "node-1", "aws-snp", &channels, extra.clone());
+        // Path B: the split a sign-over-rows platform uses: collect, then
+        // assemble. (The real attest() signs over `collected` between these
+        // two calls; the signature does not change the Bundle ASSEMBLY, so
+        // byte-equality of the assembly is exactly the property to prove.)
+        let collected = collect_channels(&nonce, &channels);
+        let b = assemble(
+            &nonce,
+            "node-1",
+            "aws-snp",
+            collected,
+            extra.clone(),
+        );
+
+        // Byte-identical serialized bytes (the bundle's wire form), not just
+        // structural equality: the rows-fold digest is over these exact bytes.
+        let a_bytes = serde_json::to_vec(&a).expect("a serializes");
+        let b_bytes = serde_json::to_vec(&b).expect("b serializes");
+        assert_eq!(a_bytes, b_bytes, "produce() and collect+assemble() are byte-identical");
+
+        // And the SHA-256 of the identical bytes is PINNED, so a future edit
+        // that perturbs the assembly layout (row order, keys-or, the extra
+        // splice point, field order) flips this digest and fails LOUDLY even
+        // if both paths stay mutually consistent. This pins the assembler's
+        // byte contract: produce() bytes == collect+assemble() bytes == this
+        // digest. A legitimate contract change re-measures this value by hand
+        // (a coordinated protocol change that re-pins the golden fixtures in
+        // the same commit).
+        let digest: [u8; 32] = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(&a_bytes);
+            h.finalize().into()
+        };
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "3a9e8c47d5deabc9b2063282a6a334b8e4d4c07e101f808be291f552d459dd66",
+            "the assembled bundle bytes digest moved: the assembly layout is a frozen contract, re-pin ONLY with the golden fixtures in the same commit"
+        );
+
+        // The layout invariants, spelled out so a reviewer sees WHAT was
+        // proven identical: hardware rows first (in collect order, degraded
+        // channel skipped), the platform evidence last, keys from the FIRST
+        // publisher.
+        assert_eq!(b.evidence.len(), 3, "snp + tpm2 + wardend (aws-cp degraded)");
+        assert_eq!(b.evidence[0].channel, "snp");
+        assert_eq!(b.evidence[1].channel, "tpm2");
+        assert_eq!(b.evidence[2].channel, "wardend");
+        assert!(b.keys.is_some(), "the first publisher (snp) owns the keys");
+        assert_eq!(b.keys.as_ref().unwrap().sign.as_ref().unwrap().curve, "P-256");
     }
 
     fn mock_bundle(nonce: &[u8; 32], channels: &[&str]) -> Bundle {
