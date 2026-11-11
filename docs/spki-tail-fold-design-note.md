@@ -48,6 +48,30 @@ alters the tail breaks all three.
 
 ## 3. The three-state render (G5) — verifier-side, both verifiers, in lock-step
 
+> **AMENDED 2026-11-11 (the fold adjudication, chipmunk CLOSED).** The
+> table below is the ORIGINAL design and is SUPERSEDED. The amended
+> classify law: tail content NEVER FAILS — FAILED belongs to the
+> signature, never to the content. The three states: all-zero ⇒
+> NotEnabled (honest pre-fold); non-zero + named-candidate match ⇒
+> Matched; non-zero + no match ⇒ Unattributed (NOT PROVEN with the
+> auditor-law reason NAMING the measured tail hex and the candidates
+> tried — honest, never a lie). A mis-folded tail is most often a bug or
+> a stale key, not an attacker, and a FAILED on content would train
+> operators to ignore red. Also superseded below: the `expected ==
+> identity.pin` framing — the SPKI pin is an ENVELOPE value (the TLS
+> leaf's identity), NOT a bundle value, so at core scope the candidate
+> set is EMPTY BY LAW and only NotEnabled/Unattributed are reachable.
+> The Matched arm lives where a real candidate exists: the browser
+> (publishedPin, but always NOT PROVEN until #19 — browser equality is
+> theater without the out-of-band manifest) and wardenctl
+> (`verify_bundle_pinned`: the operator's `WARDENCTL_SEALD_PUB` pin + the
+> bundle's hsm anchor, both derived through the fold law
+> `SHA-256(SPKI-DER(point))` — the same `spki_der_from_point` the
+> producer folds with). Implementations: bootproof `verify/snp.rs`
+> `facts()` (commit 3a08e602), `verify.js` + `bootproof.js`
+> `snpIdentityTailSub` (7b6cc530), wardend `wardenctl::verify_bundle_pinned`
+> (wardend 3bd3ab60).
+
 Given `expected = identity.pin` (32 bytes, already carried in the envelope
 identity section):
 
@@ -75,7 +99,9 @@ hardware-anchored, and it attests the report bytes, not the bundle's key
 fields. The tail fold moves the identity claim from tier 2 (daemon-asserted)
 to tier 1: the VLEK signature covers `rd[32..64]`, so the report itself
 names the key. Interposer with someone else's genuine bundle: tail mismatch
-⇒ loud FAILED. Stale pre-fold bundle: zero tail ⇒ NOT PROVEN, G4 below.
+⇒ loud FAILED [SUPERSEDED 2026-11-11: ⇒ Unattributed, NOT PROVEN with the
+auditor-law reason — see the §3 amendment]. Stale pre-fold bundle: zero
+tail ⇒ NOT PROVEN, G4 below.
 
 ## 5. The pre-fold world (G4) — the one real design tension
 
@@ -85,7 +111,9 @@ tier 1. Options considered:
 - **Grace (NOT PROVEN):** pre-fold bundles verify but the identity row is
   explicitly unproven. Honest, but leaves a world where the strongest
   identity claim quietly never appears.
-- **Hard-cut (FAILED):** every pre-fold bundle goes red on deploy day,
+- **Hard-cut (FAILED):** [REJECTED by the 2026-11-11 amendment — tail
+  content never FAILS; the shipped law is the third option: honest
+  Unattributed] every pre-fold bundle goes red on deploy day,
   including the frozen goldens and every live node until re-imaged.
 
 RULING-NEEDED: NOT PROVEN + the deployment sequence below makes the grace
@@ -111,7 +139,9 @@ browser already knows comes from the ACME leaf — and `keys.rs` proves
 the identity section ALREADY carries (`attest_signer_spki_sha256`): the
 fold closes the loop between the hardware report and the published pin.
 If the boot signer ever differs from the serving key, the fold makes it
-visible (tail ≠ identity.pin ⇒ FAILED) rather than assumed away.
+visible (tail ≠ identity.pin ⇒ FAILED) [SUPERSEDED 2026-11-11: visible as
+Unattributed with the measured hex named — see the §3 amendment] rather
+than assumed away.
 
 ## 8. The latch fold (item 2), design shape
 
