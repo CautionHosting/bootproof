@@ -59,7 +59,10 @@ pub const BOOTPROOF_HTML: &str = include_str!("../assets/dist/bootproof.html");
 /// is an honest NOT PROVEN, never a dead page (AGENTS.md). Byte-for-byte parity
 /// with the service-worker trunc guard; both surfaces gated by
 /// fixtures/system_health/trunc_contract.js).
-/// Predecessor: 637503ad (T-E facts tier + honest footer: mapStatus maps
+/// On-chain value: 4210f8a6 (the title pivot: page <title> renamed 'System
+/// Health' -> 'Bootproof Verifier' in single_file + shell sources per operator
+/// 02:44Z; h1 and all other bytes identical to 2db3ce4b). Predecessor chain:
+/// 2db3ce4b (the conformance tree + ARCHITECTURE.md R2 proposal), 637503ad (T-E facts tier + honest footer: mapStatus maps
 /// the server's "proven" to SERVER-ASSERTED — env.facts is unsigned display,
 /// the last tier-blind green after T-B — fact rows gain r-/v-/w- witness ids,
 /// and the footer claim narrows to the browser-verified proofs with the
@@ -70,7 +73,7 @@ pub const BOOTPROOF_HTML: &str = include_str!("../assets/dist/bootproof.html");
 /// Before that: 4760aa18 (the pending-first pivot: operator-named sources, the
 /// static pending tables, the flip engine, the fleet_domains row; the artifact
 /// moved to assets/dist/), then a3ba3240 (the first canonical bootproof.html).
-pub const BOOTPROOF_SHA256: &str = "88630e3bcfb33cabc7195e478d4796c59c8017c91d317c28a3bfd082621a2907";
+pub const BOOTPROOF_SHA256: &str = "4210f8a6843a8fa59b54b8ce52b0c40f9af24c8f9fe63c5b2380d4b42ac52fd6";
 
 #[cfg(test)]
 mod tests {
