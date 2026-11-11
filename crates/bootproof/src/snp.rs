@@ -79,9 +79,18 @@ pub fn report_data_for_nonce(nonce: &[u8; 32]) -> [u8; 64] {
 
 /// The nonce-binding check a verified snp report MUST satisfy: the 32-byte
 /// challenge nonce is echoed verbatim in the first 32 bytes of the 64-byte
-/// report_data (the back 32 bytes are firmware-chosen but integrity-covered
-/// by the VLEK signature over the signed prefix), and the nonce is not
-/// all-zero (an all-zero nonce would make the binding forgeable).
+/// report_data, and the nonce is not all-zero (an all-zero nonce would make
+/// the binding forgeable). The back 32 bytes are GUEST-COMPOSED, not
+/// firmware-chosen: the guest builds the whole 64-byte report_data (today
+/// `report_data_for_nonce` zeroes them) and the firmware copies it verbatim
+/// into the VLEK-signed report, so they are integrity-covered (a flipped
+/// byte breaks the signature) while remaining under guest control. That is
+/// what lets a truncated signer-key hash ride the tail for an in-report
+/// key-binding WITHOUT a second report; a value placed in the tail is bound
+/// to the SAME nonce and the SAME VLEK signature as the freshness nonce.
+/// (An earlier version of this comment claimed the tail was
+/// "firmware-chosen" — false, and it argued against our own interest: it
+/// would have told a reader the tail was unavailable for binding.)
 pub fn nonce_binding_ok(report_data: &[u8; 64], nonce: &[u8; 32]) -> bool {
     report_data[..32] == nonce[..] && nonce.iter().any(|&b| b != 0)
 }
