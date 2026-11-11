@@ -15,7 +15,7 @@
 // FAILED.
 use bootproof::engine::{verify_bundle, VerifierRegistry, VerifyPolicy};
 use bootproof::wire::{Bundle, Status};
-use bootproof_platform_wardend::{canonical_doc_digest, WardendVerifier};
+use bootproof_platform_wardend::{canonical_doc_digest, canonical_doc_digest_v2, WardendVerifier};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -425,4 +425,149 @@ fn an_unsigned_doc_never_proven_seal_state_on_either_verifier() {
         Some("NOT PROVEN"),
         "the JS gate must fire the doc_signature sub as the honest cause: {subs:?}"
     );
+}
+
+/// D4 (digest v2 fixture parity, both directions): the fixture's doc is
+/// now SIGNED under digest v2 bound to the fixture's own frozen nonce.
+/// (1) The Rust canonical_doc_digest_v2 over the DECODED fixture doc plus
+/// bundle.nonce must equal the generator's wardend_doc_digest_v2_hex in
+/// golden.meta.json (the same two-implementation, one-vector witness the
+/// v1 pin provides). (2) The doc_signature anchor must verify under the
+/// HSM key over THAT digest: the fixture walks production's byte
+/// protocol end to end. (3) The v1 digest of the SAME doc stays pinned
+/// to the historical c957... vector: v1 is byte-blind to user_data, so
+/// the v1 canonicalization provably did not drift while v2 was added.
+#[test]
+fn the_digest_v2_parity_pin_rust_equals_js_and_the_sig_closes_under_it() {
+    let g = fixtures_dir().join("golden.json");
+    let ev = wardend_evidence(&g);
+    let doc: bootproof_platform_wardend::WardendDoc =
+        serde_json::from_slice(&ev.doc.0).expect("the wardend doc decodes");
+    // The fixture's own bundle nonce, byte-for-byte what the engine hands
+    // the verifier as the challenge.
+    let env: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&g).expect("read golden")).expect("json");
+    let nonce_b64 = env
+        .get("bundle")
+        .and_then(|b| b.get("nonce"))
+        .and_then(|n| n.as_str())
+        .expect("bundle.nonce")
+        .to_string();
+    let nonce = base64_decode(&nonce_b64);
+    assert_eq!(nonce.len(), 32, "the fixture nonce must be 32 bytes");
+
+    let d2 = canonical_doc_digest_v2(&doc, nonce.as_slice().try_into().expect("32-byte nonce"));
+    let hex2: String = d2.iter().map(|b| format!("{b:02x}")).collect();
+    let meta: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(fixtures_dir().join("golden.meta.json")).expect("read meta"),
+    )
+    .expect("meta JSON");
+    let js_hex2 = meta
+        .get("wardend_doc_digest_v2_hex")
+        .and_then(|v| v.as_str())
+        .expect("golden.meta.json carries wardend_doc_digest_v2_hex (gen_golden.js D4)");
+    assert_eq!(
+        hex2, js_hex2,
+        "digest v2 parity FAILED: Rust canonical_doc_digest_v2 \"{hex2}\" drifted from the \
+         JS generator \"{js_hex2}\" (same doc bytes, same nonce, two canonicalizations)"
+    );
+    // Cross-version discrimination: v2 of this doc is NOT the historical
+    // v1 vector (marker + nonce + user_data inputs), the property the
+    // fail-closed v1<->v2 rejection rests on.
+    let d1 = canonical_doc_digest(&doc);
+    let hex1: String = d1.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(
+        hex1, "c957cec67aebdcd839b66d7a58d462c4513e85a23596d8564f689338651aa62d",
+        "the RETIRED v1 digest of the fixture doc changed: v1 canonicalization must stay \
+         byte-blind to user_data, so the historical vector is regression evidence"
+    );
+    assert_ne!(hex1, hex2, "v1 and v2 digests of the same doc must differ");
+}
+
+/// D4 (fail-closed v1 rejection, both verifiers): golden.v1-signed.json
+/// carries the golden's doc with an honest signature under RETIRED digest
+/// v1 (bound to no nonce). The channel must reject it fail-closed with
+/// the replay named as the cause, NEVER silently accept it, and never
+/// mislabel it as a broken chain.
+#[test]
+fn a_v1_signed_doc_is_rejected_and_named_replayable_on_both_verifiers() {
+    let g = fixtures_dir().join("golden.v1-signed.json");
+    // Rust: fails the doc-signature leg; the failed-fact is NOT PROVEN;
+    // nothing derived from the doc is PROVEN.
+    let (rust, errors) = rust_wardend_facts(&g);
+    assert!(
+        errors.iter().any(|e| e.contains("doc signature")),
+        "the v1-signed doc must fail the doc-signature leg: {errors:?}"
+    );
+    assert_eq!(
+        rust.get("wardend").map(String::as_str),
+        Some("NOT PROVEN"),
+        "the failed-fact is the honest NOT PROVEN: {rust:?}"
+    );
+    assert_ne!(
+        rust.get("wardend_state_chain").map(String::as_str),
+        Some("PROVEN"),
+        "a v1-signed doc must never PROVEN the state chain: {rust:?}"
+    );
+    // The user-data fact must not be PROVEN either: v1 never digested
+    // the section, so its commitment is not under this signature.
+    assert_ne!(
+        rust.get("wardend_user_data").map(String::as_str),
+        Some("PROVEN"),
+        "a v1-signed doc must never PROVEN attested user data: {rust:?}"
+    );
+    // JS: FAILED, and the reason names the retired contract (not a
+    // tamper, not an absence).
+    let subs = js_subs(&g);
+    assert_eq!(
+        subs.get("wardend.doc_signature").map(String::as_str),
+        Some("FAILED"),
+        "a v1-only signature is a REJECTED signature (FAILED), never NOT PROVEN: {subs:?}"
+    );
+    let js = js_facts(&g);
+    let why = js
+        .get("wardend_state_chain")
+        .and_then(|_| find_why(&g, "wardend_state_chain"))
+        .unwrap_or_default();
+    assert!(
+        why.contains("RETIRED digest v1"),
+        "the JS rejection must NAME the retired-contract replay cause: {why:?}"
+    );
+}
+
+/// The why-string of a fact, from the harness output.
+fn find_why(fixture: &Path, name: &str) -> Option<String> {
+    let out = Command::new("node")
+        .arg(fixtures_dir().join("harness.js"))
+        .arg(fixture)
+        .output()
+        .expect("node runs the harness");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("harness JSON");
+    for f in v.get("facts").and_then(|a| a.as_array())? {
+        if f.get("name").and_then(|n| n.as_str())? == name {
+            return f.get("why").and_then(|w| w.as_str()).map(String::from);
+        }
+    }
+    None
+}
+
+/// Minimal base64 (the fixtures' own alphabet; no dependency needed).
+fn base64_decode(s: &str) -> Vec<u8> {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut bits = 0u32;
+    let mut acc = 0u64;
+    let mut out = Vec::new();
+    for c in s.bytes() {
+        if c == b'=' {
+            break;
+        }
+        let v = T.iter().position(|&x| x == c).expect("base64 char") as u64;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    out
 }

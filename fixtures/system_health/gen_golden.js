@@ -324,6 +324,13 @@ const AK = keyFromScalar('314159265358979323846264338327950288419716939937510582
 const SIGN = keyFromScalar('2718281828459045235360287471352662497757247093699959574966967627');
 const HSM = keyFromScalar('1414213562373095048801688729037262730136678747355356627749234488');
 
+// D3: the fixture's user-data plaintext and its commitment. The plaintext
+// is byte-identical to metadata.user_data below: the fixture demonstrates
+// the digest_v2 upgrade itself, the SAME string moving from unsigned
+// display to a SHA-256 commitment under the HSM signature.
+const UDATA_TEXT = 'bootproof golden fixture user-data (no wardend-commit line)';
+const UDATA_SHA = sha256(Buffer.from(UDATA_TEXT, 'utf8'));
+
 // ---------------------------------------------------------------------------
 // The frozen nonce: the live report's own binding (firmware-signed). All
 // premises on the live bytes are asserted up front (fail loud at build).
@@ -383,13 +390,22 @@ for (const i of PCR_INDICES) pcrValues[i] = sha256(Buffer.from('bootproof golden
 // integers; bools as single bytes.
 // ---------------------------------------------------------------------------
 const DOC_DIGEST_PREFIX = Buffer.from('wardend/platform-doc-digest/v1');
+// D4 (digest v2): the v2 domain marker, the frozen NONCE as a binding
+// input, and the D3 user-data section appended to the field walk. v1 is
+// byte-BLIND to the user_data field (never even a presence tag), so the
+// historical v1 digest of the fixture doc is UNCHANGED by the field's
+// addition: the c957... pin below stays exactly where it was, and it is
+// the witness that v1 canonicalization did not drift.
+const DOC_DIGEST_PREFIX_V2 = Buffer.from('wardend/platform-doc-digest/v2');
 const dBytes = (b) => Buffer.concat([u32(b.length), Buffer.from(b)]);
 const dU64 = (v) => u64(v);
 const dBool = (b) => Buffer.from([b ? 1 : 0]);
 const dOpt = (v, f) => (v === undefined || v === null ? Buffer.from([0]) : Buffer.concat([Buffer.from([1]), f(v)]));
 const dU32s = (arr) => Buffer.concat([u32(arr.length), ...arr.map((x) => u32(x))])
-const canonicalDocDigest = (doc) => sha256(Buffer.concat([
-  DOC_DIGEST_PREFIX,
+// The field walk BOTH digest versions share (the Rust digest_fields
+// mirror; single implementation, so a drift in one cannot hide from the
+// other). withUserData selects v2's trailing presence-tagged section.
+const canonicalFieldBytes = (doc, withUserData) => Buffer.concat([
   dOpt(doc.seal_state, (s) => Buffer.concat([
     Buffer.from([s.posture === 'sealed' ? 1 : 0]),
     dBytes(s.state),
@@ -444,7 +460,23 @@ const canonicalDocDigest = (doc) => sha256(Buffer.concat([
     ])),
   ]),
   dOpt(doc.retry, (r) => Buffer.concat([dU64(r.warden_respawn), dU64(r.watchdog_reboot_guard)])),
-]));
+  // D3: the user-data section LAST, in v2's byte stream ONLY. The
+  // commitment hash is 32 RAW bytes (no length prefix); the plaintext
+  // rides its OWN presence tag as len-prefixed bytes, so a
+  // commitment-only doc and a plaintext doc never share a digest and
+  // None != Some(empty). Absent section = the 0x00 tag alone.
+  withUserData ? dOpt(doc.user_data, (u) => Buffer.concat([
+    Buffer.from(u.sha256),
+    dOpt(u.text, (t) => dBytes(Buffer.from(t, 'utf8'))),
+  ])) : Buffer.alloc(0),
+]);
+const canonicalDocDigest = (doc) => sha256(Buffer.concat([DOC_DIGEST_PREFIX, canonicalFieldBytes(doc, false)]));
+// D4: digest v2 = the v2 marker || the 32-byte challenge the response
+// answers || the fields INCLUDING the user-data section. THIS is what
+// the fixture's HSM signs now (one signature over the challenge the
+// client drew: the A7 replay closure), and what both verifiers
+// recompute with the bundle's nonce.
+const canonicalDocDigestV2 = (doc, nonce32) => sha256(Buffer.concat([DOC_DIGEST_PREFIX_V2, Buffer.from(nonce32), canonicalFieldBytes(doc, true)]));
 
 // The doc's JSON: the serde shape. A BigInt handle must serialize as a
 // BARE NUMBER TOKEN (serde_json writes u64 as a bare integer; a quoted
@@ -476,6 +508,13 @@ const wardendDocObj = {
   // ONLY the token-safe canonicalization reproduces.
   key_acls: [{ handle: 1653858798848288593n, operations: ['sign', 'unseal'], pcr_policy: [22] }],
   retry: { warden_respawn: 2, watchdog_reboot_guard: 0 },
+  // D3: the signed user-data section. The plaintext here deliberately
+  // EQUALS metadata.user_data: the fixture witnesses the real upgrade
+  // path the ledger's I-2b gap describes: the same string that metadata
+  // merely DISPLAYS (SERVER-ASSERTED) becomes byte-ATTESTED, because the
+  // HSM signature now covers its SHA-256 commitment. The metadata row
+  // keeps its server-asserted tier law untouched.
+  user_data: { sha256: u8arr(UDATA_SHA), text: UDATA_TEXT },
 };
 // The canonical wardend doc bytes: what BOTH verifiers decode, what the
 // fold measures, what a byte-level tamper must break.
@@ -486,7 +525,16 @@ const WARDEND_DOC = jSerde(wardendDocObj);
 // the evidence ANCHORS map, so the doc bytes below are byte-pure under
 // the digest and the PCR22 fold input is untouched by construction).
 // The RFC6979 nonce keeps the fixture byte-stable across regenerations.
-const WARDEND_DOC_DIGEST = canonicalDocDigest(wardendDocObj);
+//
+// D4: the fixture's doc is signed under digest v2, bound to the FROZEN
+// nonce (the live report's own binding, which every gate already checks
+// bundle.nonce against): the fixture speaks production's byte protocol.
+// The v1 digest of the SAME doc is computed and pinned right beside it:
+// v1 is byte-blind to user_data, so the historical c957... vector is
+// unchanged and stays as regression evidence that v1 canonicalization
+// did not drift while v2 was added.
+const WARDEND_DOC_DIGEST_V1 = canonicalDocDigest(wardendDocObj);
+const WARDEND_DOC_DIGEST = canonicalDocDigestV2(wardendDocObj, NONCE);
 const WARDEND_DOC_SIG = signDetPrehashed(HSM.pub, HSM.d, WARDEND_DOC_DIGEST);
 // The parity pin. This is the digest of THE FIXTURE's wardend doc (not
 // the plugin crate's internal golden-doc vector, which is a different
@@ -498,10 +546,10 @@ const WARDEND_DOC_SIG = signDetPrehashed(HSM.pub, HSM.d, WARDEND_DOC_DIGEST);
 // asserting the same hex IS the cross-implementation parity witness:
 // same bytes, two canonicalizations, one vector.
 const FIXTURE_DOC_DIGEST_HEX = "c957cec67aebdcd839b66d7a58d462c4513e85a23596d8564f689338651aa62d";
-if (hexOf(WARDEND_DOC_DIGEST) !== FIXTURE_DOC_DIGEST_HEX) {
+if (hexOf(WARDEND_DOC_DIGEST_V1) !== FIXTURE_DOC_DIGEST_HEX) {
   throw new Error(
     'doc-digest parity FAILED: the JS canonicalDocDigest drifted from the pinned vector\n' +
-    '  js:    ' + hexOf(WARDEND_DOC_DIGEST) + '\n  pinned: ' + FIXTURE_DOC_DIGEST_HEX,
+    '  js:    ' + hexOf(WARDEND_DOC_DIGEST_V1) + '\n  pinned: ' + FIXTURE_DOC_DIGEST_HEX,
   );
 }
 
@@ -603,7 +651,7 @@ const envelope = {
   identity: { attest_signer_spki_sha256: HSM_PIN, leaf_pem_present: false },
   metadata: {
     instance_id: 'i-0golden0000000000',
-    user_data: 'bootproof golden fixture user-data (no wardend-commit line)',
+    user_data: UDATA_TEXT,
     stagex_commit: null,
     instance_identity: null,
     disk_encryption: null,
@@ -659,6 +707,16 @@ const tNoSig = clone(envelope);  // unsigned-doc: the doc signature dropped
   delete ev.anchors.doc_signature;
 }
 
+const tV1 = clone(envelope);     // v1-signed: the RETIRED contract, honestly
+{
+  // signed: identical doc bytes and anchors, but the doc_signature closes
+  // under digest v1 (no nonce input, blind to user_data). Both verifiers
+  // must reject it fail-closed AND name the reason (replayable at any
+  // nonce), never silently accept it and never mislabel it as tamper.
+  const ev = tV1.bundle.evidence.find((e) => e.channel === 'wardend');
+  ev.anchors.doc_signature = b64(signDetPrehashed(HSM.pub, HSM.d, WARDEND_DOC_DIGEST_V1));
+}
+
 // ---------------------------------------------------------------------------
 // Write.
 // ---------------------------------------------------------------------------
@@ -669,6 +727,7 @@ write('golden.chip-tamper.json', tChip);
 write('golden.log-tamper.json', tLog);
 write('golden.missing-snp.json', tNoSnp);
 write('golden.unsigned-doc.json', tNoSig);
+write('golden.v1-signed.json', tV1);
 write('golden.meta.json', {
   // The harness + tests read the frozen nonce from here. The expected
   // VERDICTS deliberately do NOT live here: they are hardcoded in the
@@ -677,11 +736,18 @@ write('golden.meta.json', {
   // never quietly move the goalposts: a verdict change is a test edit.
   nonce_hex: hexOf(NONCE),
   hsm_spki_pin: HSM_PIN,
-  // I-2: the fixture's wardend doc canonical digest (the JS mirror of
+  // I-2: the fixture's wardend doc canonical digest under RETIRED v1
+  // (byte-blind to user_data, so the historical vector: the JS mirror of
   // the Rust canonical_doc_digest, pinned twice: here at generation, and
   // in the plugin's fixture agreement test against the Rust computation
   // over the decoded fixture doc — the cross-implementation parity pin).
-  wardend_doc_digest_hex: hexOf(WARDEND_DOC_DIGEST),
+  wardend_doc_digest_hex: hexOf(WARDEND_DOC_DIGEST_V1),
+  // D4: the SAME doc's digest v2 over the frozen nonce — the value the
+  // fixture's signature actually closes under, and the second parity
+  // vector: the JS mirrors (verify.js/bootproof.js) and the Rust
+  // canonical_doc_digest_v2 must BOTH recompute it from the fixture's
+  // doc bytes plus bundle.nonce.
+  wardend_doc_digest_v2_hex: hexOf(WARDEND_DOC_DIGEST),
 });
 console.log('golden fixtures written to', OUT);
 console.log('nonce:', hexOf(NONCE));

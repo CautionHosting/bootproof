@@ -1,5 +1,6 @@
 {
  "nonce_hex": "5c32712a7a5915e0b982da3364078c865e9d0d921241db1cffbe47332afef467",
  "hsm_spki_pin": "fe7d197d7e519aa06277a96dd3c2c256d0f2d04987d620e2c1851493710364ef",
- "wardend_doc_digest_hex": "c957cec67aebdcd839b66d7a58d462c4513e85a23596d8564f689338651aa62d"
+ "wardend_doc_digest_hex": "c957cec67aebdcd839b66d7a58d462c4513e85a23596d8564f689338651aa62d",
+ "wardend_doc_digest_v2_hex": "89b908551ca4c85ed0166130c0ff2b0427b68140d5fafd1f8fb1557608dedfd8"
 }

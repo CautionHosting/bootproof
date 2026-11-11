@@ -104,6 +104,8 @@ page stays exactly as it is: an honest list of things not yet checked.</p>
 <tr id="r-wardend.doc_signature" class="pd"><td class=k>wardend.doc_signature</td><td><span class="verdict pd" id="v-wardend.doc_signature">PENDING</span> <span class=why id="w-wardend.doc_signature">awaiting verification in this browser</span></td></tr>
 <tr id="r-wardend.hsm_key_identity" class="pd"><td class=k>wardend.hsm_key_identity</td><td><span class="verdict pd" id="v-wardend.hsm_key_identity">PENDING</span> <span class=why id="w-wardend.hsm_key_identity">awaiting verification in this browser</span></td></tr>
 <tr id="r-wardend.seal_state" class="pd"><td class=k>wardend.seal_state</td><td><span class="verdict pd" id="v-wardend.seal_state">PENDING</span> <span class=why id="w-wardend.seal_state">awaiting verification in this browser</span></td></tr>
+<tr id="r-wardend.doc_nonce" class="pd"><td class=k>wardend.doc_nonce</td><td><span class="verdict pd" id="v-wardend.doc_nonce">PENDING</span> <span class=why id="w-wardend.doc_nonce">awaiting verification in this browser</span></td></tr>
+<tr id="r-wardend.user_data_attested" class="pd"><td class=k>wardend.user_data_attested</td><td><span class="verdict pd" id="v-wardend.user_data_attested">PENDING</span> <span class=why id="w-wardend.user_data_attested">awaiting verification in this browser</span></td></tr>
 <tr id="r-wardend.state_chain" class="pd"><td class=k>wardend.state_chain</td><td><span class="verdict pd" id="v-wardend.state_chain">PENDING</span> <span class=why id="w-wardend.state_chain">awaiting verification in this browser</span></td></tr>
 </table>
 <div class="sec">server-published facts (verbatim, the seald-side verify)</div>
@@ -1098,6 +1100,18 @@ function pad2(n) { return n < 10 ? "0" + n : "" + n; }
 
 const DOC_DIGEST_PREFIX = "wardend/platform-doc-digest/v1";
 
+// D4 (digest v2): the nonce-bound, user-data-bearing contract. The v2
+// marker IS the string change, and it fail-closes in BOTH directions: a
+// doc signed under v1 recomputes to a different digest here, and a v2
+// signature never verifies against the v1 bytes. The verifier computes
+// BOTH digests of the presented doc and judges the signature under each:
+// v2-valid = the current contract (and the freshness row is real); v1-
+// only-valid = the RETIRED contract, proven replayable by design, so it
+// reads FAILED with the reason, never a silent pass (the A7 closure:
+// v1's digest has no nonce input, so a captured v1 response answers
+// every challenge forever). Rust authority: canonical_doc_digest_v2.
+const DOC_DIGEST_PREFIX_V2 = "wardend/platform-doc-digest/v2";
+
 // The six fields the Rust canonical_doc_digest feeds through digest_u64. Only
 // these object-member integers are captured as digit-token strings; every
 // other number (byte-array elements, pcr u32s) is a plain Number.
@@ -1203,7 +1217,13 @@ function dU32s(arr) { return concat.apply(null, [u32be((arr || []).length)].conc
 // in the Rust fixed order (seal_state, state_log, pcr_policy, units, luks,
 // key_acls, retry). WebCrypto's hash-mode verify hashes exactly these with
 // SHA-256, producing the SAME digest the HSM signed (canonical_doc_digest).
-function canonicalDocBytes(doc) {
+//
+// D4 split: canonicalFieldBytes is the field walk BOTH versions share (one
+// implementation, exactly like the Rust digest_fields; a drift in one
+// cannot hide from the other), and each version is its domain marker plus
+// its own extra inputs. canonicalDocBytes stays the v1 byte layout so the
+// v1 fixtures and the v1-rejection path keep measuring the REAL v1 bytes.
+function canonicalFieldBytes(doc, withUserData) {
   const d = doc || {};
   const log = d.state_log || [];
   const logParts = [u32be(log.length)];
@@ -1221,7 +1241,6 @@ function canonicalDocBytes(doc) {
   }
   const pcr = d.pcr_policy;
   return concat(
-    new TextEncoder().encode(DOC_DIGEST_PREFIX),
     dOpt(d.seal_state, (s) => concat(new Uint8Array([s.posture === "sealed" ? 1 : 0]), dBytes(s.state))),
     concat.apply(null, logParts),
     dOpt(pcr, (p) => {
@@ -1234,13 +1253,37 @@ function canonicalDocBytes(doc) {
     dOpt(d.luks, (l) => concat(dBytes(l.device), dBool(l.open), dU32s(l.pcr_policy), dOpt(l.marker_counter, u64beBig))),
     concat.apply(null, aclParts),
     dOpt(d.retry, (r) => concat(u64beBig(r.warden_respawn), u64beBig(r.watchdog_reboot_guard))),
+    // D3: the user-data section, LAST (the Rust digest_user_data position),
+    // and ONLY in v2's byte stream — v1 never fed this section to the
+    // hasher at all, not even a presence tag, so v1 recomputes EXACTLY
+    // the historical v1 bytes (which is what makes the fixture's
+    // v1-signed doc still verifiable under v1 for the honest
+    // RETIRED-contract diagnosis). Within v2: the commitment hash is 32
+    // RAW bytes (no length prefix); the plaintext rides its OWN presence
+    // tag as len-prefixed bytes, so a commitment-only doc and a plaintext
+    // doc never share a digest and None != Some(empty). Absent section =
+    // the 0x00 tag alone.
+    withUserData ? dOpt(d.user_data, (u) => concat(dRaw(u.sha256), dOpt(u.text, (t) => dBytes(t)))) : new Uint8Array(0),
   );
+}
+function canonicalDocBytes(doc) {
+  return concat(new TextEncoder().encode(DOC_DIGEST_PREFIX), canonicalFieldBytes(doc, false));
+}
+// The v2 canonical bytes: v2 marker || the 32-byte challenge || the fields
+// (including the user-data section, which v2 carries and v1 never saw).
+// nonce32 is the bundle's nonce bytes (the challenge THIS view drew; the
+// envelope echo and bundle.nonce are already gated equal to it).
+function canonicalDocBytesV2(doc, nonce32) {
+  return concat(new TextEncoder().encode(DOC_DIGEST_PREFIX_V2), nonce32, canonicalFieldBytes(doc, true));
 }
 // The hex canonical digest (SHA-256 of the canonical bytes). Exposed on the
 // test seam so the parity pin is driven by THIS mirror against the committed
 // fixture, and the naive Number path is shown to diverge (the negative twin).
 function canonicalDocDigestHex(doc) {
   return crypto.subtle.digest("SHA-256", canonicalDocBytes(doc)).then(bufToHex);
+}
+function canonicalDocDigestHexV2(doc, nonce32) {
+  return crypto.subtle.digest("SHA-256", canonicalDocBytesV2(doc, nonce32)).then(bufToHex);
 }
 
 // -----------------------------------------------------------------------------
@@ -1267,6 +1310,17 @@ async function checkStateLog(env) {
     // its low bits (see the precision rule above).
     doc = JSON.parse(text);
     doc.__docDigest = canonicalDocBytes(parseDocTokens(text));
+    // D4: the v2 digest additionally binds THIS view's challenge. The
+    // nonce input is bundle.nonce (byte-for-byte what verify_bundle hands
+    // the Rust verifier as its challenge; the envelope echo + bundle_nonce
+    // rows have already gated it equal to our fresh nonce in live mode,
+    // equal to the frozen fixture nonce in fixture mode). The v2 digest
+    // consumes the TOKEN-SAFE parse too: the same >2^53 discipline.
+    const bundleNonce = wireBytes((env.bundle || {}).nonce);
+    doc.__docNonce32 = (bundleNonce && bundleNonce.length === 32) ? bundleNonce : null;
+    if (doc.__docNonce32) {
+      doc.__docDigestV2 = canonicalDocBytesV2(parseDocTokens(text), doc.__docNonce32);
+    }
   } catch (e) {
     return finishFact("wardend_state_chain", [sub("wardend.evidence", FAILED, "the wardend evidence doc is not decodable JSON: " + e)], "");
   }
@@ -1298,23 +1352,38 @@ async function checkStateLog(env) {
       [sub("wardend.doc_signature", NOT_PROVEN, "the wardend doc carries no doc_signature anchor: the whole-doc byte attestation is missing (an unsigned doc is unverified, not healthy)")], "");
   }
   const docSigBytes = wireBytes(docSig);
-  let docSigOk = false;
-  try {
-    docSigOk = docSigBytes && docSigBytes.length === 64
-      ? await verifyEcdsa("P-256", "SHA-256", spki, docSigBytes, doc.__docDigest)
-      : false;
-  } catch (e) {
-    docSigOk = false;
+  // D4: the signature is judged under BOTH digests of the presented doc.
+  // v2-valid is the current contract: the doc bytes AND this view's
+  // challenge. A signature that closes ONLY under v1 is the RETIRED
+  // contract: a captured response replayable against any challenge (the
+  // ledger's A7 class), so it reads FAILED with the reason, never a
+  // silent pass, and the doc is still never trusted (no dual-accept).
+  async function sigUnder(bytes) {
+    if (!docSigBytes || docSigBytes.length !== 64) return false;
+    try { return await verifyEcdsa("P-256", "SHA-256", spki, docSigBytes, bytes); } catch (e) { return false; }
   }
+  const v2Bytes = doc.__docDigestV2;
+  const v2Ok = v2Bytes ? await sigUnder(v2Bytes) : false;
+  const v1Ok = await sigUnder(doc.__docDigest);
+  const docSigOk = v2Ok;
   if (!docSigOk) {
+    const why = docSigBytes && docSigBytes.length !== 64
+      ? "the doc_signature anchor is not a 64-byte P-256 signature"
+      : !v2Bytes
+        ? "the bundle carries no 32-byte nonce, so digest v2 has no challenge input to verify against"
+        : v1Ok
+          ? "signature valid under RETIRED digest v1: replayable at any nonce (digest v2 required)"
+          : "the whole-doc ECDSA signature does NOT verify under the pinned HSM key over digest v2 of this exact doc and challenge (tampered, stale, or replayed doc bytes)";
     return finishFact("wardend_state_chain",
-      [sub("wardend.doc_signature", docSigBytes && docSigBytes.length === 64 ? FAILED : NOT_PROVEN,
-        docSigBytes && docSigBytes.length === 64
-          ? "the whole-doc ECDSA signature does NOT verify under the pinned HSM key (tampered or stale doc bytes)"
-          : "the doc_signature anchor is not a 64-byte P-256 signature")], "");
+      [sub("wardend.doc_signature", docSigBytes && docSigBytes.length === 64 ? FAILED : NOT_PROVEN, why),
+       sub("wardend.doc_nonce", docSigBytes && docSigBytes.length === 64 ? FAILED : NOT_PROVEN, v1Ok
+         ? "the signature does not bind this session's challenge: the doc is signed under retired digest v1, which has no nonce input, so one captured copy answers every challenge forever"
+         : "no signature over this session's 32-byte challenge could be verified")], "");
   }
   subs.push(sub("wardend.doc_signature", PROVEN,
-    "the whole-doc signature verifies under the pinned HSM key (SHA-256 over the canonical bytes of every doc field)"));
+    "the whole-doc signature verifies under the pinned HSM key (SHA-256 over digest v2: every doc field plus this view's challenge)"));
+  subs.push(sub("wardend.doc_nonce", PROVEN,
+    "the signature binds this session's 32-byte challenge: a captured doc cannot answer a new one"));
   // Display-of-verified (AMI-2 scope 2b): WHICH HSM key verified the doc.
   // The pin is the same SPKI-SHA256 the identity cross-check keys on; the
   // row shows it so the operator can NAME the key rather than trust that
@@ -1332,6 +1401,29 @@ async function checkStateLog(env) {
   subs.push(sub("wardend.seal_state", doc.seal_state ? PROVEN : NOT_PROVEN,
     doc.seal_state ? "seal state published (byte-attested by the doc signature): " + j(doc.seal_state)
                    : "the byte-attested doc carries no seal state"));
+  // D3: the attested user-data tiers, exactly the Rust channel's
+  // wardend_user_data fact: we are PAST the digest-v2 gate, so the
+  // commitment here is under signature and nonce-bound. Plaintext whose
+  // SHA-256 equals the signed commitment = the launch bytes themselves are
+  // attested (PROVEN); commitment only = existence at the hash is
+  // attested, contents withheld (DEGRADED, never silently PROVEN); absent
+  // section = honest NOT PROVEN. A mismatch between the published text
+  // and the signed commitment is FAILED: it is signed-bytes tamper.
+  const udata = doc.user_data;
+  const udataCommit = udata && udata.sha256 ? bufToHex(hexOrBytes(udata.sha256)) : "";
+  if (!udata || udataCommit.length !== 64) {
+    subs.push(sub("wardend.user_data_attested", NOT_PROVEN, "the byte-attested doc carries no user-data section: nothing about the launch user data is proven"));
+  } else if (udata.text != null && typeof udata.text !== "string") {
+    subs.push(sub("wardend.user_data_attested", FAILED, "the user-data plaintext is not a string"));
+  } else if (typeof udata.text === "string") {
+    const textHash = await sha256Hex(new TextEncoder().encode(udata.text));
+    const ok = textHash === udataCommit;
+    subs.push(sub("wardend.user_data_attested", ok ? PROVEN : FAILED, ok
+      ? "attested: " + udata.text.length + " bytes of launch user data, sha256 " + udataCommit.slice(0, 16) + "\u2026, signature-verified and nonce-bound"
+      : "the published user data does NOT hash to the signed commitment (" + textHash.slice(0, 16) + "\u2026 != " + udataCommit.slice(0, 16) + "\u2026): signed-bytes tamper"));
+  } else {
+    subs.push(sub("wardend.user_data_attested", "DEGRADED", "commitment attested (sha256 " + udataCommit.slice(0, 16) + "\u2026); the plaintext is withheld by configuration: existence at the hash is proven, contents are not"));
+  }
   // The empty log now only means "no per-entry signatures to walk", NOT
   // "unverified": the doc signature already byte-attests every field
   // (including an empty state_log). The chain sub is the honest NOT PROVEN

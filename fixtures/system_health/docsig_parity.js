@@ -66,12 +66,29 @@ if (!V || !V.docDigestTokenSafe || !V.docDigestNaive) {
   const tokenSafe = (await V.docDigestTokenSafe(docText)).toLowerCase();
   const naive = (await V.docDigestNaive(docText)).toLowerCase();
 
+  // D4: the digest v2 twin. The fixture's doc plus the fixture's OWN
+  // bundle nonce must reproduce wardend_doc_digest_v2_hex through the
+  // SHIPPED v2 canonicalizer — the same value the fixture's signature
+  // closes under and the Rust canonical_doc_digest_v2 recomputes. If the
+  // JS v2 canonicalizer drifts, this diverges and the gate fails.
+  const pinV2 = String(meta.wardend_doc_digest_v2_hex).toLowerCase();
+  const fixtureNonce = String(env.bundle.nonce);
+  const tokenSafeV2 = (await V.docDigestV2TokenSafe(docText, fixtureNonce)).toLowerCase();
+  // The v2 fail-closed property, computed here rather than asserted
+  // blind: the SAME doc under the v1 canonicalizer and under v2 must be
+  // two different digests (marker + nonce inputs), which is exactly why
+  // a v1 signature cannot close under v2 and vice versa.
+  if (tokenSafeV2 === tokenSafe) throw new Error('digest v2 equals v1: the marker/nonce inputs are not in the byte stream');
+
   process.stdout.write(JSON.stringify({
     pin: pin,
     token_safe: tokenSafe,
     naive: naive,
     token_safe_matches_pin: tokenSafe === pin,
     naive_matches_pin: naive === pin,
+    pin_v2: pinV2,
+    token_safe_v2: tokenSafeV2,
+    token_safe_v2_matches_pin: tokenSafeV2 === pinV2,
   }, null, 1) + '\n');
 })().catch(function (e) {
   console.error('docsig_parity harness error: ' + (e && e.stack || e));

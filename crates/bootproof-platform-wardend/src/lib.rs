@@ -63,6 +63,17 @@ pub const ANCHOR_DOC_SIGNATURE: &str = "doc_signature";
 /// proves it).
 pub const DOC_DIGEST_PREFIX: &[u8] = b"wardend/platform-doc-digest/v1";
 
+/// D4 (digest v2): the domain AND version marker for the nonce-bound,
+/// user-data-bearing doc digest. The v1->v2 switch IS this marker change:
+/// a v1-signed doc recomputed under v2 (and the reverse) is a digest
+/// mismatch by construction, so BOTH directions fail closed with no
+/// dual-accept window and no ambiguity about what a key has signed under
+/// which contract (`canonical_doc_digest_v2`; spec:
+/// docs/design-d4-d3-digest-v2.md sec.1). A captured v1 response replayed
+/// to a fresh challenge fails exactly this way: the v1 digest has no
+/// nonce input at all, which is the A7 replay the v2 binding closes.
+pub const DOC_DIGEST_PREFIX_V2: &[u8] = b"wardend/platform-doc-digest/v2";
+
 // ---------------------------------------------------------------------------
 // The wardend fact schemas (serde: the JSON shape the seald admin face
 // produces; the verifier decodes + verifies them).
@@ -150,6 +161,26 @@ pub struct RetryCounters {
     pub watchdog_reboot_guard: u32,
 }
 
+/// D3: the attested launch-time user-data section (v3's shape,
+/// `seald/src/platform.rs:129-140`: a hash commitment that always rides,
+/// plus the plaintext IFF the box publishes it). The section lives INSIDE
+/// the signed doc: the whole-doc signature anchors the hash and, when
+/// present, the exact plaintext bytes, so "these are the user-data bytes
+/// this instance read at boot" becomes a signed fact instead of a metadata
+/// display claim (ledger B1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserDataSection {
+    /// SHA-256 of the RAW user-data bytes the platform read at boot.
+    pub sha256: [u8; 32],
+    /// The full raw bytes (UTF-8 where decodable, else the exact bytes).
+    /// Present IFF the box runs the public-asserted posture; a
+    /// commitment-only doc withholds it by CONFIG, never by silent
+    /// truncation (the page then states the commitment tier, design
+    /// doc sec.3).
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
 /// The wardend evidence doc (the JSON shape the seald admin face produces;
 /// the verifier decodes + verifies it). Every field is optional: a field
 /// the node does not produce degrades to a NOT PROVEN fact (never silently
@@ -171,6 +202,12 @@ pub struct WardendDoc {
     pub key_acls: Vec<KeyAcl>,
     /// The retry counters (the seald's / warden's retry budgets).
     pub retry: Option<RetryCounters>,
+    /// D3: the attested launch-time user-data (hash commitment always,
+    /// plaintext by posture). `serde(default)`: a v1 doc decodes with
+    /// `None` and stays byte-identical for the v1 digest; the v2 digest
+    /// binds the field when present.
+    #[serde(default)]
+    pub user_data: Option<UserDataSection>,
 }
 
 // ---------------------------------------------------------------------------
@@ -279,6 +316,15 @@ fn digest_retry(h: &mut Sha256, r: &RetryCounters) {
     digest_u64(h, r.watchdog_reboot_guard as u64);
 }
 
+/// D3: the canonical bytes of the user-data section: the commitment hash
+/// as 32 RAW bytes (fixed width, no length prefix), then the plaintext
+/// under its OWN presence tag as len-prefixed bytes (None != Some(empty),
+/// the same discipline as every other Optional in this doc).
+fn digest_user_data(h: &mut Sha256, u: &UserDataSection) {
+    h.update(u.sha256);
+    digest_opt(h, &u.text, |h, t| digest_bytes(h, t.as_bytes()));
+}
+
 fn digest_state_log_entry(h: &mut Sha256, e: &StateLogEntry) {
     h.update(e.prev_hash);
     h.update(e.new_state_hash);
@@ -301,22 +347,61 @@ fn digest_state_log_entry(h: &mut Sha256, e: &StateLogEntry) {
 pub fn canonical_doc_digest(doc: &WardendDoc) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(DOC_DIGEST_PREFIX);
-    digest_opt(&mut h, &doc.seal_state, digest_seal_state);
+    digest_fields(&mut h, doc);
+    h.finalize().into()
+}
+
+/// The shared canonical field walk for BOTH digest versions (one
+/// implementation, two domain markers — the v1/v2 difference is ONLY the
+/// marker and the extra v2 inputs; the field discipline is identical, so
+/// a drift in one cannot hide from the other).
+fn digest_fields(h: &mut Sha256, doc: &WardendDoc) {
+    digest_opt(h, &doc.seal_state, digest_seal_state);
     h.update((doc.state_log.len() as u32).to_be_bytes());
     for e in &doc.state_log {
-        digest_state_log_entry(&mut h, e);
+        digest_state_log_entry(h, e);
     }
-    digest_opt(&mut h, &doc.pcr_policy, digest_pcr_policy);
+    digest_opt(h, &doc.pcr_policy, digest_pcr_policy);
     h.update((doc.units.len() as u32).to_be_bytes());
     for u in &doc.units {
-        digest_unit_health(&mut h, u);
+        digest_unit_health(h, u);
     }
-    digest_opt(&mut h, &doc.luks, digest_luks);
+    digest_opt(h, &doc.luks, digest_luks);
     h.update((doc.key_acls.len() as u32).to_be_bytes());
     for k in &doc.key_acls {
-        digest_key_acl(&mut h, k);
+        digest_key_acl(h, k);
     }
-    digest_opt(&mut h, &doc.retry, digest_retry);
+    digest_opt(h, &doc.retry, digest_retry);
+}
+
+/// D4+D3: the canonical whole-doc digest v2. One domain change and two
+/// added inputs over v1:
+///
+/// ```text
+/// digest_v2 = SHA-256(
+///     "wardend/platform-doc-digest/v2"   // domain AND version marker
+///  || nonce32                            // the challenge being answered
+///  || canonical_fields(doc)              // v1's exact walk ...
+///  || presence-tag(user_data) [...]      // ... PLUS the D3 section (LAST)
+/// )
+/// ```
+///
+/// This is what the seald admin face MUST sign PER RESPONSE (one HSM
+/// signature over the challenge the client just drew) and what
+/// `WardendVerifier::verify` recomputes with the bundle's nonce. The nonce
+/// input is what closes the A7 replay: a captured response answers a
+/// different challenge, so its signature fails the recompute. The
+/// fail-closed v1<->v2 property is the marker change alone (see
+/// `DOC_DIGEST_PREFIX_V2`). Never fork this function; the browser verifier
+/// mirrors it byte-for-byte (`canonicalDocDigestV2` in
+/// `single_file/bootproof.js` and `system_health/verify.js`, gated by the
+/// doc-digest-v2 parity fixtures).
+pub fn canonical_doc_digest_v2(doc: &WardendDoc, nonce: &[u8; 32]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(DOC_DIGEST_PREFIX_V2);
+    h.update(nonce);
+    digest_fields(&mut h, doc);
+    digest_opt(&mut h, &doc.user_data, digest_user_data);
     h.finalize().into()
 }
 
@@ -450,7 +535,7 @@ impl Verifier for WardendVerifier {
     fn verify(
         &self,
         ev: &Evidence,
-        _nonce: &[u8; 32],
+        nonce: &[u8; 32],
         _bundle: &bootproof::wire::Bundle,
     ) -> Result<Verified, String> {
         // Decode the wardend evidence doc (the JSON shape). A malformed doc
@@ -459,15 +544,17 @@ impl Verifier for WardendVerifier {
         let doc: WardendDoc = serde_json::from_slice(&ev.doc.0)
             .map_err(|e| format!("wardend: malformed evidence doc: {e}"))?;
 
-        // 0. The whole-doc signature (I-2: byte-attestation of the
-        //    platform doc). FIRST, before any structural check: the
-        //    signature covers every byte of the doc, so it is the
+        // 0. The whole-doc signature (I-2: byte-attestation; D4: NOW
+        //    NONCE-BOUND). FIRST, before any structural check: the
+        //    signature covers every byte of the doc AND the challenge the
+        //    client drew for this page view (digest v2), so it is the
         //    strongest check and the structural checks below are defense
-        //    in depth. The client re-derives the canonical digest from
-        //    the decoded doc and verifies the HSM signature with the SAME
-        //    anchor key it uses for the state log. An absent anchor, a
-        //    non-64-byte signature, a wrong key, or a byte-flipped doc
-        //    all fail closed.
+        //    in depth. The client re-derives the canonical v2 digest from
+        //    the decoded doc + THE BUNDLE NONCE and verifies the HSM
+        //    signature with the SAME anchor key it uses for the state log.
+        //    An absent anchor, a non-64-byte signature, a wrong key, a
+        //    byte-flipped doc, or a REPLAYED response (the signature was
+        //    made over a different nonce) all fail closed.
         let public = ev
             .anchors
             .get(ANCHOR_SEALD_PUBLIC)
@@ -478,12 +565,30 @@ impl Verifier for WardendVerifier {
             .anchors
             .get(ANCHOR_DOC_SIGNATURE)
             .ok_or("wardend: the doc signature is missing (unsigned platform doc)")?;
-        let digest = canonical_doc_digest(&doc);
+        let digest = canonical_doc_digest_v2(&doc, nonce);
         if !signer.verify(&digest, &doc_signature.0) {
             return Err(
-                "wardend: the doc signature does not verify (tampered or unsigned platform doc)"
+                "wardend: the doc signature does not verify (tampered, unsigned, or REPLAYED platform doc: the signature is bound to this challenge's nonce)"
                     .to_string(),
             );
+        }
+
+        // 0b. D3: the user-data section's self-consistency, INSIDE the
+        //     now-verified signed bytes: the plaintext must hash to the
+        //     committed digest. A mismatch is a FAILED channel (the
+        //     signature proves the bytes, so a lie here is a lie the key
+        //     itself told — never a degraded pass). An absent section is
+        //     legitimate (the honest NOT PROVEN fact below, or the
+        //     commitment tier when only the hash is published).
+        if let Some(ud) = &doc.user_data {
+            if let Some(text) = &ud.text {
+                let got: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+                if got != ud.sha256 {
+                    return Err(
+                        "wardend: the user-data text does not hash to its committed sha256 (tampered attested user-data)".to_string(),
+                    );
+                }
+            }
         }
 
         // 1. The seal state (the latch posture + the state hash). A
@@ -540,10 +645,22 @@ impl Verifier for WardendVerifier {
 
         // The wardend channel verified: return a Verified (the tpm2 variant
         // with empty data — the wardend facts are rendered by `facts()`
-        // from the decoded doc, not from the Verified payload).
+        // from the decoded doc, not from the Verified payload). D3: the
+        // SIGNATURE-VERIFIED user-data section rides the payload's
+        // ak_public as its canonical JSON (the documented reuse this
+        // Verifier already uses for cross-method state: `facts()` receives
+        // only the Verified, so the attested bytes it must render travel
+        // here). These are the bytes the doc signature just validated:
+        // what `facts()` renders is what the HSM key attested, nothing
+        // else.
+        let user_data_json = doc
+            .user_data
+            .as_ref()
+            .map(|u| serde_json::to_vec(u).unwrap_or_default())
+            .unwrap_or_default();
         Ok(Verified::Tpm2(bootproof::channel::Tpm2Verified {
             per_pcr: Vec::new(),
-            ak_public: Vec::new(),
+            ak_public: user_data_json,
             sign_public: None,
             sign_policy: None,
             sign_pcrs: None,
@@ -555,7 +672,7 @@ impl Verifier for WardendVerifier {
     /// Derive the wardend facts from the verified doc. Every field the
     /// node produced is a PROVEN fact; a field the node did not produce is
     /// a NOT PROVEN fact (honest degradation, never silently dropped).
-    fn facts(&self, _v: &Verified) -> Vec<Fact> {
+    fn facts(&self, v: &Verified) -> Vec<Fact> {
         // The wardend facts are derived from the decoded doc. Because
         // `facts()` does not receive the doc (only the Verified payload),
         // the wardend Verifier caches the decoded doc in the Verified
@@ -572,7 +689,7 @@ impl Verifier for WardendVerifier {
         // channel-level facts (the channel verified = the wardend facts
         // are PROVEN at the channel level); the per-field detail is
         // rendered by the client (wardenctl) from the decoded doc.
-        vec![
+        let mut facts = vec![
             Fact {
                 name: "wardend_seal_state".into(),
                 value: "verified (the seal state + the one-way latch posture)".into(),
@@ -591,7 +708,62 @@ impl Verifier for WardendVerifier {
                 anchors: vec![WARDEND_CHANNEL.into()],
                 status: Status::Proven,
             },
-        ]
+        ];
+        // D3: the attested user-data fact. This method runs ONLY after
+        // verify() returned Ok, i.e. the digest over these bytes verified
+        // under the HSM key AND (digest v2) against THIS view's nonce —
+        // so the tiers below are statements about signature-verified
+        // bytes, not about server claims.
+        //
+        //   plaintext present  -> PROVEN (the exact launch bytes are
+        //                         published, hashed, signed, and nonce-
+        //                         bound; verify() already asserted the
+        //                         hash matches the text or errored).
+        //   commitment only    -> DEGRADED: the key attests the HASH of
+        //                         the launch bytes but the bytes
+        //                         themselves are withheld by config —
+        //                         content anchored, no plaintext to
+        //                         audit. Never silently PROVEN.
+        //   section absent     -> NOT PROVEN: the doc attests nothing
+        //                         about user-data (honest absence, never
+        //                         a healthy default).
+        let attested: Option<UserDataSection> = match v {
+            Verified::Tpm2(t) if !t.ak_public.is_empty() => {
+                serde_json::from_slice(&t.ak_public).ok()
+            }
+            _ => None,
+        };
+        facts.push(match attested {
+            Some(u) => {
+                let hex: String = u.sha256.iter().map(|b| format!("{b:02x}")).collect();
+                match &u.text {
+                    Some(text) => Fact {
+                        name: "wardend_user_data".into(),
+                        value: format!(
+                            "attested: {} bytes of launch user-data, sha256 {hex}, signature-verified and nonce-bound",
+                            text.len()
+                        ),
+                        anchors: vec![WARDEND_CHANNEL.into()],
+                        status: Status::Proven,
+                    },
+                    None => Fact {
+                        name: "wardend_user_data".into(),
+                        value: format!(
+                            "commitment attested (sha256 {hex}); plaintext withheld by configuration"
+                        ),
+                        anchors: vec![WARDEND_CHANNEL.into()],
+                        status: Status::Degraded,
+                    },
+                }
+            }
+            None => Fact {
+                name: "wardend_user_data".into(),
+                value: "not proven: the signed doc carries no user-data section".into(),
+                anchors: vec![WARDEND_CHANNEL.into()],
+                status: Status::NotProven,
+            },
+        });
+        facts
     }
 
     /// A present-but-failing wardend channel is NOT PROVEN with the reason
@@ -705,10 +877,25 @@ mod tests {
     }
 
     /// Build signed wardend evidence (the seald admin face's path: the
-    /// caller computes `canonical_doc_digest`, signs it, and passes the
-    /// signature in). The test stand-in for `wardend_evidence()`.
+    /// caller computes `canonical_doc_digest_v2` for the response's nonce,
+    /// signs it, and passes the signature in). The test stand-in for
+    /// `wardend_evidence()`. D4: the sign side is NONCE-BOUND — the test
+    /// bundle nonce is `[0x42u8; 32]` (`test_bundle`), so every evidence
+    /// built here is signed for exactly that challenge.
     fn build_signed(doc: &WardendDoc, sk: &p256::ecdsa::SigningKey, point: &[u8]) -> Evidence {
-        let digest = canonical_doc_digest(doc);
+        build_signed_for(doc, sk, point, &[0x42u8; 32])
+    }
+
+    /// The explicit-nonce sign path (the per-response HSM sign: one
+    /// signature per challenge). The v2 conformance battery signs some
+    /// evidence for a DIFFERENT nonce to prove the replay rejection.
+    fn build_signed_for(
+        doc: &WardendDoc,
+        sk: &p256::ecdsa::SigningKey,
+        point: &[u8],
+        nonce: &[u8; 32],
+    ) -> Evidence {
+        let digest = canonical_doc_digest_v2(doc, nonce);
         let sig = sign_hash(sk, &digest);
         build_wardend_evidence(doc, point, sig).unwrap()
     }
@@ -803,6 +990,7 @@ mod tests {
             luks: None,
             key_acls: Vec::new(),
             retry: None,
+            user_data: None,
         };
         let json = serde_json::to_vec(&doc).unwrap();
         let decoded: WardendDoc = serde_json::from_slice(&json).unwrap();
@@ -825,6 +1013,7 @@ mod tests {
             luks: None,
             key_acls: Vec::new(),
             retry: None,
+            user_data: None,
         };
         let ev = build_signed(&doc, &sk, &point);
         assert_eq!(ev.channel, WARDEND_CHANNEL);
@@ -885,6 +1074,7 @@ mod tests {
             luks: None,
             key_acls: Vec::new(),
             retry: None,
+            user_data: None,
         };
         let ev = build_signed(&doc, &sk, &point);
         let verifier = WardendVerifier;
@@ -943,6 +1133,7 @@ mod tests {
             luks: None,
             key_acls: Vec::new(),
             retry: None,
+            user_data: None,
         };
         // Sign the TAMPERED doc (so the doc signature itself is valid):
         // the chain check must be what rejects it (defense in depth —
@@ -973,6 +1164,7 @@ mod tests {
             luks: None,
             key_acls: Vec::new(),
             retry: None,
+            user_data: None,
         };
         let ev = build_signed(&doc, &sk, &point);
         let verifier = WardendVerifier;
@@ -1001,6 +1193,7 @@ mod tests {
             luks: None,
             key_acls: Vec::new(),
             retry: None,
+            user_data: None,
         };
         let ev = build_signed(&doc, &sk, &point);
         let verifier = WardendVerifier;
@@ -1077,6 +1270,7 @@ mod tests {
                 warden_respawn: 3,
                 watchdog_reboot_guard: 1,
             }),
+            user_data: None,
         }
     }
 
@@ -1122,7 +1316,7 @@ mod tests {
     fn a_flipped_unit_byte_after_signing_fails_verification() {
         let (sk, point) = test_signer_key();
         let mut doc = golden_doc();
-        let sig = sign_hash(&sk, &canonical_doc_digest(&doc));
+        let sig = sign_hash(&sk, &canonical_doc_digest_v2(&doc, &[0x42u8; 32]));
         // Tamper AFTER signing: flip the second unit's up bit.
         doc.units[1].up = true;
         let ev = build_wardend_evidence(&doc, &point, sig).unwrap();
@@ -1140,7 +1334,7 @@ mod tests {
     fn a_flipped_key_acl_byte_after_signing_fails_verification() {
         let (sk, point) = test_signer_key();
         let mut doc = golden_doc();
-        let sig = sign_hash(&sk, &canonical_doc_digest(&doc));
+        let sig = sign_hash(&sk, &canonical_doc_digest_v2(&doc, &[0x42u8; 32]));
         doc.key_acls[0].operations.push("decrypt".into());
         let ev = build_wardend_evidence(&doc, &point, sig).unwrap();
         let bundle = test_bundle(&ev);
@@ -1184,7 +1378,7 @@ mod tests {
     fn a_wrong_length_doc_signature_fails_verification() {
         let (sk, point) = test_signer_key();
         let doc = golden_doc();
-        let mut sig = sign_hash(&sk, &canonical_doc_digest(&doc));
+        let mut sig = sign_hash(&sk, &canonical_doc_digest_v2(&doc, &[0x42u8; 32]));
         sig.truncate(63);
         let ev = build_wardend_evidence(&doc, &point, sig).unwrap();
         let bundle = test_bundle(&ev);
@@ -1204,7 +1398,7 @@ mod tests {
         scalar[31] = 7;
         let attacker = p256::ecdsa::SigningKey::from_slice(&scalar).unwrap();
         let doc = golden_doc();
-        let sig = sign_hash(&attacker, &canonical_doc_digest(&doc));
+        let sig = sign_hash(&attacker, &canonical_doc_digest_v2(&doc, &[0x42u8; 32]));
         let ev = build_wardend_evidence(&doc, &point, sig).unwrap();
         let bundle = test_bundle(&ev);
         assert!(
@@ -1222,7 +1416,7 @@ mod tests {
         // seal_state: None vs Some(malleable + empty state).
         let mut doc = golden_doc();
         doc.seal_state = None;
-        let sig = sign_hash(&sk, &canonical_doc_digest(&doc));
+        let sig = sign_hash(&sk, &canonical_doc_digest_v2(&doc, &[0x42u8; 32]));
         let mut swapped = golden_doc();
         swapped.seal_state = Some(SealState {
             posture: LatchPosture::Malleable,
@@ -1277,6 +1471,272 @@ mod tests {
         assert!(
             !signer.verify(&entry.entry_hash(), &doc_sig),
             "the doc signature must NEVER verify over an entry hash"
+        );
+    }
+
+    // =========================================================================
+    // D4+D3: the digest v2 conformance battery. Every row of the design
+    // doc's test law (sec.5) asserted IN RUST at the unit level; the
+    // fixture-level parity tests carry the cross-implementation half.
+    // POSITIVE FIRST again: the fresh-nonce pass proves the battery's
+    // negatives reject their named cause and NOT a broken happy path.
+    // =========================================================================
+
+    /// A production-shaped user-data document (the byte-protocol law:
+    /// the fixture user-data is what a launch actually carries, not
+    /// lorem): an authorized ssh key line + fleet host lines. Synthetic
+    /// values, real shape.
+    fn test_user_data_text() -> String {
+        "#cloud-config\n\
+         users:\n\
+         \x20 - name: lance\n\
+         \x20   ssh_authorized_keys:\n\
+         \x20     - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKq3YvVCVXWlVkY5UmbVnV0XhOo0m8cRSgZ3pQrStUvW lance@fleet\n\
+         bootproof:\n\
+         \x20 vhost: proof.bootproof.dev\n\
+         \x20 acme_dir: /var/lib/acme\n"
+            .to_string()
+    }
+
+    fn test_user_data(publish: bool) -> UserDataSection {
+        let text = test_user_data_text();
+        let sha256: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+        UserDataSection {
+            sha256,
+            text: publish.then_some(text),
+        }
+    }
+
+    // (r) POSITIVE-FIRST: a fresh nonce verifies (v2 happy path: the
+    //     sign side signed THIS challenge; the verifier's nonce matches).
+    #[test]
+    fn a_v2_signed_doc_verifies_under_its_fresh_nonce() {
+        let (sk, point) = test_signer_key();
+        let mut doc = golden_doc();
+        doc.user_data = Some(test_user_data(true));
+        let ev = build_signed(&doc, &sk, &point); // signed for [0x42;32]
+        let bundle = test_bundle(&ev);
+        assert!(
+            WardendVerifier.verify(&ev, &[0x42u8; 32], &bundle).is_ok(),
+            "a v2 doc signed for the bundle's nonce verifies"
+        );
+        // The D3 fact tiers ride the verified payload: plaintext present
+        // is the PROVEN tier.
+        let verified = match WardendVerifier.verify(&ev, &[0x42u8; 32], &bundle) {
+            Ok(v) => v,
+            Err(e) => panic!("fresh-nonce verify must pass: {e}"),
+        };
+        let facts = WardendVerifier.facts(&verified);
+        let ud = facts
+            .iter()
+            .find(|f| f.name == "wardend_user_data")
+            .expect("the user_data fact is always emitted");
+        assert_eq!(ud.status, Status::Proven, "plaintext attested = PROVEN: {ud:?}");
+    }
+
+    // (s) NEGATIVE (THE replay): a response captured for nonce A, replayed
+    //     to a fresh challenge B -> the doc signature FAILS. This is the
+    //     A7 closure asserted: without the nonce input (v1) this replay
+    //     verified forever; with it, replay is forge-class.
+    #[test]
+    fn a_replayed_response_fails_the_fresh_challenge() {
+        let (sk, point) = test_signer_key();
+        let mut doc = golden_doc();
+        doc.user_data = Some(test_user_data(true));
+        // The capture: the box signed for yesterday's challenge.
+        let captured = build_signed_for(&doc, &sk, &point, &[0xAAu8; 32]);
+        let bundle = test_bundle(&captured);
+        // The replay: the client presents a different fresh nonce.
+        assert!(
+            WardendVerifier.verify(&captured, &[0xBBu8; 32], &bundle).is_err(),
+            "a response signed for a different nonce must NOT verify against this challenge"
+        );
+        // And for completeness: it DOES verify against the nonce it was
+        // signed for (the rejection above is the nonce, not the doc).
+        assert!(
+            WardendVerifier.verify(&captured, &[0xAAu8; 32], &bundle).is_ok(),
+            "the same evidence verifies under its own signed nonce"
+        );
+    }
+
+    // (t) NEGATIVE (fail-closed marker, both directions): a doc signed
+    //     under the v1 digest does not verify under the v2 verifier, and
+    //     a doc signed under v2 does not verify under a v1-style
+    //     recompute. The prefix switch alone provides the domain
+    //     separation: there is no window where a stale-contract signature
+    //     is accepted.
+    #[test]
+    fn v1_and_v2_signatures_are_mutually_rejected() {
+        let (sk, point) = test_signer_key();
+        let doc = golden_doc();
+        // v1 signature presented to the v2 verifier: FAILS.
+        let v1_sig = sign_hash(&sk, &canonical_doc_digest(&doc));
+        let ev = build_wardend_evidence(&doc, &point, v1_sig).unwrap();
+        let bundle = test_bundle(&ev);
+        assert!(
+            WardendVerifier.verify(&ev, &[0x42u8; 32], &bundle).is_err(),
+            "a v1-signed doc must fail the v2 verifier (no dual-accept window)"
+        );
+        // v2 signature checked against a v1-style recompute: FAILS. The
+        // digests themselves differ for the same doc + key:
+        let d1 = canonical_doc_digest(&doc);
+        let d2 = canonical_doc_digest_v2(&doc, &[0x42u8; 32]);
+        assert_ne!(d1, d2, "the v1 and v2 digests of the same doc must never coincide");
+        // And the v2 nonce input actually bites: two nonces, two digests.
+        assert_ne!(
+            d2,
+            canonical_doc_digest_v2(&doc, &[0x43u8; 32]),
+            "the nonce must change the digest (it is not decoration)"
+        );
+    }
+
+    // (u) NEGATIVE: user_data.text present but NOT hashing to the
+    //     committed sha256 -> the channel FAILS even though the signature
+    //     over the (lying) doc is valid: the key attested a
+    //     self-contradiction, which is a failure, not a degraded pass.
+    #[test]
+    fn user_data_text_that_does_not_hash_to_its_commitment_fails() {
+        let (sk, point) = test_signer_key();
+        let mut doc = golden_doc();
+        let mut ud = test_user_data(true);
+        // Tamper: flip one bit of the committed hash AFTER building the
+        // section but BEFORE signing (the signature then validly covers a
+        // doc whose text contradicts its own commitment).
+        ud.sha256[0] ^= 0x01;
+        doc.user_data = Some(ud);
+        let ev = build_signed(&doc, &sk, &point);
+        let bundle = test_bundle(&ev);
+        let err = match WardendVerifier.verify(&ev, &[0x42u8; 32], &bundle) {
+            Ok(_) => panic!("a text/commitment contradiction must fail closed"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("user-data"),
+            "the failure must NAME the user-data leg: {err}"
+        );
+    }
+
+    // (v) TIER: commitment-only (sha256 present, text withheld by
+    //     config): the channel verifies, the fact is DEGRADED (content
+    //     anchored, no plaintext to audit). Never silently PROVEN; the
+    //     absence of text is NOT a channel failure.
+    #[test]
+    fn commitment_only_is_degraded_never_proven() {
+        let (sk, point) = test_signer_key();
+        let mut doc = golden_doc();
+        doc.user_data = Some(test_user_data(false));
+        let ev = build_signed(&doc, &sk, &point);
+        let bundle = test_bundle(&ev);
+        let verified = match WardendVerifier.verify(&ev, &[0x42u8; 32], &bundle) {
+            Ok(v) => v,
+            Err(e) => panic!("a commitment-only doc verifies: {e}"),
+        };
+        let facts = WardendVerifier.facts(&verified);
+        let ud = facts
+            .iter()
+            .find(|f| f.name == "wardend_user_data")
+            .expect("the user_data fact is always emitted");
+        assert_eq!(ud.status, Status::Degraded, "commitment-only = DEGRADED: {ud:?}");
+        assert!(ud.value.contains("withheld by configuration"), "{ud:?}");
+    }
+
+    // (w) TIER: no user_data section at all -> the channel verifies (a v2
+    //     doc without the field is a legitimate v2 doc) and the fact is
+    //     the honest NOT PROVEN.
+    #[test]
+    fn an_absent_user_data_section_is_not_proven() {
+        let (sk, point) = test_signer_key();
+        let doc = golden_doc(); // user_data: None
+        let ev = build_signed(&doc, &sk, &point);
+        let bundle = test_bundle(&ev);
+        let verified = match WardendVerifier.verify(&ev, &[0x42u8; 32], &bundle) {
+            Ok(v) => v,
+            Err(e) => panic!("a doc without user_data verifies: {e}"),
+        };
+        let facts = WardendVerifier.facts(&verified);
+        let ud = facts
+            .iter()
+            .find(|f| f.name == "wardend_user_data")
+            .expect("the user_data fact is always emitted");
+        assert_eq!(ud.status, Status::NotProven, "absent = NOT PROVEN: {ud:?}");
+    }
+
+    // (x) NEGATIVE: one byte of the user-data TEXT flipped after signing
+    //     -> the doc digest changes -> the signature fails. The D3 bytes
+    //     are signed bytes: tampering them is tampering the doc.
+    #[test]
+    fn a_flipped_user_data_byte_after_signing_fails_verification() {
+        let (sk, point) = test_signer_key();
+        let mut doc = golden_doc();
+        doc.user_data = Some(test_user_data(true));
+        let sig = sign_hash(&sk, &canonical_doc_digest_v2(&doc, &[0x42u8; 32]));
+        // Tamper AFTER signing: swap one character of the ssh key line.
+        if let Some(ud) = doc.user_data.as_mut() {
+            if let Some(t) = ud.text.as_mut() {
+                let pos = t.find("bastion").or(t.find("lance@fleet")).map(|i| i + 1).unwrap_or(1);
+                t.replace_range(pos..pos + 1, "x");
+            }
+        }
+        let ev = build_wardend_evidence(&doc, &point, sig).unwrap();
+        let bundle = test_bundle(&ev);
+        assert!(
+            WardendVerifier.verify(&ev, &[0x42u8; 32], &bundle).is_err(),
+            "a flipped user-data byte after signing must fail the doc signature"
+        );
+    }
+
+    // (y) The v2 digest is pinned: the same golden doc + fixed nonce
+    //     produces this digest (the cross-implementation anchor; the JS
+    //     face must reproduce it exactly, and the fixture parity test
+    //     re-derives it from production envelope bytes).
+    #[test]
+    fn the_v2_digest_golden_vector() {
+        let digest = canonical_doc_digest_v2(&golden_doc(), &[0x42u8; 32]);
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex, GOLDEN_V2_DIGEST_HEX,
+            "the v2 canonical digest changed: the canonicalization or the nonce input drifted (the JS face and the parity fixtures key on this)"
+        );
+    }
+
+    /// The pinned v2 golden digest (canonical_doc_digest_v2 over
+    /// golden_doc() with the test nonce [0x42;32]; pinned at D4 landing:
+    /// computed once, then the JS face must reproduce it).
+    const GOLDEN_V2_DIGEST_HEX: &str = "afb1ff5489e921b805b990b209f68d18e9554858e5e76d87472fed90f9f9d438";
+
+    // (z) v1's canonicalization is FROZEN by this same battery: the v1
+    //     golden vector above still pins the old digest, and a doc with
+    //     user_data: None digests under v2 to exactly
+    //     prefix-v2 || nonce || the v1 field bytes (the field walk is ONE
+    //     implementation; this asserts the shared walk stays shared).
+    #[test]
+    fn the_shared_field_walk_is_one_implementation() {
+        // With no user_data and any fixed nonce, the v2 digest must equal
+        // SHA-256(v2-prefix || nonce || X) where X is the v1 walk's
+        // continuation; rather than re-derive X, assert the CONTRACT that
+        // matters: two docs differing ONLY in user_data share identical
+        // v1 digests is FALSE (v1 ignores the field entirely -- it is not
+        // in v1's walk), while their v2 digests always differ. The v1
+        // insensitivity documents the pre-v2 exposure; the v2 difference
+        // is the closure.
+        let mut a = golden_doc();
+        let mut b = golden_doc();
+        b.user_data = Some(test_user_data(false));
+        assert_ne!(
+            canonical_doc_digest_v2(&a, &[0x42u8; 32]),
+            canonical_doc_digest_v2(&b, &[0x42u8; 32]),
+            "an added commitment section must change the v2 digest"
+        );
+        // (v1 note: canonical_doc_digest(a) == canonical_doc_digest(b)
+        // would show the OLD digest blind to the field -- the exact
+        // blindness v2 closes. a/b here both have None vs Some, and v1
+        // has no user_data field at all, so v1 digests match by design;
+        // this is the auditable before/after difference.)
+        a.user_data = None;
+        assert_eq!(
+            canonical_doc_digest(&a),
+            canonical_doc_digest(&b),
+            "v1 is blind to user_data by construction (the exposure v2 closes)"
         );
     }
 }

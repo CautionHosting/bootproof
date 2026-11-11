@@ -73,7 +73,13 @@ pub const BOOTPROOF_HTML: &str = include_str!("../assets/dist/bootproof.html");
 /// Before that: 4760aa18 (the pending-first pivot: operator-named sources, the
 /// static pending tables, the flip engine, the fleet_domains row; the artifact
 /// moved to assets/dist/), then a3ba3240 (the first canonical bootproof.html).
-pub const BOOTPROOF_SHA256: &str = "4210f8a6843a8fa59b54b8ce52b0c40f9af24c8f9fe63c5b2380d4b42ac52fd6";
+/// On-chain value: f54e0b8a (D4/D3 digest v2 in the browser face: the doc
+/// signature is judged under digest v2 bound to this view's nonce, a
+/// v1-only signature reads FAILED with the retired-contract replay named,
+/// the wardend.doc_nonce freshness row and wardend.user_data_attested tier
+/// rows ship as static PENDING rows, and the fixture/docsig gates pin both
+/// digest versions). Predecessor: 4210f8a6.
+pub const BOOTPROOF_SHA256: &str = "f54e0b8a4685ee569e99229504aef2c908d73a4de05c68e05e7b6c9f3f6c611b";
 
 #[cfg(test)]
 mod tests {

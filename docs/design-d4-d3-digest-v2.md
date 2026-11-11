@@ -5,6 +5,11 @@ doc is the pre-code spec the ruling requires). Author: provenance lane.
 Implements: A7 closure (doc freshness/replay), B1 closure (user-data attested),
 operator items 2 and 4. One digest-spec change serving both: ONE HSM signature
 per response covers state + nonce + user-data bytes.
+Addendum (lane consolidation, chipmunk 2026-11-11T03:18Z): section 8 adds
+D5, the disk-claim closure (quote-set PCR11 + pinned UKI section digests),
+and section 4 gains the D4 entropy/cache threat-model bullets. The D2
+track's doc base stays squid's docs/d1-firmware-measurement.md (stagex
+repo); this section is the citation's bootproof-side counterpart.
 
 ## 0. The problem, measured
 
@@ -126,6 +131,16 @@ Browser (`checkStateLog` in the verifier JS):
   (identity-link indirection); time-of-response beyond the nonce itself
   inherits the client's own freshness (the page view), which is the honest
   outer bound for any TVC.
+- **Nonce entropy (D4, binding):** the browser nonce MUST come from
+  `crypto.getRandomValues(new Uint8Array(32))` -- the WebCrypto CSPRNG.
+  `Math.random` is banned: it is a predictable per-tab stream, and a
+  guessable nonce collapses D4 back to v1's replay property.
+- **Response freshness (D4, binding):** every `/health/api` response MUST
+  carry `Cache-Control: no-store` and every client MUST fetch it with
+  `{cache: "no-store"}`. Both hold today (the page's fetch sites; the
+  website server header) but they are now REQUIRED properties, not
+  accidents: a cacheable response answering a fresh nonce is a replay
+  delivered by the cache layer, and D4's whole row set would lie.
 
 ## 5. Test law (production byte protocol, every face)
 
@@ -177,9 +192,72 @@ Browser (`checkStateLog` in the verifier JS):
 This doc covers step 1 (D4+D3). Implementation order per ruling:
 1. D4+D3 v2 digest (bootproof: digest + both verifiers + fixtures + rows;
    wardend seald sign-side v2 — coordinated, one landing set)
-2. D6+BUG-1 file:// cold verifier mode (pending-first, no self-fetch crash)
-3. B2 census widening (units[] -> full user+first-party set, health +
+2. D5 disk-claim closure (section 8; verifier-side quote-set + TOFU pins)
+3. D2 measurement pins when G2's W4 value lands
+4. D6+BUG-1 file:// cold verifier mode (pending-first, no self-fetch crash)
+5. B2 census widening (units[] -> full user+first-party set, health +
    generation, in-doc; rows refuse "current" until this + D4 both land)
-4. B7 page-sha pin row
-5. A2 in-page RSA-PSS with real ASVK->VLEK fixture
-6. D1 when the G2 report lands (firmware-class pin; PCR11 pin is the D2 track)
+6. B7 page-sha pin row
+7. A2 in-page RSA-PSS with real ASVK->VLEK fixture
+8. D1 when the G2 report lands (firmware-class pin; PCR11 pin is the D2 track)
+
+## 8. D5 -- disk-claim closure (quote-set PCR11 + pinned section digests)
+
+**Ledger entries it closes:** the DISK half of A1 ("the disk running is the
+disk that was built"). The reconciliation findings this builds on:
+
+- The launch measurement at report_data **0x90..0xC0** (R3: byte-identical
+  across both EC2 capture fixtures while 0x030 differs = vmpl; the 0x40
+  read was plat_info) is a FIRMWARE/OVMF-class measurement. It says
+  nothing about the disk. D1's firmware row must never borrow it for the
+  disk, and vice versa.
+- The DISK identity is measured by the EFI linux stub into **PCR11**: the
+  stub extends `.linux`, `.initrd`, `.cmdline` and the `.osrel` section;
+  the erofs root filesystem rides INSIDE `.initrd` in the unique-mode
+  (unikernel) image, so PCR11 covers the complete disk contents. The
+  current quote set (PCR00-07 + 13/14/15) never quotes it.
+
+**Mechanism (verifier-side only; no signing-pipeline change):**
+
+1. `SnpQuoteVerifier::parse_quote` parameterizes the quoted-PCR set;
+   extend it to include index 11 (the bake-11 face:
+   {0..7, 11, 13, 14, 15}). The quote binds digests for every listed
+   index; existing TPM-side digests are unchanged.
+2. `VerifyPolicy` gains the quoted-PCR set as a typed field with the
+   current seven-index default; the bundle face runs the extended set so
+   a quote that omits PCR11 fails the fold instead of silently skipping
+   the disk row.
+3. New sub row `snp.disk_verification`: the quote's PCR11 digest must
+   equal the pinned expected value. Separate row and separate verdict
+   from the firmware row: two claims, no cross-borrowing.
+4. Expected values are **TOFU pins**: the PCR11 value and the per-UKI
+   section digests come from G2's captured UKI (croc W4), recorded in
+   the registry like D2's measurement pins -- not from a build pipeline
+   the verifier can replay. The page labels them as pins with the capture
+   source named.
+5. **sbsign prerequisite:** signing must not perturb the measured
+   sections. sbsign appends to `.siglineage`/`.sbsig` and leaves
+   .linux/.initrd/.cmdline/.osrel bytes intact, but any change to signing
+   flags, certificate, or section order is a PCR11 break by definition.
+   Pins are therefore **provisional until G2 captures the FINAL signed
+   UKI** the AMI boots; every re-sign is a pin rotation event with a
+   recorded reason (D2's change-control discipline).
+
+**Semantics:**
+
+| row | verdict | evidence |
+|---|---|---|
+| snp.firmware_verification (launch measurement) | pinned-proven iff quote report_data[0x90..0xC0] == registry pin; no pin => NOT PROVEN | the R3-offset bytes from the live quote |
+| snp.disk_verification | pinned-proven iff quote PCR11 digest == pinned PCR11; no pin => NOT PROVEN | the quote's PCR11 digest; sections listed with digests as detail |
+
+The comparison needs only the quote's PCR11 digest, so D5 lands while the
+eventlog remains absent from the bundle (ledger E1/E2): when the eventlog
+is added later, the section digests upgrade from pinned to replayed and
+the structural-PROVEN path (a replayable builder reproducing identical
+sections) stays gated on D2's unresolved pipeline claims.
+
+**D5 explicitly does NOT claim:** the builder is reproducible; the section
+digests were produced by the public pipeline; or any implication between
+the firmware row and the disk row -- a correct firmware measurement with
+a wrong disk passes the firmware row and fails the disk row, which is
+precisely why they are split.
