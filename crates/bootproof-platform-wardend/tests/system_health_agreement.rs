@@ -137,6 +137,25 @@ fn golden_wardend_agreement() {
     // the Rust side (the JS side renders them as metadata, not facts).
     assert_eq!(rust.get("wardend_seal_state").map(String::as_str), Some("PROVEN"));
     assert_eq!(rust.get("wardend_pcr_policy").map(String::as_str), Some("PROVEN"));
+    // The bake-11 fold row on THIS lane (the wardend envelope publishes the
+    // real signer pin): the browser reads the tail against the published pin
+    // and STILL says NOT PROVEN — the golden's tail (ac0e6a94..74a18) is not
+    // the pin (fe7d197d..), so the row is the honest Unattributed witness
+    // naming the measured hex. Even a byte-equal tail could not PROVEN here:
+    // browser-trusted attribution waits for #19 (the fail-closed driver in
+    // the fixture gate enforces that overclaim class).
+    let subs = js_subs(&g);
+    assert_eq!(
+        subs.get("snp.identity_tail").map(String::as_str),
+        Some("NOT PROVEN"),
+        "the browser tail row is NOT PROVEN on the wardend-lane golden: {subs:?}"
+    );
+    let why = find_sub_why(&g, "snp.identity_tail").unwrap_or_default();
+    assert!(
+        why.contains("ac0e6a940aa7a6fb1bbf697079a8fc5845d10876f75ce3c2e3a0394838a74a18")
+            && why.contains("unattributed"),
+        "the auditor law: the row names the measured tail hex: {why}"
+    );
 }
 
 /// The log tamper: BOTH verifiers reject the flipped wardend log, through
@@ -624,6 +643,23 @@ fn find_why(fixture: &Path, name: &str) -> Option<String> {
     for f in v.get("facts").and_then(|a| a.as_array())? {
         if f.get("name").and_then(|n| n.as_str())? == name {
             return f.get("why").and_then(|w| w.as_str()).map(String::from);
+        }
+    }
+    None
+}
+
+/// The same lookup on the SUBS array (the browser identity rows are subs,
+/// not facts: the fact-level roll stays memory_encryption).
+fn find_sub_why(fixture: &Path, name: &str) -> Option<String> {
+    let out = Command::new("node")
+        .arg(fixtures_dir().join("harness.js"))
+        .arg(fixture)
+        .output()
+        .expect("node runs the harness");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("harness JSON");
+    for s in v.get("subs").and_then(|a| a.as_array())? {
+        if s.get("name").and_then(|n| n.as_str())? == name {
+            return s.get("why").and_then(|w| w.as_str()).map(String::from);
         }
     }
     None
