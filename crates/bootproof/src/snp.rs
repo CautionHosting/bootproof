@@ -94,6 +94,27 @@ pub fn nonce_binding_ok(report_data: &[u8; 64], nonce: &[u8; 32]) -> bool {
     report_data[..32] == nonce[..] && nonce.iter().any(|&b| b != 0)
 }
 
+/// Compose the 64-byte report_data for the SPKI tail fold: the client nonce
+/// in the front 32 bytes (the freshness binding `nonce_binding_ok` checks)
+/// and the 32-byte signer SPKI pin in the back 32 bytes (the identity
+/// binding — `SHA-256(SubjectPublicKeyInfo)`, the same value the TLS leaf
+/// check and wardenctl's pin comparison use). Both halves land inside the
+/// VLEK-signed prefix, so the fold is bound to the SAME nonce and the SAME
+/// signature as the freshness binding: the report itself names the signer
+/// key (tier 1, hardware-anchored), not the self-declared bundle keys.
+///
+/// The FRONT half is copied from `challenge[..32]`, not from a bare nonce,
+/// so the fold composes whatever the transport chose as the challenge front
+/// (the channel never re-derives the nonce). This is the composition seam the
+/// frozen byte contract left open: `challenge_from_nonce` fills the front and
+/// zeroes the back precisely so the back is available for this fold.
+pub fn fold_signer_pin(challenge_front32: &[u8; 32], signer_pin: &[u8; 32]) -> [u8; 64] {
+    let mut rd = [0u8; 64];
+    rd[..32].copy_from_slice(challenge_front32);
+    rd[32..].copy_from_slice(signer_pin);
+    rd
+}
+
 // `device_present()` DELETED (gate unification (4)): `Path::exists()`
 // swallows every stat errno, so a denial rendered as absence (the ABSENCE
 // LAW violation). The replacement is `channel::probe_device`
