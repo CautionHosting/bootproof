@@ -255,6 +255,55 @@ impl Verifier for SnpVerifier {
                 status: if proven { Status::Proven } else { Status::NotProven },
             });
         }
+
+        // THE IDENTITY-TAIL ROW (bake-11 #2, the SPKI tail fold). The tail is
+        // `report_data[32..64]`, INSIDE the VLEK-signed prefix every gate in
+        // `verify_snp` just cleared, so these 32 bytes are tamper-evident by
+        // construction: a transport that flips the tail breaks the report
+        // signature and the channel dies BEFORE this fact is ever built. This
+        // is display-of-attested, not a new trust tier.
+        //
+        // CLASSIFY LAW (the fold adjudication): tail content NEVER fails.
+        // FAILED belongs to the signature, not the content. The three states:
+        // all-zero => NotEnabled (honest pre-fold); non-zero + named candidate
+        // match => Matched; non-zero + no match => Unattributed (honest, never
+        // a lie). At CORE SCOPE the candidate set is EMPTY BY LAW: the signer
+        // key (`keys.sign.pub_`) is a platform-scoped encoding (TPMT_PUBLIC)
+        // that the core must not parse, and the SPKI pin belongs to the TLS
+        // leaf, which is not in the Bundle. So the core can only ever emit
+        // NotEnabled or Unattributed — it can report the fold STATE but never
+        // attribute the tail to a named key. The Matched arm is reached only
+        // where a platform/envelope supplies a candidate (wardend parses its
+        // own signer pin, the browser mirrors) and, until #19 lands the
+        // out-of-band expected pin, even a Matched row is tier-labeled
+        // "same-attacker", never a browser-trusted identity. The Matched arm
+        // below is therefore unreachable at core scope (empty candidates); it
+        // is kept exhaustive so the verbatim label is defined in one place.
+        let mut tail = [0u8; 32];
+        tail.copy_from_slice(&v.report_data[32..64]);
+        let cands: [(&'static str, [u8; 32]); 0] = [];
+        let (value, status) = match crate::snp::classify_identity_tail(&tail, &cands) {
+            crate::snp::IdentityTail::NotEnabled => (
+                "identity fold not enabled (report_data[32..64] all zero): this bundle \
+                 predates the SPKI tail fold, tier-1 key binding absent"
+                    .to_string(),
+                Status::NotProven,
+            ),
+            crate::snp::IdentityTail::Unattributed => (
+                crate::snp::identity_tail_reason(&tail, &cands),
+                Status::NotProven,
+            ),
+            crate::snp::IdentityTail::Matched(name) => (
+                format!("identity tail matches {name}: attested identity, same-attacker bound until #19"),
+                Status::Proven,
+            ),
+        };
+        facts.push(Fact {
+            name: "snp_identity_tail".into(),
+            value,
+            anchors: vec!["snp".into()],
+            status,
+        });
         facts
     }
 
@@ -270,23 +319,26 @@ impl Verifier for SnpVerifier {
         })
     }
 
-    // AMI-2: the snp channel owns THREE facts, so a failed report must
-    // NOT PROVEN all three -- a tampered report's identity bytes are
-    // untrustworthy exactly as the memory-encryption claim is. The JS
-    // verifier reaches the same verdict through its own path (the
-    // identity subs are gated on the report signature); this is the
-    // two-verifiers-one-verdict parity on the tamper path. The
-    // required-absent case is NOT overridden: an absent report has no
-    // bytes, so the identity rows are absent (not NOT PROVEN) in both
-    // verifiers -- honest silence, distinct from a tampered report's
-    // present-row-says-NOT-PROVEN.
+    // AMI-2: the snp channel owns FOUR facts (memory_encryption + the three
+    // identity rows: cpu, chip, tail), so a failed report must NOT PROVEN all
+    // four -- a tampered report's identity bytes are untrustworthy exactly as
+    // the memory-encryption claim is. This is load-bearing for the
+    // identity-tail row specifically: an all-zero or attacker-shaped tail on
+    // a report that FAILED the signature must read NOT PROVEN, never a
+    // NotEnabled/Unattributed that would imply the bytes were attested. The
+    // JS verifier reaches the same verdict through its own path (the identity
+    // subs are gated on the report signature); this is the two-verifiers-one-
+    // verdict parity on the tamper path. The required-absent case is NOT
+    // overridden: an absent report has no bytes, so the identity rows are
+    // absent (not NOT PROVEN) in both verifiers -- honest silence, distinct
+    // from a tampered report's present-row-says-NOT-PROVEN.
     fn failed_facts(&self, ev: &Evidence, reason: &str) -> Vec<Fact> {
-        let mut facts = Vec::with_capacity(3);
+        let mut facts = Vec::with_capacity(4);
         if let Some(f) = self.failed_fact(ev, reason) {
             facts.push(f);
         }
         let why = format!("snp report NOT verified ({reason}): identity bytes unattested");
-        for name in ["snp_cpu_identity", "snp_chip_identity"] {
+        for name in ["snp_cpu_identity", "snp_chip_identity", "snp_identity_tail"] {
             facts.push(Fact {
                 name: name.into(),
                 value: why.clone(),
@@ -455,20 +507,23 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// POSITIVE-FIRST + golden vectors: the fixture report passes every
-    /// gate, so facts() must carry all three facts with the pinned
+    /// gate, so facts() must carry all four facts with the pinned
     /// Milan-generation values: CPU identity PROVEN (the model number is
-    /// real even when the serial is blanked -- the operator's ask), and
-    /// chip identity NOT PROVEN with the zero-rule reason (the firmware
-    /// emits zeros; a green row naming 64 zero bytes would attest
-    /// nothing). The memory_encryption fact riding PROVEN in the same
-    /// call is the witness that the identity NOT PROVEN is the zero-rule
-    /// and not a broken channel.
+    /// real even when the serial is blanked -- the operator's ask), chip
+    /// identity NOT PROVEN with the zero-rule reason (the firmware emits
+    /// zeros; a green row naming 64 zero bytes would attest nothing), and
+    /// the identity-tail row NOT PROVEN as UNATTRIBUTED (the fixture tail is
+    /// non-zero -- a pre-fold host folded a 32-byte value -- and the core
+    /// carries no signer-key candidate, so it reports the fold state without
+    /// attributing it; never FAILED). The memory_encryption fact riding
+    /// PROVEN in the same call is the witness that the identity NOT PROVENs
+    /// are the zero-rule + unattributed-fold, not a broken channel.
     #[test]
     fn identity_facts_pin_the_milan_fixture() {
         let ev = evidence(REPORT, Some(vlek_der()));
         let v = SnpVerifier::verify_snp_with_vmpl(&ev, &fixture_nonce(), 1).expect("verifies");
         let facts = SnpVerifier.facts(&Verified::Snp(v));
-        assert_eq!(facts.len(), 3, "three facts: {facts:?}");
+        assert_eq!(facts.len(), 4, "four facts: {facts:?}");
         let mem = facts.iter().find(|f| f.name == "memory_encryption").unwrap();
         assert_eq!(mem.status, Status::Proven);
         let cpu = facts.iter().find(|f| f.name == "snp_cpu_identity").unwrap();
@@ -491,6 +546,17 @@ mod tests {
         // a firmware-generation behavior, NOT a mask setting -- the exact
         // surprise this fact exists to surface honestly).
         assert!(chip.value.contains("mask_chipid=0"), "got: {}", chip.value);
+        // The identity-tail row: the fixture tail is non-zero and the core
+        // has no signer-key candidate, so it is UNATTRIBUTED (never FAILED),
+        // and the reason NAMES the measured tail hex (the auditor law).
+        let tail = facts.iter().find(|f| f.name == "snp_identity_tail").unwrap();
+        assert_eq!(tail.status, Status::NotProven, "core scope: never attributes");
+        assert!(
+            tail.value.contains("unattributed")
+                && tail.value.contains("744938841637f5f20d64e252545d333a201aa88a3210e1100bf04d6adab8f106"),
+            "the tail reason must name the measured hex: {}",
+            tail.value
+        );
     }
 
     /// The zero-rule decision fn, pinned at unit level: all-zero is not
@@ -558,13 +624,16 @@ mod tests {
     }
 
     /// TAMPER PARITY (Option A, both sides): a failed report must NOT
-    /// PROVEN ALL THREE owned facts, matching the JS verifier's behavior
-    /// on the same bundle (its identity subs are gated on the report
+    /// PROVEN ALL FOUR owned facts, matching the JS verifier's behavior on
+    /// the same bundle (its identity subs are gated on the report
     /// signature). Before the plural override, the identity facts were
     /// ABSENT on the Rust side while JS rendered them NOT PROVEN -- the
-    /// exact asymmetry the agreement gate kills.
+    /// exact asymmetry the agreement gate kills. The identity-tail row is
+    /// the fourth: on a tampered report its bytes are unattested, so it must
+    /// read NOT PROVEN, never the NotEnabled/Unattributed it would emit on
+    /// the SUCCESS path (which would imply the tampered bytes were attested).
     #[test]
-    fn a_failed_report_not_provens_all_three_facts() {
+    fn a_failed_report_not_provens_all_four_facts() {
         let mut doc = REPORT.to_vec();
         doc[CHIP_ID_OFF] ^= 0x01;
         let ev = evidence(&doc, Some(vlek_der()));
@@ -573,8 +642,13 @@ mod tests {
         let names: Vec<&str> = facts.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["memory_encryption", "snp_cpu_identity", "snp_chip_identity"],
-            "one failure, three honest facts"
+            vec![
+                "memory_encryption",
+                "snp_cpu_identity",
+                "snp_chip_identity",
+                "snp_identity_tail"
+            ],
+            "one failure, four honest facts"
         );
         assert!(facts.iter().all(|f| f.status == Status::NotProven));
         assert!(facts[1].value.contains("identity bytes unattested"));

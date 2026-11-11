@@ -152,16 +152,34 @@ pub fn classify_identity_tail(tail: &[u8; 32], candidates: &[(&'static str, [u8;
     IdentityTail::Unattributed
 }
 
-/// The P-256 point-hash derivations a bundle exposes as identity-tail
+/// The P-256 point-hash derivations a REAL key yields as identity-tail
 /// candidates, pinned as test vectors because the BROWSER must compute the
 /// identical values (the anchor law: one derivation, both verifiers, or the
 /// equality is theater):
 /// - `H(x || y)`: the concatenated raw coordinates
 /// - `H(0x04 || x || y)`: the SEC1 uncompressed point encoding
+///
+/// THE ANTI-MIRROR LAW (the fold adjudication): a production candidate must
+/// be derived from a REAL 32-byte field element, never a fixture stand-in.
+/// A key whose coordinates are not exactly 32 bytes is NOT a real P-256 point
+/// (the golden's `keys.sign` carries 16-byte x/y as a stand-in), and a
+/// candidate derived from a stand-in would be a MIRROR of the fixture, not an
+/// identity witness. So this returns the EMPTY set for any non-32-byte
+/// coordinate pair — a fixture point can never produce a match, and a live
+/// bundle carrying a real point yields exactly the two derivations.
+///
 /// The TPM `Name` is deliberately NOT a candidate: it is 34 bytes
 /// (nameAlg || H(publicArea)) and can never equal a 32-byte tail — naming it
-/// would be a candidate that lies.
+/// would be a candidate that lies. The SPKI PIN is likewise NOT a candidate:
+/// `keys.sign.pub_` is a raw TPMT_PUBLIC, not an X.509 cert, so there is no
+/// SPKI to pin from the bundle (the SPKI pin belongs to the TLS leaf, which
+/// lives only in the envelope, not the Bundle).
 pub fn point_hash_candidates(x: &[u8], y: &[u8]) -> Vec<(&'static str, [u8; 32])> {
+    // A real P-256 field element is exactly 32 bytes. Anything else is a
+    // fixture stand-in and yields NO candidate (anti-mirror law).
+    if x.len() != 32 || y.len() != 32 {
+        return Vec::new();
+    }
     let mut h1 = Sha256::new();
     h1.update(x);
     h1.update(y);
@@ -173,6 +191,41 @@ pub fn point_hash_candidates(x: &[u8], y: &[u8]) -> Vec<(&'static str, [u8; 32])
         ("p256-point-h(x||y)", h1.finalize().into()),
         ("p256-point-h(04||x||y)", h2.finalize().into()),
     ]
+}
+
+/// The auditor-law reason string for an UNATTRIBUTED tail: it NAMES the
+/// measured tail hex AND the derivation forms it failed to match, so an
+/// auditor reading the fact can tell WHICH of the three states' evidence they
+/// are holding without opening the source. `cands` is the candidate set that
+/// was tried (possibly empty for a stand-in key, in which case the string
+/// says so — an empty candidate set is itself honest evidence).
+pub fn identity_tail_reason(
+    tail: &[u8; 32],
+    candidates: &[(&'static str, [u8; 32])],
+) -> String {
+    let hex = hex_str(tail);
+    if candidates.is_empty() {
+        return format!(
+            "identity tail {hex} unattributed: no real-key candidate derivable \
+             (signing key is not a real 32-byte P-256 point)"
+        );
+    }
+    let tried: Vec<String> = candidates
+        .iter()
+        .map(|(name, c)| format!("{name}={}", hex_str(c)))
+        .collect();
+    format!(
+        "identity tail {hex} unattributed: matches none of [{}]",
+        tried.join(", ")
+    )
+}
+
+fn hex_str(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for byte in b {
+        s.push_str(&format!("{byte:02x}"));
+    }
+    s
 }
 
 #[cfg(test)]
