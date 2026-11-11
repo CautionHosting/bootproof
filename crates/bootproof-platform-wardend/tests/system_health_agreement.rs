@@ -168,16 +168,22 @@ fn log_tamper_rejected_by_both() {
 
 /// Pull the wardend evidence out of a fixture's bundle.
 fn wardend_evidence(fixture: &Path) -> bootproof::wire::Evidence {
-    let text = std::fs::read_to_string(fixture)
-        .unwrap_or_else(|e| panic!("read {}: {e}", fixture.display()));
-    let env: serde_json::Value = serde_json::from_str(&text).expect("fixture JSON");
-    let bundle: Bundle =
-        serde_json::from_value(env.get("bundle").cloned().expect("bundle")).expect("bundle");
-    bundle
+    fixture_bundle(fixture)
         .evidence
         .into_iter()
         .find(|e| e.channel == "wardend")
         .expect("the wardend channel")
+}
+
+/// D4 rows-fold: the fixture's FULL evidence vector (all rows). The
+/// digest's own folded_rows() drops the wardend row and sorts the rest, so
+/// this hands the fold the same row set the live verify side derives from
+/// bundle.evidence.
+fn fixture_bundle(fixture: &Path) -> Bundle {
+    let text = std::fs::read_to_string(fixture)
+        .unwrap_or_else(|e| panic!("read {}: {e}", fixture.display()));
+    let env: serde_json::Value = serde_json::from_str(&text).expect("fixture JSON");
+    serde_json::from_value(env.get("bundle").cloned().expect("bundle")).expect("bundle")
 }
 
 /// The cross-implementation parity pin: the JS generator computes the
@@ -456,7 +462,12 @@ fn the_digest_v2_parity_pin_rust_equals_js_and_the_sig_closes_under_it() {
     let nonce = base64_decode(&nonce_b64);
     assert_eq!(nonce.len(), 32, "the fixture nonce must be 32 bytes");
 
-    let d2 = canonical_doc_digest_v2(&doc, nonce.as_slice().try_into().expect("32-byte nonce"));
+    let rows = fixture_bundle(&g).evidence;
+    let d2 = canonical_doc_digest_v2(
+        &doc,
+        nonce.as_slice().try_into().expect("32-byte nonce"),
+        &rows,
+    );
     let hex2: String = d2.iter().map(|b| format!("{b:02x}")).collect();
     let meta: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(fixtures_dir().join("golden.meta.json")).expect("read meta"),

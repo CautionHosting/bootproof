@@ -79,7 +79,13 @@ pub const BOOTPROOF_HTML: &str = include_str!("../assets/dist/bootproof.html");
 /// the wardend.doc_nonce freshness row and wardend.user_data_attested tier
 /// rows ship as static PENDING rows, and the fixture/docsig gates pin both
 /// digest versions). Predecessor: 4210f8a6.
-pub const BOOTPROOF_SHA256: &str = "f54e0b8a4685ee569e99229504aef2c908d73a4de05c68e05e7b6c9f3f6c611b";
+/// On-chain value: 65a71b65 (D4 rows-fold: canonicalDocBytesV2 gains the
+/// bundle's OTHER channels' rows (drop/swap close); the wardend row is
+/// excluded, every other row present-tagged + SHA-256'd + content-sorted
+/// into the v2 walk. The fixture's 68df3fae... v2 vector supersedes
+/// 89b90855... and the empty-rows plugin golden rides c43c4a61. Predecessor:
+/// f54e0b8a).
+pub const BOOTPROOF_SHA256: &str = "65a71b65a2d5b9ccc06a376a157c70098c2a61ae189a389ac4174b4eb8ec61ec";
 
 #[cfg(test)]
 mod tests {

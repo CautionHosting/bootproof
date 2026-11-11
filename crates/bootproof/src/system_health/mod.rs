@@ -19,7 +19,13 @@ pub const SW: &str = include_str!("../assets/system_health/verify.js");
 /// coexist in one verify.js, so this is the FIRST value covering BOTH. It is
 /// DERIVED from the merged bytes (sha256sum of the rebased asset), NOT
 /// hand-copied; never bake any historical value here. On-chain value chain:
-///   7c6616ea THIS (D4/D3 digest v2: the doc signature is judged under the
+///   c866486f THIS (D4 rows-fold: canonicalDocBytesV2 gains the bundle's
+///            OTHER channels' rows (drop/swap close); the wardend row is
+///            excluded, every other row present-tagged + SHA-256'd +
+///            content-sorted into the v2 walk. The fixture's 68df3fae...
+///            v2 vector supersedes 89b90855...; the plugin's empty-rows
+///            golden rides c43c4a61)
+///   7c6616ea (D4/D3 digest v2: the doc signature is judged under the
 ///            nonce-bound digest v2 (v1-valid-only reads FAILED with the
 ///            retired-contract replay named), the wardend.doc_nonce and
 ///            wardend.user_data_attested tier rows ship, and the fixture
@@ -39,7 +45,7 @@ pub const SW: &str = include_str!("../assets/system_health/verify.js");
 /// Footnote: 0013e67f was the footer-only value on the pre-rebase branch tip
 /// 924d33f; the rebase onto 655b202 REWROTE that commit, so 0013e67f never
 /// landed on this chain and is an off-chain orphan, not a predecessor.)
-pub const SW_SHA256: &str = "7c6616ea2a73077aa11974c5813c5b3bad9fddb4c1e72b9fd22f28fadaee94ee";
+pub const SW_SHA256: &str = "c866486ff280e7eda96682d9acc1eac08e522dd2988bf38da161eeb5c3de59a3";
 
 pub mod schema;
 /// The single-file pivot: the canonical bootproof.html (the pending-first

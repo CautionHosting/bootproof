@@ -382,27 +382,103 @@ fn digest_fields(h: &mut Sha256, doc: &WardendDoc) {
 ///     "wardend/platform-doc-digest/v2"   // domain AND version marker
 ///  || nonce32                            // the challenge being answered
 ///  || canonical_fields(doc)              // v1's exact walk ...
-///  || presence-tag(user_data) [...]      // ... PLUS the D3 section (LAST)
+///  || presence-tag(user_data) [...]      // ... PLUS the D3 section ...
+///  || rows_section                       // ... PLUS the D4 rows fold (LAST)
 /// )
 /// ```
 ///
+/// The rows section (`digest_rows_section`) is the D4 fold: the signing box
+/// commits, under its HSM key, to the EXACT set of hardware evidence rows
+/// (snp / tpm2 / future channels) it shipped. Before the fold, dropping or
+/// swapping a bundled hw row on the wire broke NO checked signature (the
+/// slot-link's absence arm is a soft NotProven - the ruling's
+/// absence-that-presents-as-honesty family). After the fold, a post-signature
+/// row drop/swap/addition/reorder changes the digest: FAILED, loud, never a
+/// degrade. The wardend row is EXCLUDED from its own fold (see
+/// `folded_rows`): the wardend doc bytes are already bound by the field
+/// walk, and a row containing its own signature would be self-referential.
+///
 /// This is what the seald admin face MUST sign PER RESPONSE (one HSM
 /// signature over the challenge the client just drew) and what
-/// `WardendVerifier::verify` recomputes with the bundle's nonce. The nonce
-/// input is what closes the A7 replay: a captured response answers a
+/// `WardendVerifier::verify` recomputes with the bundle's nonce and the
+/// bundle's PRESENTED rows (the verifier hashes what it was given - the
+/// recompute from the presented set is exactly what detects the drop). The
+/// nonce input is what closes the A7 replay: a captured response answers a
 /// different challenge, so its signature fails the recompute. The
 /// fail-closed v1<->v2 property is the marker change alone (see
 /// `DOC_DIGEST_PREFIX_V2`). Never fork this function; the browser verifier
 /// mirrors it byte-for-byte (`canonicalDocDigestV2` in
 /// `single_file/bootproof.js` and `system_health/verify.js`, gated by the
 /// doc-digest-v2 parity fixtures).
-pub fn canonical_doc_digest_v2(doc: &WardendDoc, nonce: &[u8; 32]) -> [u8; 32] {
+pub fn canonical_doc_digest_v2(
+    doc: &WardendDoc,
+    nonce: &[u8; 32],
+    evidence: &[bootproof::wire::Evidence],
+) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(DOC_DIGEST_PREFIX_V2);
     h.update(nonce);
     digest_fields(&mut h, doc);
     digest_opt(&mut h, &doc.user_data, digest_user_data);
+    digest_rows_section(&mut h, evidence);
     h.finalize().into()
+}
+
+/// The rows the digest folds: every evidence row EXCEPT the wardend channel
+/// itself (the wardend doc is the signed container - its bytes are bound by
+/// the field walk, and binding its anchors would be self-referential: the
+/// doc_signature anchor is the signature over this digest). Sorted by
+/// (channel name, then the row's canonical bytes) so the fold is a pure
+/// function of the row SET, not the order the bundle happened to ship.
+pub fn folded_rows(evidence: &[bootproof::wire::Evidence]) -> Vec<&bootproof::wire::Evidence> {
+    let mut rows: Vec<&bootproof::wire::Evidence> = evidence
+        .iter()
+        .filter(|ev| ev.channel != WARDEND_CHANNEL)
+        .collect();
+    rows.sort_by(|a, b| {
+        a.channel
+            .as_bytes()
+            .cmp(b.channel.as_bytes())
+            .then_with(|| canonical_row_bytes(a).cmp(&canonical_row_bytes(b)))
+    });
+    rows
+}
+
+/// The canonical byte form of ONE evidence row (the fold's unit): the
+/// channel name, the opaque doc bytes, and the anchors as a sorted
+/// key/value list - all length-prefixed, BE widths, the same walk
+/// discipline as the doc fields. A byte flip anywhere in the row (the doc,
+/// an anchor, a rename) changes these bytes.
+pub fn canonical_row_bytes(ev: &bootproof::wire::Evidence) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    push_bytes(&mut out, ev.channel.as_bytes());
+    push_bytes(&mut out, &ev.doc.0);
+    out.extend((ev.anchors.len() as u32).to_be_bytes());
+    // BTreeMap iterates in key order already (the canonical anchor order).
+    for (k, v) in &ev.anchors {
+        push_bytes(&mut out, k.as_bytes());
+        push_bytes(&mut out, &v.0);
+    }
+    out
+}
+
+fn push_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    out.extend((b.len() as u32).to_be_bytes());
+    out.extend_from_slice(b);
+}
+
+/// The rows fold into the digest walk: `u32 count || per folded row
+/// (presence-tag 1 || the row's SHA-256)`. The presence tag mirrors the
+/// digest_opt discipline (a declared-absent row can later ride tag 0 + the
+/// declared reason; today every enumerated row is present). The count is
+/// part of the fold, so an added row and a swapped row both move the digest.
+fn digest_rows_section(h: &mut Sha256, evidence: &[bootproof::wire::Evidence]) {
+    let rows = folded_rows(evidence);
+    h.update((rows.len() as u32).to_be_bytes());
+    for ev in rows {
+        h.update([1u8]);
+        h.update(Sha256::digest(canonical_row_bytes(ev)));
+    }
 }
 
 /// A state-log entry (the wardend hash-chained log entry: the mechanism is
@@ -536,7 +612,7 @@ impl Verifier for WardendVerifier {
         &self,
         ev: &Evidence,
         nonce: &[u8; 32],
-        _bundle: &bootproof::wire::Bundle,
+        bundle: &bootproof::wire::Bundle,
     ) -> Result<Verified, String> {
         // Decode the wardend evidence doc (the JSON shape). A malformed doc
         // is an Err (fail-closed: a corrupt wardend doc is never silently
@@ -545,16 +621,21 @@ impl Verifier for WardendVerifier {
             .map_err(|e| format!("wardend: malformed evidence doc: {e}"))?;
 
         // 0. The whole-doc signature (I-2: byte-attestation; D4: NOW
-        //    NONCE-BOUND). FIRST, before any structural check: the
-        //    signature covers every byte of the doc AND the challenge the
-        //    client drew for this page view (digest v2), so it is the
-        //    strongest check and the structural checks below are defense
-        //    in depth. The client re-derives the canonical v2 digest from
-        //    the decoded doc + THE BUNDLE NONCE and verifies the HSM
-        //    signature with the SAME anchor key it uses for the state log.
-        //    An absent anchor, a non-64-byte signature, a wrong key, a
-        //    byte-flipped doc, or a REPLAYED response (the signature was
-        //    made over a different nonce) all fail closed.
+        //    NONCE-BOUND AND ROWS-BOUND). FIRST, before any structural
+        //    check: the signature covers every byte of the doc, the
+        //    challenge the client drew for this page view, AND the exact
+        //    set of hardware evidence rows shipped alongside (the D4 fold —
+        //    see `canonical_doc_digest_v2`). The client re-derives the
+        //    canonical v2 digest from the decoded doc + THE BUNDLE NONCE +
+        //    THE BUNDLE'S PRESENTED ROWS and verifies the HSM signature with
+        //    the SAME anchor key it uses for the state log. An absent anchor,
+        //    a non-64-byte signature, a wrong key, a byte-flipped doc, a
+        //    REPLAYED response (a different nonce), OR a post-signature
+        //    hardware-row drop / swap / addition (the fold moves) all fail
+        //    closed — the rows the box did NOT sign for move the digest and
+        //    the signature fails, so the absence-that-presents-as-honesty
+        //    degrade (the slot-link's soft NotProven on a dropped row) can no
+        //    longer survive a signature the box actually produced.
         let public = ev
             .anchors
             .get(ANCHOR_SEALD_PUBLIC)
@@ -565,7 +646,7 @@ impl Verifier for WardendVerifier {
             .anchors
             .get(ANCHOR_DOC_SIGNATURE)
             .ok_or("wardend: the doc signature is missing (unsigned platform doc)")?;
-        let digest = canonical_doc_digest_v2(&doc, nonce);
+        let digest = canonical_doc_digest_v2(&doc, nonce, &bundle.evidence);
         if !signer.verify(&digest, &doc_signature.0) {
             return Err(
                 "wardend: the doc signature does not verify (tampered, unsigned, or REPLAYED platform doc: the signature is bound to this challenge's nonce)"
@@ -895,7 +976,11 @@ mod tests {
         point: &[u8],
         nonce: &[u8; 32],
     ) -> Evidence {
-        let digest = canonical_doc_digest_v2(doc, nonce);
+        // D4: the sign side folds the SAME row set the bundle will carry.
+        // These helpers feed test_bundle(), whose only row is the wardend
+        // channel itself (excluded from the fold), so the folded row set
+        // is EMPTY here -- matching the verify side's folded_rows().
+        let digest = canonical_doc_digest_v2(doc, nonce, &[]);
         let sig = sign_hash(sk, &digest);
         build_wardend_evidence(doc, point, sig).unwrap()
     }
@@ -1316,7 +1401,7 @@ mod tests {
     fn a_flipped_unit_byte_after_signing_fails_verification() {
         let (sk, point) = test_signer_key();
         let mut doc = golden_doc();
-        let sig = sign_hash(&sk, &canonical_doc_digest_v2(&doc, &[0x42u8; 32]));
+        let sig = sign_hash(&sk, &canonical_doc_digest_v2(&doc, &[0x42u8; 32], &[]));
         // Tamper AFTER signing: flip the second unit's up bit.
         doc.units[1].up = true;
         let ev = build_wardend_evidence(&doc, &point, sig).unwrap();
@@ -1334,7 +1419,7 @@ mod tests {
     fn a_flipped_key_acl_byte_after_signing_fails_verification() {
         let (sk, point) = test_signer_key();
         let mut doc = golden_doc();
-        let sig = sign_hash(&sk, &canonical_doc_digest_v2(&doc, &[0x42u8; 32]));
+        let sig = sign_hash(&sk, &canonical_doc_digest_v2(&doc, &[0x42u8; 32], &[]));
         doc.key_acls[0].operations.push("decrypt".into());
         let ev = build_wardend_evidence(&doc, &point, sig).unwrap();
         let bundle = test_bundle(&ev);
@@ -1378,7 +1463,7 @@ mod tests {
     fn a_wrong_length_doc_signature_fails_verification() {
         let (sk, point) = test_signer_key();
         let doc = golden_doc();
-        let mut sig = sign_hash(&sk, &canonical_doc_digest_v2(&doc, &[0x42u8; 32]));
+        let mut sig = sign_hash(&sk, &canonical_doc_digest_v2(&doc, &[0x42u8; 32], &[]));
         sig.truncate(63);
         let ev = build_wardend_evidence(&doc, &point, sig).unwrap();
         let bundle = test_bundle(&ev);
@@ -1398,7 +1483,7 @@ mod tests {
         scalar[31] = 7;
         let attacker = p256::ecdsa::SigningKey::from_slice(&scalar).unwrap();
         let doc = golden_doc();
-        let sig = sign_hash(&attacker, &canonical_doc_digest_v2(&doc, &[0x42u8; 32]));
+        let sig = sign_hash(&attacker, &canonical_doc_digest_v2(&doc, &[0x42u8; 32], &[]));
         let ev = build_wardend_evidence(&doc, &point, sig).unwrap();
         let bundle = test_bundle(&ev);
         assert!(
@@ -1416,7 +1501,7 @@ mod tests {
         // seal_state: None vs Some(malleable + empty state).
         let mut doc = golden_doc();
         doc.seal_state = None;
-        let sig = sign_hash(&sk, &canonical_doc_digest_v2(&doc, &[0x42u8; 32]));
+        let sig = sign_hash(&sk, &canonical_doc_digest_v2(&doc, &[0x42u8; 32], &[]));
         let mut swapped = golden_doc();
         swapped.seal_state = Some(SealState {
             posture: LatchPosture::Malleable,
@@ -1580,12 +1665,12 @@ mod tests {
         // v2 signature checked against a v1-style recompute: FAILS. The
         // digests themselves differ for the same doc + key:
         let d1 = canonical_doc_digest(&doc);
-        let d2 = canonical_doc_digest_v2(&doc, &[0x42u8; 32]);
+        let d2 = canonical_doc_digest_v2(&doc, &[0x42u8; 32], &[]);
         assert_ne!(d1, d2, "the v1 and v2 digests of the same doc must never coincide");
         // And the v2 nonce input actually bites: two nonces, two digests.
         assert_ne!(
             d2,
-            canonical_doc_digest_v2(&doc, &[0x43u8; 32]),
+            canonical_doc_digest_v2(&doc, &[0x43u8; 32], &[]),
             "the nonce must change the digest (it is not decoration)"
         );
     }
@@ -1669,7 +1754,7 @@ mod tests {
         let (sk, point) = test_signer_key();
         let mut doc = golden_doc();
         doc.user_data = Some(test_user_data(true));
-        let sig = sign_hash(&sk, &canonical_doc_digest_v2(&doc, &[0x42u8; 32]));
+        let sig = sign_hash(&sk, &canonical_doc_digest_v2(&doc, &[0x42u8; 32], &[]));
         // Tamper AFTER signing: swap one character of the ssh key line.
         if let Some(ud) = doc.user_data.as_mut() {
             if let Some(t) = ud.text.as_mut() {
@@ -1691,7 +1776,7 @@ mod tests {
     //     re-derives it from production envelope bytes).
     #[test]
     fn the_v2_digest_golden_vector() {
-        let digest = canonical_doc_digest_v2(&golden_doc(), &[0x42u8; 32]);
+        let digest = canonical_doc_digest_v2(&golden_doc(), &[0x42u8; 32], &[]);
         let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex, GOLDEN_V2_DIGEST_HEX,
@@ -1700,9 +1785,136 @@ mod tests {
     }
 
     /// The pinned v2 golden digest (canonical_doc_digest_v2 over
-    /// golden_doc() with the test nonce [0x42;32]; pinned at D4 landing:
-    /// computed once, then the JS face must reproduce it).
-    const GOLDEN_V2_DIGEST_HEX: &str = "afb1ff5489e921b805b990b209f68d18e9554858e5e76d87472fed90f9f9d438";
+    /// golden_doc() with the test nonce [0x42;32] and an EMPTY row set
+    /// (the wardend-only bundle's fold). Re-pinned at D4 rows landing: the
+    /// empty-row-set fold (count 0) supersedes the pre-rows vector
+    /// afb1ff5489e921b805b990b209f68d18e9554858e5e76d87472fed90f9f9d438.
+    /// The JS face + the fixture parity test key on this.
+    const GOLDEN_V2_DIGEST_HEX: &str = "c43c4a6122eec81c87fe3db87a38af181666ce2f49b3b009f7eb3b9e5baeb3e6";
+
+    // (za) D4 ROWS-FOLD DIFFERENTIALS. The whole point of folding the
+    //     other channels' rows into the wardend signature is that a bundle
+    //     cannot add or drop a row out from under the wardend signature.
+    //     These four asserts are the security property, not decoration.
+    #[test]
+    fn the_rows_fold_binds_the_other_channels_rows() {
+        let doc = golden_doc();
+        let nonce = &[0x42u8; 32];
+        let row = |chan: &str, body: &[u8], anchors: &[(&str, &[u8])]| -> bootproof::wire::Evidence {
+            let mut m = std::collections::BTreeMap::new();
+            for (k, v) in anchors {
+                m.insert((*k).to_string(), B64::new((*v).to_vec()));
+            }
+            bootproof::wire::Evidence {
+                channel: chan.to_string(),
+                doc: B64::new(body.to_vec()),
+                anchors: m,
+            }
+        };
+        let snp = row("snp", b"snp-report-A", &[("certificate", b"ark-der")]);
+
+        // (1) ORDER INVARIANCE: the fold is by CONTENT, not by bundle order.
+        //     Two permuted presentations of the SAME row set agree.
+        let tpm = row("tpm2", b"tpm-quote-B", &[("ek_cert", b"ek-der")]);
+        let d_ab = canonical_doc_digest_v2(&doc, nonce, &[snp.clone(), tpm.clone()]);
+        let d_ba = canonical_doc_digest_v2(&doc, nonce, &[tpm.clone(), snp.clone()]);
+        assert_eq!(d_ab, d_ba, "the rows fold must be order-invariant (it sorts)");
+
+        // (2) ROWS DIFFERENTIAL: an added row changes the digest. A bundle
+        //     that drops this row recomputes a different digest and the
+        //     wardend signature fails -> fail-closed.
+        let d_none = canonical_doc_digest_v2(&doc, nonce, &[]);
+        let d_one = canonical_doc_digest_v2(&doc, nonce, &[snp.clone()]);
+        assert_ne!(d_none, d_one, "a dropped/added row MUST change the digest (no drop window)");
+
+        // (3) DOC-BYTE DIFFERENTIAL: a swapped doc (a different snp report)
+        //     changes the digest even with the same channel name + anchors.
+        let snp_swap = row("snp", b"snp-report-A-tampered", &[("certificate", b"ark-der")]);
+        assert_ne!(
+            canonical_doc_digest_v2(&doc, nonce, &[snp.clone()]),
+            canonical_doc_digest_v2(&doc, nonce, &[snp_swap]),
+            "a swapped row doc MUST change the digest"
+        );
+
+        // (4) ANCHOR DIFFERENTIAL: the anchors are IN the canonical row
+        //     bytes (swapping the cert for a different validly-chained cert
+        //     is the D4 swap this closes). A different anchor -> different
+        //     digest.
+        let snp_anchored = row("snp", b"snp-report-A", &[("certificate", b"ARK-der")]);
+        assert_ne!(
+            canonical_doc_digest_v2(&doc, nonce, &[snp.clone()]),
+            canonical_doc_digest_v2(&doc, nonce, &[snp_anchored]),
+            "a swapped anchor MUST change the digest (the anchor-swap close)"
+        );
+
+        // (5) CHANNEL-NAME BINDING: two rows with identical doc+anchor bytes
+        //     but different channel names differ (the channel name is in the
+        //     canonical bytes; a channel cannot masquerade as another).
+        let tpm_same_bytes = row("tpm2", b"snp-report-A", &[("certificate", b"ark-der")]);
+        assert_ne!(
+            canonical_doc_digest_v2(&doc, nonce, &[snp.clone()]),
+            canonical_doc_digest_v2(&doc, nonce, &[tpm_same_bytes]),
+            "the channel name MUST be bound into the row digest"
+        );
+
+        // (6) WARDEND ROW EXCLUDED: folding the wardend row itself must be
+        //     IDENTICAL to folding an empty set (the self-reference rule;
+        //     the wardend row is dropped before the fold).
+        let wardend_row = row("wardend", b"whatever-the-wardend-doc-is", &[]);
+        assert_eq!(
+            canonical_doc_digest_v2(&doc, nonce, &[wardend_row.clone()]),
+            d_none,
+            "the wardend row is EXCLUDED from its own fold (no self-reference)"
+        );
+    }
+
+    // (zb) END-TO-END: a verify-side row DROP (the bundle the verifier
+    //     receives is missing a row that was present at signing time) fails
+    //     the wardend signature. This is the drop window v2-c-rows closes,
+    //     witnessed through the real verifier, not just the digest helper.
+    #[test]
+    fn a_dropped_row_after_signing_fails_the_wardend_signature() {
+        let (sk, point) = test_signer_key();
+        let doc = golden_doc();
+        // Sign WITH a snp row folded in (the row is in the bundle at sign
+        // time). We do not need to verify the snp channel -- the wardend
+        // verifier only folds its bytes.
+        let snp_row = bootproof::wire::Evidence {
+            channel: "snp".into(),
+            doc: B64::new(b"a-live-snp-report".to_vec()),
+            anchors: std::collections::BTreeMap::new(),
+        };
+        let digest = canonical_doc_digest_v2(&doc, &[0x42u8; 32], &[snp_row.clone()]);
+        let sig = sign_hash(&sk, &digest);
+        let ev = build_wardend_evidence(&doc, &point, sig).unwrap();
+
+        // Bundle PRESENTS the snp row -> verifies (the fold matches).
+        let mut ok_bundle = test_bundle(&ev);
+        ok_bundle.evidence.push(snp_row.clone());
+        assert!(
+            WardendVerifier.verify(&ev, &[0x42u8; 32], &ok_bundle).is_ok(),
+            "a bundle presenting the signed row set must verify"
+        );
+
+        // Bundle DROPS the snp row -> the fold differs -> signature fails.
+        let drop_bundle = test_bundle(&ev); // wardend row only (snp dropped)
+        assert!(
+            WardendVerifier.verify(&ev, &[0x42u8; 32], &drop_bundle).is_err(),
+            "a row dropped after signing MUST fail the wardend signature (no drop window)"
+        );
+
+        // Bundle SWAPS the snp row's doc -> the fold differs -> fails.
+        let mut swap_bundle = test_bundle(&ev);
+        swap_bundle.evidence.push(bootproof::wire::Evidence {
+            channel: "snp".into(),
+            doc: B64::new(b"a-DIFFERENT-snp-report".to_vec()),
+            anchors: std::collections::BTreeMap::new(),
+        });
+        assert!(
+            WardendVerifier.verify(&ev, &[0x42u8; 32], &swap_bundle).is_err(),
+            "a row swapped after signing MUST fail the wardend signature (the swap close)"
+        );
+    }
 
     // (z) v1's canonicalization is FROZEN by this same battery: the v1
     //     golden vector above still pins the old digest, and a doc with
@@ -1723,8 +1935,8 @@ mod tests {
         let mut b = golden_doc();
         b.user_data = Some(test_user_data(false));
         assert_ne!(
-            canonical_doc_digest_v2(&a, &[0x42u8; 32]),
-            canonical_doc_digest_v2(&b, &[0x42u8; 32]),
+            canonical_doc_digest_v2(&a, &[0x42u8; 32], &[]),
+            canonical_doc_digest_v2(&b, &[0x42u8; 32], &[]),
             "an added commitment section must change the v2 digest"
         );
         // (v1 note: canonical_doc_digest(a) == canonical_doc_digest(b)

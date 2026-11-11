@@ -1130,12 +1130,75 @@ function canonicalFieldBytes(doc, withUserData) {
 function canonicalDocBytes(doc) {
   return concat(new TextEncoder().encode(DOC_DIGEST_PREFIX), canonicalFieldBytes(doc, false));
 }
+// D4 rows-fold (the browser mirror of the Rust folded_rows /
+// canonical_row_bytes / digest_rows_section). The wardend doc's signature
+// binds the OTHER channels' rows: a bundle that drops or swaps a row under
+// the wardend signature recomputes a different digest and fails closed (the
+// drop/swap close). The wardend row is EXCLUDED (self-reference); every
+// other row is present-tagged, hashed, and folded in a content-sorted,
+// order-invariant walk. Rows arrive in the WIRE shape ({channel, doc: b64,
+// anchors: {k: b64}}); the fold measures the RAW bytes (the same bytes the
+// Rust walk hashes via ev.doc.0 / anchor.0). A byte flip anywhere in a row
+// (the doc, an anchor, a rename) moves the fold, hence the wardend digest.
+function pushBytes(b) { return concat(u32be(b.length), b); }
+// A raw byte-lexicographic compare (Buffer.compare's cousin): the tiebreak
+// in the row sort and the BTreeMap anchor-key order.
+function byteCompare(x, y) {
+  const n = Math.min(x.length, y.length);
+  for (let i = 0; i < n; i++) { if (x[i] !== y[i]) return x[i] - y[i]; }
+  return x.length - y.length;
+}
+// BTreeMap<String> walks keys in UTF-8 BYTE order; JS Object.keys is
+// insertion order, so sort by byte to match the Rust anchor walk.
+function anchorKeySort(a) {
+  return Object.keys(a).sort((x, y) => byteCompare(new TextEncoder().encode(x), new TextEncoder().encode(y)));
+}
+// The canonical bytes of ONE evidence row (the fold's unit): the channel
+// name, the opaque doc bytes, and the anchors as a sorted key/value list,
+// all length-prefixed. A null/undecodable row byte throws (fail-closed:
+// silently skipping a row is the exact attack this fold closes).
+function canonicalRowBytesOf(ev) {
+  const chan = new TextEncoder().encode(ev.channel);
+  const doc = wireBytes(ev.doc);
+  if (doc === null) throw new Error("rows-fold: undecodable row doc bytes");
+  const a = ev.anchors || {};
+  const keys = anchorKeySort(a);
+  const parts = [pushBytes(chan), pushBytes(doc), u32be(keys.length)];
+  for (const k of keys) {
+    const kb = new TextEncoder().encode(k);
+    const vb = wireBytes(a[k]);
+    if (vb === null) throw new Error("rows-fold: undecodable anchor bytes");
+    parts.push(pushBytes(kb), pushBytes(vb));
+  }
+  return concat.apply(null, parts);
+}
+// The rows fold: u32 count || per folded row (presence-tag 1 || SHA-256 of
+// the row's canonical bytes). ASYNC: each row's digest is a WebCrypto
+// SHA-256. The wardend row is dropped before the fold (no self-reference).
+async function digestRowsSection(evidence) {
+  const rows = (evidence || []).filter((e) => e && e.channel !== "wardend");
+  const keyed = rows.map((r) => ({ ch: new TextEncoder().encode(r.channel), rb: canonicalRowBytesOf(r) }));
+  keyed.sort((x, y) => {
+    const c = byteCompare(x.ch, y.ch);
+    return c !== 0 ? c : byteCompare(x.rb, y.rb);
+  });
+  const parts = [u32be(keyed.length)];
+  for (const k of keyed) {
+    const rh = new Uint8Array(await crypto.subtle.digest("SHA-256", k.rb));
+    parts.push(new Uint8Array([1]), rh);
+  }
+  return concat.apply(null, parts);
+}
 // The v2 canonical bytes: v2 marker || the 32-byte challenge || the fields
-// (including the user-data section, which v2 carries and v1 never saw).
-// nonce32 is the bundle's nonce bytes (the challenge THIS view drew; the
-// envelope echo and bundle.nonce are already gated equal to it).
-function canonicalDocBytesV2(doc, nonce32) {
-  return concat(new TextEncoder().encode(DOC_DIGEST_PREFIX_V2), nonce32, canonicalFieldBytes(doc, true));
+// (including the user-data section) || the rows fold. nonce32 is the
+// bundle's nonce bytes (the challenge THIS view drew; the envelope echo and
+// bundle.nonce are already gated equal to it). evidence is the bundle's
+// full row list (the wardend row is dropped inside digestRowsSection).
+// ASYNC: the fold hashes each row with WebCrypto.
+async function canonicalDocBytesV2(doc, nonce32, evidence) {
+  return concat(
+    new TextEncoder().encode(DOC_DIGEST_PREFIX_V2), nonce32,
+    canonicalFieldBytes(doc, true), await digestRowsSection(evidence));
 }
 // The hex canonical digest (SHA-256 of the canonical bytes). Exposed on the
 // test seam so the parity pin is driven by THIS mirror against the committed
@@ -1143,8 +1206,9 @@ function canonicalDocBytesV2(doc, nonce32) {
 function canonicalDocDigestHex(doc) {
   return crypto.subtle.digest("SHA-256", canonicalDocBytes(doc)).then(bufToHex);
 }
-function canonicalDocDigestHexV2(doc, nonce32) {
-  return crypto.subtle.digest("SHA-256", canonicalDocBytesV2(doc, nonce32)).then(bufToHex);
+function canonicalDocDigestHexV2(doc, nonce32, evidence) {
+  return canonicalDocBytesV2(doc, nonce32, evidence)
+    .then((bytes) => crypto.subtle.digest("SHA-256", bytes)).then(bufToHex);
 }
 
 // -----------------------------------------------------------------------------
@@ -1180,7 +1244,11 @@ async function checkStateLog(env) {
     const bundleNonce = wireBytes((env.bundle || {}).nonce);
     doc.__docNonce32 = (bundleNonce && bundleNonce.length === 32) ? bundleNonce : null;
     if (doc.__docNonce32) {
-      doc.__docDigestV2 = canonicalDocBytesV2(parseDocTokens(text), doc.__docNonce32);
+      // D4: the v2 digest ALSO binds the bundle's other channels' rows
+      // (the drop/swap close). The fold reads the SAME bundle.evidence the
+      // snp/tpm2 verifiers read, so a row presented to the browser is the
+      // row folded into the wardend signature it is shown beside.
+      doc.__docDigestV2 = await canonicalDocBytesV2(parseDocTokens(text), doc.__docNonce32, (env.bundle || {}).evidence);
     }
   } catch (e) {
     return finishFact("wardend_state_chain", [sub("wardend.evidence", FAILED, "the wardend evidence doc is not decodable JSON: " + e)], "");

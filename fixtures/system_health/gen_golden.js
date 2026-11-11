@@ -470,13 +470,47 @@ const canonicalFieldBytes = (doc, withUserData) => Buffer.concat([
     dOpt(u.text, (t) => dBytes(Buffer.from(t, 'utf8'))),
   ])) : Buffer.alloc(0),
 ]);
+// D4 rows-fold (the batch that closes the drop/swap window): the wardend
+// doc's signature binds the OTHER channels' rows. Mirror of the Rust
+// folded_rows / canonical_row_bytes / digest_rows_section. The wardend row
+// is EXCLUDED (self-reference); every other row is present-tagged and
+// hashed, folded in a content-sorted, order-invariant walk. pushBytes ==
+// the Rust push_bytes (u32 BE length || bytes).
+const pushBytes = (b) => Buffer.concat([u32(b.length), Buffer.from(b)]);
+// BTreeMap<String> iterates by UTF-8 BYTE order of the key; JS Object.keys
+// is insertion order, so sort by byte to match the Rust anchor walk.
+const anchorKeySort = (a) => Object.keys(a).sort((x, y) => Buffer.from(x, 'utf8').compare(Buffer.from(y, 'utf8')));
+// The canonical bytes of ONE evidence row (the fold's unit). doc/anchors
+// arrive as b64 strings (the wire shape) and decode to raw bytes here, the
+// same raw bytes Rust folds via ev.doc.0 / anchor.0.
+const canonicalRowBytes = (ev) => {
+  const doc = Buffer.from(ev.doc, 'base64');
+  const a = ev.anchors || {};
+  const keys = anchorKeySort(a);
+  const parts = [pushBytes(Buffer.from(ev.channel, 'utf8')), pushBytes(doc), u32(keys.length)];
+  for (const k of keys) parts.push(pushBytes(Buffer.from(k, 'utf8')), pushBytes(Buffer.from(a[k], 'base64')));
+  return Buffer.concat(parts);
+};
+// The rows fold: u32 count || per folded row (presence-tag 1 || SHA-256 of
+// the row's canonical bytes). The wardend row is dropped before the fold.
+const digestRowsSection = (evidence) => {
+  const rows = (evidence || []).filter((e) => e.channel !== 'wardend');
+  rows.sort((x, y) => {
+    const c = Buffer.from(x.channel, 'utf8').compare(Buffer.from(y.channel, 'utf8'));
+    return c !== 0 ? c : canonicalRowBytes(x).compare(canonicalRowBytes(y));
+  });
+  const parts = [u32(rows.length)];
+  for (const r of rows) parts.push(Buffer.from([1]), sha256(canonicalRowBytes(r)));
+  return Buffer.concat(parts);
+};
 const canonicalDocDigest = (doc) => sha256(Buffer.concat([DOC_DIGEST_PREFIX, canonicalFieldBytes(doc, false)]));
 // D4: digest v2 = the v2 marker || the 32-byte challenge the response
-// answers || the fields INCLUDING the user-data section. THIS is what
-// the fixture's HSM signs now (one signature over the challenge the
-// client drew: the A7 replay closure), and what both verifiers
-// recompute with the bundle's nonce.
-const canonicalDocDigestV2 = (doc, nonce32) => sha256(Buffer.concat([DOC_DIGEST_PREFIX_V2, Buffer.from(nonce32), canonicalFieldBytes(doc, true)]));
+// answers || the fields INCLUDING the user-data section || the rows fold.
+// THIS is what the fixture's HSM signs (one signature over the challenge AND
+// the other channels' rows: the A7 replay close plus the D4 drop/swap
+// close), and what both verifiers recompute with the bundle's nonce and
+// evidence.
+const canonicalDocDigestV2 = (doc, nonce32, evidence) => sha256(Buffer.concat([DOC_DIGEST_PREFIX_V2, Buffer.from(nonce32), canonicalFieldBytes(doc, true), digestRowsSection(evidence)]));
 
 // The doc's JSON: the serde shape. A BigInt handle must serialize as a
 // BARE NUMBER TOKEN (serde_json writes u64 as a bare integer; a quoted
@@ -534,8 +568,11 @@ const WARDEND_DOC = jSerde(wardendDocObj);
 // unchanged and stays as regression evidence that v1 canonicalization
 // did not drift while v2 was added.
 const WARDEND_DOC_DIGEST_V1 = canonicalDocDigest(wardendDocObj);
-const WARDEND_DOC_DIGEST = canonicalDocDigestV2(wardendDocObj, NONCE);
-const WARDEND_DOC_SIG = signDetPrehashed(HSM.pub, HSM.d, WARDEND_DOC_DIGEST);
+// D4 rows-fold: the v2 digest binds the OTHER channels' rows, so the sig
+// is created BELOW, after the snp/tpm2 row bytes exist (see foldRows). The
+// sig rides the evidence ANCHORS, never the doc bytes, so folding TPM_DOC
+// (which depends on WARDEND_DOC bytes, not the sig) into the sig is not
+// circular.
 // The parity pin. This is the digest of THE FIXTURE's wardend doc (not
 // the plugin crate's internal golden-doc vector, which is a different
 // document). Two independent witnesses pin this one value: (1) the JS
@@ -622,15 +659,37 @@ const ASVK_DER = pemDer(fs.readFileSync(path.join(DATA, 'asvk-sev-vlek-milan.pem
 const ARK_DER = pemDer(fs.readFileSync(path.join(DATA, 'ark-milan.pem')));
 const EK_BLOB = Buffer.from('bootproof golden fixture EK-cert blob (presence only: neither verifier checks the NitroTPM EK chain in this build; the shared verdict is DEGRADED)');
 
+// D4 rows-fold: build the snp + tpm2 rows FIRST (these are the rows the
+// wardend signature binds), sign the wardend doc over them, then assemble
+// the bundle from THE SAME row objects so the fold input and the presented
+// rows are byte-identical by construction (the parity the drop/swap close
+// rests on). The wardend row is excluded from its own fold.
+const snpRow = { channel: 'snp', doc: b64(REPORT), anchors: { vlek: b64(VLEK_DER), asvk: b64(ASVK_DER), ark: b64(ARK_DER) } };
+const tpmRow = { channel: 'tpm2', doc: b64(TPM_DOC), anchors: { ek_cert: b64(EK_BLOB) } };
+const foldRows = [snpRow, tpmRow];
+const WARDEND_DOC_DIGEST = canonicalDocDigestV2(wardendDocObj, NONCE, foldRows);
+const WARDEND_DOC_SIG = signDetPrehashed(HSM.pub, HSM.d, WARDEND_DOC_DIGEST);
+// D4 rows-fold parity pin (the cross-implementation witness for the rows
+// fold): the JS canonicalDocDigestV2 over the fixture doc + nonce + rows
+// MUST equal the Rust canonical_doc_digest_v2 recomputed in the plugin
+// integration test. 68df3fae... supersedes the pre-rows v2 vector
+// 89b908551ca4c85ed0166130c0ff2b0427b68140d5fafd1f8fb1557608dedfd8 (the
+// rows fold appended to the v2 walk moves the digest). A JS/Rust fold drift
+// throws HERE at generation, before any fixture is written.
+const FIXTURE_DOC_DIGEST_V2_HEX = "68df3fae3b466f8b189bb059b1db0dc6c9715eacce8c44ff515572600f163023";
+if (hexOf(WARDEND_DOC_DIGEST) !== FIXTURE_DOC_DIGEST_V2_HEX) {
+  throw new Error(
+    'digest v2 rows-fold parity FAILED: the JS canonicalDocDigestV2 drifted from the pinned Rust vector\n' +
+    '  js:    ' + hexOf(WARDEND_DOC_DIGEST) + '\n  pinned: ' + FIXTURE_DOC_DIGEST_V2_HEX,
+  );
+}
+const wardendRow = { channel: 'wardend', doc: b64(WARDEND_DOC), anchors: { hsm_public: b64(HSM.point), doc_signature: b64(WARDEND_DOC_SIG) } };
+
 const bundle = {
   v: 1,
   nonce: b64(NONCE),
   node: { id: 'i-0golden0000000000', platform: 'aws-snp' },
-  evidence: [
-    { channel: 'snp', doc: b64(REPORT), anchors: { vlek: b64(VLEK_DER), asvk: b64(ASVK_DER), ark: b64(ARK_DER) } },
-    { channel: 'tpm2', doc: b64(TPM_DOC), anchors: { ek_cert: b64(EK_BLOB) } },
-    { channel: 'wardend', doc: b64(WARDEND_DOC), anchors: { hsm_public: b64(HSM.point), doc_signature: b64(WARDEND_DOC_SIG) } },
-  ],
+  evidence: [snpRow, tpmRow, wardendRow],
   keys: { sign: { pub_: b64(signPublic), curve: 'P-256', scheme: 'ecdsa-sha256', pcr_policy: Array.from(PCR_INDICES) } },
 };
 const HSM_PIN = hexOf(sha256(Buffer.concat([P256_SPKI_PREFIX, HSM.point])));
