@@ -85,7 +85,15 @@ pub const BOOTPROOF_HTML: &str = include_str!("../assets/dist/bootproof.html");
 /// into the v2 walk. The fixture's 68df3fae... v2 vector supersedes
 /// 89b90855... and the empty-rows plugin golden rides c43c4a61. Predecessor:
 /// f54e0b8a).
-pub const BOOTPROOF_SHA256: &str = "65a71b65a2d5b9ccc06a376a157c70098c2a61ae189a389ac4174b4eb8ec61ec";
+/// On-chain value: bfbb6d14 (D6 census: canonicalDocBytesV2 gains the HSM
+/// key-registry census (v2-only, AFTER user_data, BEFORE the rows fold) —
+/// the crypto-region block identical to the service-worker verify.js, so the
+/// crypto-region byte-parity test stays green. The fold moves the fixture v2
+/// vector 68df3fae -> 36320364 and the plugin empty-rows golden c43c4a61 ->
+/// 554a8a18; v1 stays byte-identical (the census entered v2 ONLY). Regenerated
+/// by fixtures/single_file/combiner.js, measured by the combiner (121997
+/// bytes). Predecessor: 65a71b65).
+pub const BOOTPROOF_SHA256: &str = "bfbb6d1492df09beab36876bbe071c89b08a5785500c8a36031c2ccb11ba8259";
 
 #[cfg(test)]
 mod tests {

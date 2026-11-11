@@ -152,6 +152,59 @@ pub struct KeyAcl {
     pub pcr_policy: Vec<u32>,
 }
 
+/// D6 (bake-11 step 1c): one row of the HSM key-registry census. The page
+/// must show WHAT KEYS the HSM holds and WHAT THEY'RE FOR, not merely that
+/// the HSM is present. This is the registry read folded into the SIGNED doc
+/// (TIER 2: daemon-attested, rides the doc signature + the D4 rows fold —
+/// a tampered registry is a FAILED, never a silent degrade).
+///
+/// Metadata-only by construction (the `hsm_keys` discipline): it NEVER
+/// carries key material. `name` / `key_id` are routing metadata, `proto` is
+/// the declared protocol (the use-case), `operations` is derived from
+/// `proto`. A public key is deliberately NOT carried: deriving it requires
+/// peeking the sealed material, and peeking risks burning the store's
+/// once-per-boot read gate (which would lock a real unit out of its own key,
+/// and the page must cost the fleet NOTHING). The registry's identity is
+/// already bound by the doc signature over these rows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyRegistryRow {
+    /// The key name (`secrets=<name>`, `unit:name`).
+    pub name: String,
+    /// The key is currently sealed (its key is available this boot).
+    #[serde(default)]
+    pub sealed: bool,
+    /// The key is PCR-gated (sealed under the persist key).
+    #[serde(default)]
+    pub pcr_gated: bool,
+    /// Which key seals it (`persist` / `disk` / ...), absent when unsealed
+    /// or unroutable.
+    #[serde(default)]
+    pub key_id: Option<String>,
+    /// The declared protocol / use-case (`pkcs11` / `pgp` / `webauthn`).
+    /// ABSENT means the secret exists in the store but NO unit ACL declares
+    /// it: an honest "unmanaged secret", itself a security fact (a key with
+    /// no declared use is a key nobody is accounting for).
+    #[serde(default)]
+    pub proto: Option<String>,
+    /// The operations the protocol permits (derived from `proto`; empty when
+    /// `proto` is None — an unmanaged secret has no declared operations).
+    #[serde(default)]
+    pub operations: Vec<String>,
+    /// The public half as lowercase hex (the 65-byte uncompressed P-256
+    /// point, `0x04 || X || Y`). PRESENT = the daemon attests this exact key
+    /// is under this name; an out-of-band checker can match the pin. ABSENT
+    /// is honest: a persist-gated key whose key is locked THIS boot cannot
+    /// be peeked, so its public is unknown until the gate passes (sealed +
+    /// public both false/None together). This is the ONLY public-key surface:
+    /// the PRIVATE scalar is derived to a local temporary, the point taken
+    /// from it, and the temporary dropped — no material ever enters the row
+    /// or crosses the wire. `peek` is `&self` + side-effect-free (it never
+    /// touches the once-per-boot `served` set), so this read is repeatable
+    /// per poll and cannot lock a unit out of its own key.
+    #[serde(default)]
+    pub public: Option<String>,
+}
+
 /// The retry counters (the seald's / warden's retry budgets).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetryCounters {
@@ -208,6 +261,13 @@ pub struct WardendDoc {
     /// binds the field when present.
     #[serde(default)]
     pub user_data: Option<UserDataSection>,
+    /// D6 (bake-11): the HSM key-registry census (one row per named secret:
+    /// name / slot / sealed / PCR-gate / declared use-case / operations).
+    /// `serde(default)`: a pre-census doc decodes with an empty list. The
+    /// census is folded into the v2 digest (len-prefixed, like `units` /
+    /// `key_acls`), so a tampered registry is a FAILED, never a degrade.
+    #[serde(default)]
+    pub key_registry: Vec<KeyRegistryRow>,
 }
 
 // ---------------------------------------------------------------------------
@@ -316,6 +376,41 @@ fn digest_retry(h: &mut Sha256, r: &RetryCounters) {
     digest_u64(h, r.watchdog_reboot_guard as u64);
 }
 
+/// D6 (bake-11): the canonical bytes of one HSM key-registry census row.
+/// Fixed field order; a 1-byte presence tag per Optional (`key_id`, `proto`)
+/// so None != Some(""); booleans as a single byte; `operations` len-prefixed
+/// (so [] != [""]). The row carries NO key material (see KeyRegistryRow).
+fn digest_key_registry_row(h: &mut Sha256, r: &KeyRegistryRow) {
+    digest_bytes(h, r.name.as_bytes());
+    h.update([r.sealed as u8]);
+    h.update([r.pcr_gated as u8]);
+    match &r.key_id {
+        None => h.update([0u8]),
+        Some(s) => {
+            h.update([1u8]);
+            digest_bytes(h, s.as_bytes());
+        }
+    }
+    match &r.proto {
+        None => h.update([0u8]),
+        Some(s) => {
+            h.update([1u8]);
+            digest_bytes(h, s.as_bytes());
+        }
+    }
+    h.update((r.operations.len() as u32).to_be_bytes());
+    for op in &r.operations {
+        digest_bytes(h, op.as_bytes());
+    }
+    match &r.public {
+        None => h.update([0u8]),
+        Some(s) => {
+            h.update([1u8]);
+            digest_bytes(h, s.as_bytes());
+        }
+    }
+}
+
 /// D3: the canonical bytes of the user-data section: the commitment hash
 /// as 32 RAW bytes (fixed width, no length prefix), then the plaintext
 /// under its OWN presence tag as len-prefixed bytes (None != Some(empty),
@@ -420,6 +515,15 @@ pub fn canonical_doc_digest_v2(
     h.update(nonce);
     digest_fields(&mut h, doc);
     digest_opt(&mut h, &doc.user_data, digest_user_data);
+    // D6 (bake-11): the HSM key-registry census, folded AFTER the shared v1
+    // field walk (so a pre-census doc keeps v1 byte-identity exactly like
+    // user_data) and BEFORE the rows section. Len-prefixed like `units` /
+    // `key_acls`: a tampered registry (a dropped/added/edited row) changes
+    // the digest: FAILED, never a degrade.
+    h.update((doc.key_registry.len() as u32).to_be_bytes());
+    for r in &doc.key_registry {
+        digest_key_registry_row(&mut h, r);
+    }
     digest_rows_section(&mut h, evidence);
     h.finalize().into()
 }
@@ -1076,6 +1180,7 @@ mod tests {
             key_acls: Vec::new(),
             retry: None,
             user_data: None,
+            key_registry: Vec::new(),
         };
         let json = serde_json::to_vec(&doc).unwrap();
         let decoded: WardendDoc = serde_json::from_slice(&json).unwrap();
@@ -1099,6 +1204,7 @@ mod tests {
             key_acls: Vec::new(),
             retry: None,
             user_data: None,
+            key_registry: Vec::new(),
         };
         let ev = build_signed(&doc, &sk, &point);
         assert_eq!(ev.channel, WARDEND_CHANNEL);
@@ -1160,6 +1266,7 @@ mod tests {
             key_acls: Vec::new(),
             retry: None,
             user_data: None,
+            key_registry: Vec::new(),
         };
         let ev = build_signed(&doc, &sk, &point);
         let verifier = WardendVerifier;
@@ -1219,6 +1326,7 @@ mod tests {
             key_acls: Vec::new(),
             retry: None,
             user_data: None,
+            key_registry: Vec::new(),
         };
         // Sign the TAMPERED doc (so the doc signature itself is valid):
         // the chain check must be what rejects it (defense in depth —
@@ -1250,6 +1358,7 @@ mod tests {
             key_acls: Vec::new(),
             retry: None,
             user_data: None,
+            key_registry: Vec::new(),
         };
         let ev = build_signed(&doc, &sk, &point);
         let verifier = WardendVerifier;
@@ -1279,6 +1388,7 @@ mod tests {
             key_acls: Vec::new(),
             retry: None,
             user_data: None,
+            key_registry: Vec::new(),
         };
         let ev = build_signed(&doc, &sk, &point);
         let verifier = WardendVerifier;
@@ -1351,6 +1461,40 @@ mod tests {
                 operations: vec!["sign".into(), "unseal".into()],
                 pcr_policy: vec![4, 7, 9],
             }],
+            key_registry: vec![
+                // A fully-populated managed key (a persist-gated pkcs11
+                // signing key): every Optional arm present (key_id / proto /
+                // public all Some), non-empty operations, both booleans true.
+                KeyRegistryRow {
+                    name: "seald:sign".into(),
+                    sealed: true,
+                    pcr_gated: true,
+                    key_id: Some("persist".into()),
+                    proto: Some("pkcs11".into()),
+                    operations: vec![
+                        "sign".into(),
+                        "decrypt".into(),
+                        "generate_keypair".into(),
+                    ],
+                    // A fixture public point (0x04 || X || Y, hex); the fold
+                    // treats it as opaque bytes (a T2 daemon-attested value,
+                    // never re-derived by the verifier).
+                    public: Some(format!("04{}{}", "11".repeat(32), "22".repeat(32))),
+                },
+                // An UNMANAGED secret (a name in the store no unit ACL
+                // declares): every Optional arm absent (None), empty
+                // operations, both booleans false — the honest "a key with
+                // no declared use" row, exercising the None arms.
+                KeyRegistryRow {
+                    name: "orphan:secret".into(),
+                    sealed: false,
+                    pcr_gated: false,
+                    key_id: None,
+                    proto: None,
+                    operations: Vec::new(),
+                    public: None,
+                },
+            ],
             retry: Some(RetryCounters {
                 warden_respawn: 3,
                 watchdog_reboot_guard: 1,
@@ -1786,11 +1930,13 @@ mod tests {
 
     /// The pinned v2 golden digest (canonical_doc_digest_v2 over
     /// golden_doc() with the test nonce [0x42;32] and an EMPTY row set
-    /// (the wardend-only bundle's fold). Re-pinned at D4 rows landing: the
-    /// empty-row-set fold (count 0) supersedes the pre-rows vector
-    /// afb1ff5489e921b805b990b209f68d18e9554858e5e76d87472fed90f9f9d438.
-    /// The JS face + the fixture parity test key on this.
-    const GOLDEN_V2_DIGEST_HEX: &str = "c43c4a6122eec81c87fe3db87a38af181666ce2f49b3b009f7eb3b9e5baeb3e6";
+    /// (the wardend-only bundle's fold). Re-pinned at D6 census landing:
+    /// the HSM key-registry census folded into the v2 walk moves the digest
+    /// from the census-less c43c4a61 (the D4 empty-row-set fold) to
+    /// 554a8a18. v1 stays byte-identical at 1a6c06ff — the census entered
+    /// v2 ONLY (the freeze witness in the v1 golden test). The JS face +
+    /// the fixture parity test key on this.
+    const GOLDEN_V2_DIGEST_HEX: &str = "554a8a181fde344b1d3d79e934defe2146b371d0e021699b1592f5e7697bc74c";
 
     // (za) D4 ROWS-FOLD DIFFERENTIALS. The whole point of folding the
     //     other channels' rows into the wardend signature is that a bundle

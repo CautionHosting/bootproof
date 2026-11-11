@@ -19,7 +19,17 @@ pub const SW: &str = include_str!("../assets/system_health/verify.js");
 /// coexist in one verify.js, so this is the FIRST value covering BOTH. It is
 /// DERIVED from the merged bytes (sha256sum of the rebased asset), NOT
 /// hand-copied; never bake any historical value here. On-chain value chain:
-///   c866486f THIS (D4 rows-fold: canonicalDocBytesV2 gains the bundle's
+///   5e50e4bb THIS (D6 census: canonicalDocBytesV2 gains the HSM
+///            key-registry census (v2-only, AFTER user_data, BEFORE the rows
+///            fold — the census fold in verify.js + bootproof.js crypto
+///            region, both byte-identical). The fold moves the fixture v2
+///            vector 68df3fae -> 36320364 and the plugin empty-rows golden
+///            c43c4a61 -> 554a8a18. v1 is byte-BLIND to the census, so the
+///            v1 freeze vectors (fixture c957..., plugin 1a6c06ff) are
+///            UNCHANGED — the freeze witness that the census entered v2
+///            only. verify.js crypto region grew 75756 -> 76694 bytes
+///            (+938 for the one census-walk block).)
+///   c866486f (D4 rows-fold: canonicalDocBytesV2 gains the bundle's
 ///            OTHER channels' rows (drop/swap close); the wardend row is
 ///            excluded, every other row present-tagged + SHA-256'd +
 ///            content-sorted into the v2 walk. The fixture's 68df3fae...
@@ -45,7 +55,7 @@ pub const SW: &str = include_str!("../assets/system_health/verify.js");
 /// Footnote: 0013e67f was the footer-only value on the pre-rebase branch tip
 /// 924d33f; the rebase onto 655b202 REWROTE that commit, so 0013e67f never
 /// landed on this chain and is an off-chain orphan, not a predecessor.)
-pub const SW_SHA256: &str = "c866486ff280e7eda96682d9acc1eac08e522dd2988bf38da161eeb5c3de59a3";
+pub const SW_SHA256: &str = "5e50e4bb747b7a3444cfa828bb7f6f0e0967c5ec205c1ae4732466461ee1669f";
 
 pub mod schema;
 /// The single-file pivot: the canonical bootproof.html (the pending-first

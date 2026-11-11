@@ -469,6 +469,27 @@ const canonicalFieldBytes = (doc, withUserData) => Buffer.concat([
     Buffer.from(u.sha256),
     dOpt(u.text, (t) => dBytes(Buffer.from(t, 'utf8'))),
   ])) : Buffer.alloc(0),
+  // D6 (bake-11): the HSM key-registry census, in v2's byte stream ONLY
+  // (AFTER user_data, BEFORE the rows section — the Rust
+  // canonical_doc_digest_v2 position). v1 never feeds it, so the historical
+  // v1 digest stays byte-identical (the freeze witness). One row per named
+  // secret: name, two bools, optional key_id, optional proto, an operations
+  // list, optional public — the digest_key_registry_row mirror.
+  withUserData ? Buffer.concat([
+    u32((doc.key_registry || []).length),
+    ...(doc.key_registry || []).map((r) => Buffer.concat([
+      dBytes(Buffer.from(r.name, 'utf8')),
+      dBool(r.sealed),
+      dBool(r.pcr_gated),
+      dOpt(r.key_id, (s) => dBytes(Buffer.from(s, 'utf8'))),
+      dOpt(r.proto, (s) => dBytes(Buffer.from(s, 'utf8'))),
+      Buffer.concat([
+        u32(r.operations.length),
+        ...r.operations.map((op) => dBytes(Buffer.from(op, 'utf8'))),
+      ]),
+      dOpt(r.public, (s) => dBytes(Buffer.from(s, 'utf8'))),
+    ])),
+  ]) : Buffer.alloc(0),
 ]);
 // D4 rows-fold (the batch that closes the drop/swap window): the wardend
 // doc's signature binds the OTHER channels' rows. Mirror of the Rust
@@ -549,6 +570,32 @@ const wardendDocObj = {
   // HSM signature now covers its SHA-256 commitment. The metadata row
   // keeps its server-asserted tier law untouched.
   user_data: { sha256: u8arr(UDATA_SHA), text: UDATA_TEXT },
+  // D6 (bake-11): the HSM key-registry census (the v2-folded section). Two
+  // rows exercise BOTH presence arms of every Option: a fully-managed
+  // persist-gated pkcs11 signing key (key_id / proto / public all present,
+  // non-empty operations, both bools true) and an unmanaged secret (a name
+  // in the store no unit ACL declares: every Optional absent, empty ops,
+  // both bools false). All-STRING fields (name/key_id/proto/operations/
+  // public), so NO BigInt/2^53 landmine — the census never needs the token
+  // path key_acls uses. The fold treats `public` as opaque bytes (a T2
+  // daemon-attested value the verifier never re-derives).
+  key_registry: [
+    {
+      name: 'bastiond-tls',
+      sealed: true,
+      pcr_gated: true,
+      key_id: 'persist',
+      proto: 'pkcs11',
+      operations: ['sign', 'decrypt', 'generate_keypair'],
+      public: '04' + '11'.repeat(32) + '22'.repeat(32),
+    },
+    {
+      name: 'orphan:secret',
+      sealed: false,
+      pcr_gated: false,
+      operations: [],
+    },
+  ],
 };
 // The canonical wardend doc bytes: what BOTH verifiers decode, what the
 // fold measures, what a byte-level tamper must break.
@@ -672,11 +719,13 @@ const WARDEND_DOC_SIG = signDetPrehashed(HSM.pub, HSM.d, WARDEND_DOC_DIGEST);
 // D4 rows-fold parity pin (the cross-implementation witness for the rows
 // fold): the JS canonicalDocDigestV2 over the fixture doc + nonce + rows
 // MUST equal the Rust canonical_doc_digest_v2 recomputed in the plugin
-// integration test. 68df3fae... supersedes the pre-rows v2 vector
-// 89b908551ca4c85ed0166130c0ff2b0427b68140d5fafd1f8fb1557608dedfd8 (the
-// rows fold appended to the v2 walk moves the digest). A JS/Rust fold drift
-// throws HERE at generation, before any fixture is written.
-const FIXTURE_DOC_DIGEST_V2_HEX = "68df3fae3b466f8b189bb059b1db0dc6c9715eacce8c44ff515572600f163023";
+// integration test. 36320364... supersedes the census-less v2 vector
+// 68df3fae3b466f8b189bb059b1db0dc6c9715eacce8c44ff515572600f163023 (the D6
+// HSM key-registry census folded into the v2 walk moves the digest; v1 stays
+// byte-identical at c957... — the freeze witness above proves the census
+// entered v2 ONLY). A JS/Rust fold drift throws HERE at generation, before
+// any fixture is written.
+const FIXTURE_DOC_DIGEST_V2_HEX = "36320364c54ffe6175b7869142a0d9c0e5f9838e2add340726c66fce9bb31c38";
 if (hexOf(WARDEND_DOC_DIGEST) !== FIXTURE_DOC_DIGEST_V2_HEX) {
   throw new Error(
     'digest v2 rows-fold parity FAILED: the JS canonicalDocDigestV2 drifted from the pinned Rust vector\n' +

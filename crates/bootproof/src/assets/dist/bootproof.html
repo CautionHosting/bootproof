@@ -1239,6 +1239,26 @@ function canonicalFieldBytes(doc, withUserData) {
     const ops = k.operations || [];
     aclParts.push(concat(u64beBig(k.handle), concat.apply(null, [u32be(ops.length)].concat(ops.map(dBytes))), dU32s(k.pcr_policy)));
   }
+  // D6 (bake-11): the HSM key-registry census rows (the v2-only section, folded
+  // AFTER user_data and BEFORE the rows section — the Rust
+  // canonical_doc_digest_v2 position). One row per named secret: name, two
+  // bools, optional key_id, optional proto, an operations list, optional
+  // public — the digest_key_registry_row mirror. v1 never feeds this section,
+  // so the historical v1 bytes are untouched (the freeze witness).
+  const census = d.key_registry || [];
+  const censusParts = [u32be(census.length)];
+  for (const r of census) {
+    const cops = r.operations || [];
+    censusParts.push(concat(
+      dBytes(r.name),
+      dBool(r.sealed),
+      dBool(r.pcr_gated),
+      dOpt(r.key_id, dBytes),
+      dOpt(r.proto, dBytes),
+      concat.apply(null, [u32be(cops.length)].concat(cops.map(dBytes))),
+      dOpt(r.public, dBytes),
+    ));
+  }
   const pcr = d.pcr_policy;
   return concat(
     dOpt(d.seal_state, (s) => concat(new Uint8Array([s.posture === "sealed" ? 1 : 0]), dBytes(s.state))),
@@ -1264,6 +1284,7 @@ function canonicalFieldBytes(doc, withUserData) {
     // doc never share a digest and None != Some(empty). Absent section =
     // the 0x00 tag alone.
     withUserData ? dOpt(d.user_data, (u) => concat(dRaw(u.sha256), dOpt(u.text, (t) => dBytes(t)))) : new Uint8Array(0),
+    withUserData ? concat.apply(null, censusParts) : new Uint8Array(0),
   );
 }
 function canonicalDocBytes(doc) {
