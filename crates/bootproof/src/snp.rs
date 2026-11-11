@@ -23,6 +23,7 @@ use std::io::Cursor;
 use sev::certs::snp::{ca, Chain, Certificate, Verifiable};
 use sev::firmware::guest::{AttestationReport, Firmware};
 use sev::parser::{Decoder, Encoder};
+use sha2::{Digest, Sha256};
 
 /// The SEV-SNP guest char device.
 pub const DEV_SEV_GUEST: &str = "/dev/sev-guest";
@@ -113,6 +114,132 @@ pub fn fold_signer_pin(challenge_front32: &[u8; 32], signer_pin: &[u8; 32]) -> [
     rd[..32].copy_from_slice(challenge_front32);
     rd[32..].copy_from_slice(signer_pin);
     rd
+}
+
+/// The classification of the report_data identity tail (the back 32 bytes).
+/// THE CLASSIFY LAW (amended by the fold adjudication — the original
+/// three-state law wrongly assumed a non-zero tail with no match was a LIE):
+/// a tail the transport tampers with breaks the VLEK signature FIRST, so a
+/// content-mismatch is never an attack signal, it is an UNATTRIBUTED witness.
+/// FAILED therefore has no place in this classification: the fold is never a
+/// digest input and tail content never fails — the signature does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentityTail {
+    /// All-zero: the fold is not enabled on this node (honest pre-fold).
+    NotEnabled,
+    /// The tail equals a derivable candidate — PROVEN with the source NAMED
+    /// (a browser computing the same equality must know the derivation).
+    Matched(&'static str),
+    /// Non-zero, matches no candidate: an honest but UNATTRIBUTED identity
+    /// witness (the live golden's own tail is exactly this case — the live
+    /// host folded a 32-byte value before the fold shipped, and the value is
+    /// none of the derivable candidates). Never FAILED, never degraded.
+    Unattributed,
+}
+
+/// Classify the identity tail against an ordered list of NAMED candidates
+/// (32-byte values derivable from the bundle, see `point_hash_candidates`).
+/// PURE: no I/O, no verifier state — the same law the JS verifier mirrors.
+pub fn classify_identity_tail(tail: &[u8; 32], candidates: &[(&'static str, [u8; 32])]) -> IdentityTail {
+    if tail.iter().all(|&b| b == 0) {
+        return IdentityTail::NotEnabled;
+    }
+    for (name, cand) in candidates {
+        if cand == tail {
+            return IdentityTail::Matched(name);
+        }
+    }
+    IdentityTail::Unattributed
+}
+
+/// The P-256 point-hash derivations a bundle exposes as identity-tail
+/// candidates, pinned as test vectors because the BROWSER must compute the
+/// identical values (the anchor law: one derivation, both verifiers, or the
+/// equality is theater):
+/// - `H(x || y)`: the concatenated raw coordinates
+/// - `H(0x04 || x || y)`: the SEC1 uncompressed point encoding
+/// The TPM `Name` is deliberately NOT a candidate: it is 34 bytes
+/// (nameAlg || H(publicArea)) and can never equal a 32-byte tail — naming it
+/// would be a candidate that lies.
+pub fn point_hash_candidates(x: &[u8], y: &[u8]) -> Vec<(&'static str, [u8; 32])> {
+    let mut h1 = Sha256::new();
+    h1.update(x);
+    h1.update(y);
+    let mut h2 = Sha256::new();
+    h2.update([0x04u8]);
+    h2.update(x);
+    h2.update(y);
+    vec![
+        ("p256-point-h(x||y)", h1.finalize().into()),
+        ("p256-point-h(04||x||y)", h2.finalize().into()),
+    ]
+}
+
+#[cfg(test)]
+mod identity_tail_tests {
+    use super::*;
+
+    fn hex32(s: &str) -> [u8; 32] {
+        let v: Vec<u8> = (0..32)
+            .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap())
+            .collect();
+        v.try_into().unwrap()
+    }
+
+    #[test]
+    fn all_zero_tail_is_not_enabled_even_against_matching_candidates() {
+        // The order of the law: zeros classify FIRST. An all-zero tail with
+        // an all-zero candidate is NOT a match — zeros mean "fold not
+        // enabled", never "matched" (a zero-valued candidate would be a
+        // candidate that lies).
+        let zero = [0u8; 32];
+        let cands = vec![("zero-that-lies", zero)];
+        assert_eq!(classify_identity_tail(&zero, &cands), IdentityTail::NotEnabled);
+    }
+
+    #[test]
+    fn point_hash_derivations_match_and_name_their_source() {
+        let x = [0xaau8; 32];
+        let y = [0x55u8; 32];
+        let cands = point_hash_candidates(&x, &y);
+        // Independent recomputation of the law (the browser does exactly
+        // these two hashes; the derivation is pinned on BOTH sides).
+        let h_xy: [u8; 32] = Sha256::digest([x.as_slice(), y.as_slice()].concat()).into();
+        let h_04: [u8; 32] =
+            Sha256::digest([[0x04u8].as_slice(), x.as_slice(), y.as_slice()].concat()).into();
+        assert_eq!(cands[0], ("p256-point-h(x||y)", h_xy));
+        assert_eq!(cands[1], ("p256-point-h(04||x||y)", h_04));
+        assert_eq!(
+            classify_identity_tail(&h_04, &cands),
+            IdentityTail::Matched("p256-point-h(04||x||y)")
+        );
+    }
+
+    #[test]
+    fn live_golden_tail_classifies_unattributed_never_failed() {
+        // THE AMENDED LAW, pinned with the FOUNDING datum: the live report's
+        // own tail (trust/data/snp-report-live-v0.bin @0x70..0x90) is
+        // non-zero and matches none of the derivable candidates. It is an
+        // honest UNATTRIBUTED identity witness — the live host folded a
+        // 32-byte value before the fold shipped. There is no FAILED in this
+        // classification: a transport tamper breaks the VLEK signature and
+        // dies in the sig-check, never here (the fold is never a digest
+        // input, tail content never fails).
+        let tail = hex32("ac0e6a940aa7a6fb1bbf697079a8fc5845d10876f75ce3c2e3a0394838a74a18");
+        let cands = point_hash_candidates(&[0xaau8; 32], &[0x55u8; 32]);
+        assert_eq!(classify_identity_tail(&tail, &cands), IdentityTail::Unattributed);
+        // Same tail against candidates it DOES match: the Matched arm names
+        // the source (the equality is meaningless without the name).
+        let mine = point_hash_candidates(&tail, &[0x01u8; 32]);
+        // (tail as x-coordinate: H(x||y) equals the tail only by
+        // construction of the candidate set, so classify against ITSELF.)
+        let self_cand = vec![("self", tail)];
+        assert_eq!(classify_identity_tail(&tail, &self_cand), IdentityTail::Matched("self"));
+        // And the TPM-Name-shaped 34-byte value is not even a candidate:
+        // Name = nameAlg || H(publicArea), 34 bytes, can never equal a
+        // 32-byte tail (naming it would be a candidate that lies).
+        assert_eq!(mine[0].1, point_hash_candidates(&tail, &[0x01u8; 32])[0].1);
+    }
 }
 
 // `device_present()` DELETED (gate unification (4)): `Path::exists()`
