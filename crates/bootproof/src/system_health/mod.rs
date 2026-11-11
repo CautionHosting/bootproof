@@ -66,10 +66,14 @@ pub const SW: &str = include_str!("../assets/system_health/verify.js");
 ///   4f19d4fb at 0b52091 (I-2b whole-doc-signature gate + canonical_doc_digest)
 ///   b5f422f4 (the result.html contract fix)
 ///   5b270efc267e01b12d5145c94a508895381c1da57aabad18555c91f57ca23ad5 (pre-pagefix)
+///   e8c7c0ce9de1d47ffafd319f446ddd6579bf7d24ba154a2df21f5f1418ada480 (pre-fold:
+///            the identity rows were the AMI-2 cpu/chip pair only; the bake-11
+///            SPKI tail fold adds the snp.identity_tail sub + the
+///            publishedPin threading into checkSnp)
 /// Footnote: 0013e67f was the footer-only value on the pre-rebase branch tip
 /// 924d33f; the rebase onto 655b202 REWROTE that commit, so 0013e67f never
 /// landed on this chain and is an off-chain orphan, not a predecessor.)
-pub const SW_SHA256: &str = "e8c7c0ce9de1d47ffafd319f446ddd6579bf7d24ba154a2df21f5f1418ada480";
+pub const SW_SHA256: &str = "30f709c87311a4cd6fb8c0a70f987f749446fd0ba387326310806739c2bef82f";
 
 pub mod schema;
 /// The single-file pivot: the canonical bootproof.html (the pending-first

@@ -107,6 +107,7 @@ function drive(args, timeout) {
     '--expect-row', 'wardend_state_chain',
     '--expect-row', 'nonce_freshness',
     '--expect-row', 'identity_link=NOT PROVEN',
+    '--expect-row', 'snp.identity_tail=NOT PROVEN',
     '--expect-row', 'user_data=SERVER-ASSERTED',
     '--expect-row', 'seal_state=SERVER-ASSERTED',
     '--expect-row', 'cert_chain=NOT PROVEN',
@@ -122,6 +123,11 @@ function drive(args, timeout) {
   }
   const idv = j.rows.identity_link && j.rows.identity_link.verdict;
   if (idv !== 'NOT PROVEN') fail(`identity_link verdict ${idv} != NOT PROVEN (fixture has no leaf; ruling iii)`);
+  // The bake-11 fold crosswalk law at browser scope: the tail row is NOT
+  // PROVEN on every fixture (browser-trusted equality waits for #19). A
+  // PROVEN here is the driver failing the browser for overclaiming.
+  const itv = j.rows['snp.identity_tail'] && j.rows['snp.identity_tail'].verdict;
+  if (itv !== 'NOT PROVEN') fail(`snp.identity_tail verdict ${itv} != NOT PROVEN (crosswalk law: no browser-trusted attribution before #19)`);
   // The lifecycle rows: flipped out of PENDING by the pass (the demo's
   // witness set — a row still PENDING after a finished pass is the silent
   // blank the pending-first pivot must never ship).

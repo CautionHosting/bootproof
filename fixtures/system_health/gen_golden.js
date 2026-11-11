@@ -833,6 +833,26 @@ const tChip = clone(envelope);   // chip-tamper (AMI-2): flip one CHIP_ID byte.
   tChip.bundle.evidence[0].doc = doc.toString('base64');
 }
 
+// TAMPER FIXTURE (bake-11 fold): the STRUCTURAL fold-mismatch carrier. The
+// identity tail (report_data[32..64] == report bytes 0x70..0x90) is ZEROED.
+// This is NOT a clean NotEnabled golden and never can be: the live report is
+// firmware-SIGNED with a non-zero tail, so zeroing it breaks the VLEK
+// signature -- the report lands on the SIG-FAIL path. That IS the point: it
+// is the structural proof that tail content never PASSES a broken signature
+// (the content-vs-signature divergence class -- Rust failed_facts NOT-PROVENs
+// ALL FOUR facts including snp_identity_tail; JS memory_encryption FAILED,
+// identity subs NOT PROVEN; agreement on the REJECTION, never the tier).
+// A CLEAN zero-tail NotEnabled golden requires a firmware-signed zero tail:
+// the field carrier at bake-11 boot-N (a fold-off boot), never a fixture we
+// mint. TAMPER-LABELED in the filename so no later reader mistakes it for a
+// clean golden.
+const tTail = clone(envelope);   // tail-zero-tamper (bake-11 fold)
+{
+  const doc = Buffer.from(tTail.bundle.evidence[0].doc, 'base64');
+  for (let i = 0x70; i < 0x90; i++) doc[i] = 0; // zero the folded tail only
+  tTail.bundle.evidence[0].doc = doc.toString('base64');
+}
+
 const tLog = clone(envelope);    // log-tamper: flip a byte in entry 1's op.
 {
   const docStr = Buffer.from(tLog.bundle.evidence[2].doc, 'base64').toString();
@@ -884,6 +904,7 @@ const write = (name, obj) => fs.writeFileSync(path.join(OUT, name), JSON.stringi
 write('golden.json', envelope);
 write('golden.snp-tamper.json', tSnap);
 write('golden.chip-tamper.json', tChip);
+write('golden.tail-zero-tamper.json', tTail);
 write('golden.log-tamper.json', tLog);
 write('golden.missing-snp.json', tNoSnp);
 write('golden.unsigned-doc.json', tNoSig);

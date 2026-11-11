@@ -607,11 +607,13 @@ function snpIdentitySubs(subs, r) {
   const roll = subs.some(function (x) { return x.name === "snp.report_sig" && x.status === PROVEN; });
   if (!r) {
     const why = "snp report NOT verified (identity bytes unattested)";
-    return [sub("snp.cpu_identity", NOT_PROVEN, why), sub("snp.chip_identity", NOT_PROVEN, why)];
+    return [sub("snp.cpu_identity", NOT_PROVEN, why), sub("snp.chip_identity", NOT_PROVEN, why),
+            sub("snp.identity_tail", NOT_PROVEN, why)];
   }
   if (!roll) {
     const why = "snp report signature NOT proven: identity bytes unattested";
-    return [sub("snp.cpu_identity", NOT_PROVEN, why), sub("snp.chip_identity", NOT_PROVEN, why)];
+    return [sub("snp.cpu_identity", NOT_PROVEN, why), sub("snp.chip_identity", NOT_PROVEN, why),
+            sub("snp.identity_tail", NOT_PROVEN, why)];
   }
   const cpu = "CPUID family " + r.cpuid[0] + " model " + r.cpuid[1] + " stepping " + r.cpuid[2] +
     "; guest_svn " + r.svn + "; reported_tcb " + bufToHex(r.reportedTcb) + " (bytes @0x180)";
@@ -623,23 +625,54 @@ function snpIdentitySubs(subs, r) {
       "): chip identity not reportable on this firmware generation";
   return [sub("snp.cpu_identity", PROVEN, cpu), sub("snp.chip_identity", chipOk ? PROVEN : NOT_PROVEN, chipWhy)];
 }
-function finishSnp(subs, r, emitIdentity) {
+// THE IDENTITY-TAIL ROW (bake-11 fold). report_data[32..64] rides the VLEK
+// signature, so after snp.report_sig proves it the tail bytes are
+// tamper-evident by construction. The classify law mirrors
+// bootproof::snp::classify_identity_tail EXACTLY: tail content NEVER fails
+// (the signature fails, not the content). All-zero => the fold is not
+// enabled; non-zero => an unattributed witness. At browser trust the
+// candidate set the ROW can attribute is EMPTY until #19 (the operator
+// manifest) lands the out-of-band expected pin: the envelope's published
+// pin arrives over the SAME origin an interposer controls, so even a
+// byte-equal tail is NOT a browser-trusted identity — it is rendered with
+// the same-attacker tier-label, never PROVEN. NOT PROVEN on every fixture:
+// the Rust core reaches the same NOT PROVEN through an empty candidate set
+// (it must not parse the platform key), so the crosswalk holds on every
+// golden including the future field golden whose tail equals the real pin
+// (both sides stay NOT PROVEN; attribution is a #19-era rendering). The
+// reason NAMES the measured tail hex (the auditor law).
+function snpIdentityTailSub(r, publishedPin) {
+  const tail = r.reportData.subarray(32, 64);
+  const tailHex = bufToHex(tail);
+  if (tail.every(function (b) { return b === 0; })) {
+    return sub("snp.identity_tail", NOT_PROVEN,
+      "identity fold not enabled (report_data[32..64] all zero): this bundle predates the SPKI tail fold, tier-1 key binding absent");
+  }
+  const eq = !!publishedPin && tailHex === publishedPin;
+  return sub("snp.identity_tail", NOT_PROVEN,
+    "identity tail " + tailHex + " unattributed" +
+    (eq ? " (== published identity.attest_signer_spki_sha256 — same-attacker bound until #19)"
+        : " (matches no value the browser can attribute without #19)"));
+}
+function finishSnp(subs, r, emitIdentity, publishedPin) {
   const fact = finishFact("memory_encryption", subs, "");
-  return { name: fact.name, status: fact.status, why: fact.why,
-           subs: emitIdentity ? subs.concat(snpIdentitySubs(subs, r)) : subs };
+  const extra = emitIdentity
+    ? subs.concat(snpIdentitySubs(subs, r)).concat(r ? [snpIdentityTailSub(r, publishedPin)] : [])
+    : subs;
+  return { name: fact.name, status: fact.status, why: fact.why, subs: extra };
 }
 
-async function checkSnp(ev, nonceHex) {
+async function checkSnp(ev, nonceHex, publishedPin) {
   const subs = [];
   if (!ev) {
-    return finishSnp([sub("snp.evidence", NOT_PROVEN, "no snp evidence in the bundle (non-SNP host, or /dev/sev-guest was absent at produce time)")], null, false);
+    return finishSnp([sub("snp.evidence", NOT_PROVEN, "no snp evidence in the bundle (non-SNP host, or /dev/sev-guest was absent at produce time)")], null, false, publishedPin);
   }
   const r = snpParse(ev.doc);
   if (!r) {
-    return finishSnp([sub("snp.evidence", FAILED, "snp doc is " + (ev.doc ? ev.doc.length : 0) + " bytes, expected the full 1184-byte v5 report")], null, true);
+    return finishSnp([sub("snp.evidence", FAILED, "snp doc is " + (ev.doc ? ev.doc.length : 0) + " bytes, expected the full 1184-byte v5 report")], null, true, publishedPin);
   }
   if (r.version !== 5) {
-    return finishSnp([sub("snp.evidence", FAILED, "snp report version " + r.version + ", expected 5")], null, true);
+    return finishSnp([sub("snp.evidence", FAILED, "snp report version " + r.version + ", expected 5")], null, true, publishedPin);
   }
   // 1. Nonce binding: report_data[0..32] echoes OUR fresh nonce.
   const nonceOk = bufToHex(r.reportData.subarray(0, 32)) === nonceHex;
@@ -661,10 +694,10 @@ async function checkSnp(ev, nonceHex) {
   if (!vlekDer || vlekDer.length === 0) {
     subs.push(sub("snp.vlek", NOT_PROVEN, "no VLEK anchor bundled (firmware did not provision one)"));
     subs.push(sub("snp.report_sig", NOT_PROVEN, "cannot check without the VLEK"));
-    return finishSnp(subs, r, true);
+    return finishSnp(subs, r, true, publishedPin);
   }
   const vlek = await decodeCert(vlekDer);
-  if (!vlek) return finishSnp([sub("snp.vlek", FAILED, "VLEK DER walk failed")].concat(subs), r, true);
+  if (!vlek) return finishSnp([sub("snp.vlek", FAILED, "VLEK DER walk failed")].concat(subs), r, true, publishedPin);
   const vlekCurve = spkiCurveIs(vlek.spkiDer, OID.CURVE_P384);
   subs.push(sub("snp.vlek", vlekCurve ? PROVEN : FAILED,
     vlekCurve ? "VLEK is an EC P-384 key" : "VLEK SPKI is not id-ecPublicKey/P-384"));
@@ -721,7 +754,7 @@ async function checkSnp(ev, nonceHex) {
         "the ASVK -> VLEK edge is RSA-PSS/SHA-384 (WebCrypto has no RSA-PSS): wardenctl verifies it under the pinned ASVK key"));
     }
   }
-  return finishSnp(subs, r, true);
+  return finishSnp(subs, r, true, publishedPin);
 }
 function spkiCurveIs(spkiDer, curveOidHex) {
   const spki = derTlv(spkiDer, 0);
@@ -1536,7 +1569,8 @@ async function runVerification(origin) {
   const evs = bundle.evidence || [];
   const snpEv = decodeEvidence(evs.find(function (e) { return e.channel === "snp"; }));
   const tpmEv = decodeEvidence(evs.find(function (e) { return e.channel === "tpm2"; }));
-  for (const r of [await checkSnp(snpEv, nonceHex), await checkTpm2(tpmEv, nonceHex, bundle), await checkStateLog(env)]) {
+  const snpPublishedPin = env.identity ? env.identity.attest_signer_spki_sha256 : null;
+  for (const r of [await checkSnp(snpEv, nonceHex, snpPublishedPin), await checkTpm2(tpmEv, nonceHex, bundle), await checkStateLog(env)]) {
     checks.push({ name: r.name, status: r.status, why: r.why });
     for (const s of r.subs || []) checks.push(s);
   }

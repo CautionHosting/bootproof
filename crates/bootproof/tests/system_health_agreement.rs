@@ -220,6 +220,12 @@ fn golden_two_verifiers_agree() {
         // sides).
         ("snp_cpu_identity", "snp.cpu_identity"),
         ("snp_chip_identity", "snp.chip_identity"),
+        // The bake-11 fold row: NOT PROVEN on every fixture at BOTH scopes
+        // (core: empty candidates by law; browser: equality is theater until
+        // #19), so the pair pins exact equality forever, field goldens
+        // included (both sides stay NOT PROVEN even when the tail equals the
+        // real pin -- attribution is platform/wardenctl scope).
+        ("snp_identity_tail", "snp.identity_tail"),
     ];
     for (rfact, jsub) in pairs {
         let r = rust.get(rfact).unwrap_or_else(|| panic!("rust emitted no {rfact} fact"));
@@ -241,6 +247,11 @@ fn golden_two_verifiers_agree() {
     // the golden lands on, so a generator change cannot quietly flip it.
     assert_eq!(rust.get("snp_cpu_identity").map(String::as_str), Some("PROVEN"));
     assert_eq!(rust.get("snp_chip_identity").map(String::as_str), Some("NOT PROVEN"));
+    // The founding Unattributed datum at e2e scope: the live report's tail
+    // (ac0e6a94…74a18, folded by the live host pre-design) matches nothing
+    // the core can derive -- the row is NOT PROVEN through the UNATTRIBUTED
+    // arm (never FAILED: content never fails, the signature does).
+    assert_eq!(rust.get("snp_identity_tail").map(String::as_str), Some("NOT PROVEN"));
     // The JS-only fact the core does not own here (wardend): must be
     // PROVEN on the JS side of the golden (the plugin test proves the
     // Rust side; the envelope-level fact must not diverge once the
@@ -336,7 +347,7 @@ fn missing_snp_exact_not_proven_agreement() {
     // state the chip-tamper test pins). This pair keeps the two states
     // distinguishable in the contract, tested.
     assert!(
-        !vf.facts.iter().any(|f| f.name == "snp_cpu_identity" || f.name == "snp_chip_identity"),
+        !vf.facts.iter().any(|f| f.name == "snp_cpu_identity" || f.name == "snp_chip_identity" || f.name == "snp_identity_tail"),
         "an absent snp channel emits NO identity rows: {vf:?}"
     );
 
@@ -348,7 +359,8 @@ fn missing_snp_exact_not_proven_agreement() {
     );
     let js_subs = js_subs(&g);
     assert!(
-        !js_subs.contains_key("snp.cpu_identity") && !js_subs.contains_key("snp.chip_identity"),
+        !js_subs.contains_key("snp.cpu_identity") && !js_subs.contains_key("snp.chip_identity")
+            && !js_subs.contains_key("snp.identity_tail"),
         "the JS side stays silent on the identity rows for an absent channel (the mirrored exception): {js_subs:?}"
     );
     // The fold broke (the dropped doc is missing from the fold input):
@@ -389,7 +401,7 @@ fn chip_tamper_not_provens_the_identity_rows_on_both() {
         errors.iter().any(|e| e.starts_with("snp:")),
         "rust must error the tampered snp channel: {errors:?}"
     );
-    for name in ["memory_encryption", "snp_cpu_identity", "snp_chip_identity"] {
+    for name in ["memory_encryption", "snp_cpu_identity", "snp_chip_identity", "snp_identity_tail"] {
         assert_eq!(
             rust.get(name).map(String::as_str),
             Some("NOT PROVEN"),
@@ -404,7 +416,7 @@ fn chip_tamper_not_provens_the_identity_rows_on_both() {
     let js = js_facts(&g);
     let js_subs = js_subs(&g);
     assert_eq!(js.get("memory_encryption").map(String::as_str), Some("FAILED (mapped)"));
-    for jsub in ["snp.cpu_identity", "snp.chip_identity"] {
+    for jsub in ["snp.cpu_identity", "snp.chip_identity", "snp.identity_tail"] {
         assert_eq!(
             js_subs.get(jsub).map(String::as_str),
             Some("NOT PROVEN"),
@@ -426,6 +438,88 @@ fn chip_tamper_not_provens_the_identity_rows_on_both() {
         Some("FAILED (mapped)"),
         "the report signature is the leg that dies"
     );
+}
+
+/// Tamper (tail-zero-tamper, bake-11 fold): the identity tail
+/// (report_data[32..64]) ZEROED on a report whose firmware signature covers
+/// the ORIGINAL non-zero tail. The expected outcome is pinned in the fixture
+/// generator (gen_golden.js): the VLEK signature MUST die — tail content
+/// never PASSES a broken signature. This is the structural proof of the
+/// amended classify law at e2e scope: the zeroed tail would classify
+/// NotEnabled on a VERIFIED report, but no report here verifies; the tier is
+/// the signature's verdict, never the content's. The documented
+/// content-vs-signature divergence class:
+///   * Rust: the snp channel errors; failed_facts NOT-PROVENs ALL FOUR
+///     facts (memory_encryption + cpu + chip + identity_tail).
+///   * JS: memory_encryption FAILED; the identity SUBs NOT PROVEN with the
+///     unattested-bytes reason (never FAILED: unattested, not proven-false).
+/// Agreement is asserted on the REJECTION, never the tier. (A CLEAN
+/// zero-tail NotEnabled golden is unmintable here by law: it needs a
+/// firmware-signed zero tail — the field carrier at bake-11 boot-N.)
+#[test]
+fn tail_zero_tamper_dies_on_the_signature_on_both() {
+    let g = fixture("golden.tail-zero-tamper.json");
+    let (rust, errors) = rust_facts(&g);
+    assert!(
+        errors.iter().any(|e| e.starts_with("snp:")),
+        "the zeroed tail breaks the VLEK signature: the snp channel must error: {errors:?}"
+    );
+    for name in ["memory_encryption", "snp_cpu_identity", "snp_chip_identity", "snp_identity_tail"] {
+        assert_eq!(
+            rust.get(name).map(String::as_str),
+            Some("NOT PROVEN"),
+            "the ONE signature failure NOT PROVENS all four owned facts ({name}) — \
+             the zeroed tail must NOT launder into a clean NotEnabled row"
+        );
+    }
+    // The tail bytes ARE the fold input (the snp doc hashes into PCR22):
+    // the tpm2 fold must break loudly too, like every snp-doc tamper.
+    assert!(
+        errors.iter().any(|e| e.starts_with("tpm2:")),
+        "the zeroed tail changed the fold input: the tpm2 channel must error: {errors:?}"
+    );
+
+    let js = js_facts(&g);
+    let js_subs = js_subs(&g);
+    assert_eq!(js.get("memory_encryption").map(String::as_str), Some("FAILED (mapped)"));
+    for jsub in ["snp.cpu_identity", "snp.chip_identity", "snp.identity_tail"] {
+        assert_eq!(
+            js_subs.get(jsub).map(String::as_str),
+            Some("NOT PROVEN"),
+            "the JS row {jsub} is NOT PROVEN (unattested), never FAILED, on the broken signature: {js_subs:?}"
+        );
+    }
+    // The tail row's REASON must carry the signature-gate wording, NOT the
+    // NotEnabled wording: the tail is zero, but the honest reading is
+    // "bytes unattested", not "fold not enabled" (which would imply the
+    // zeros were attested).
+    let why = harness_why(&g, "snp.identity_tail");
+    assert!(
+        why.contains("identity bytes unattested"),
+        "the tail-zero tamper row must name the signature gate, not the zero-rule: {why}"
+    );
+    // And the browser's fact-level rejection on the fold:
+    assert_eq!(js.get("tpm_quote").map(String::as_str), Some("FAILED (mapped)"));
+}
+
+/// The harness why-text for one sub (the verdict maps drop reasons; the
+/// tamper tests need the reason text to pin WHAT the row says, not just
+/// its status).
+fn harness_why(fixture: &Path, sub_name: &str) -> String {
+    let fixtures = fixtures_dir();
+    let out = Command::new("node")
+        .arg(fixtures.join("harness.js"))
+        .arg(fixture)
+        .output()
+        .expect("node runs the harness");
+    assert!(out.status.success(), "harness failed: {}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("harness JSON");
+    for s in v.get("subs").and_then(|f| f.as_array()).expect("subs array") {
+        if s.get("name").and_then(|n| n.as_str()) == Some(sub_name) {
+            return s.get("why").and_then(|w| w.as_str()).unwrap_or("").to_string();
+        }
+    }
+    panic!("no sub {sub_name} in the harness output");
 }
 
 /// Tamper 3 (log-tamper) in CORE scope: the flipped wardend doc must not
