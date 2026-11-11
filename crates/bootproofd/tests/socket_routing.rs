@@ -32,8 +32,8 @@ impl Channel for MockCh {
     fn name(&self) -> &'static str {
         "mockch"
     }
-    fn detect(&self) -> bool {
-        true
+    fn detect(&self) -> bootproof::channel::Presence {
+        bootproof::channel::Presence::Present
     }
     fn collect(&self, nonce: &[u8; 64], _od: &[Vec<u8>]) -> Result<Collected, String> {
         let mut doc = Vec::new();

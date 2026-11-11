@@ -19,7 +19,6 @@
 //! no OpenSSL, no temp files, no `Command::new`.
 
 use std::io::Cursor;
-use std::path::Path;
 
 use sev::certs::snp::{ca, Chain, Certificate, Verifiable};
 use sev::firmware::guest::{AttestationReport, Firmware};
@@ -95,11 +94,11 @@ pub fn nonce_binding_ok(report_data: &[u8; 64], nonce: &[u8; 32]) -> bool {
     report_data[..32] == nonce[..] && nonce.iter().any(|&b| b != 0)
 }
 
-/// Is the SNP guest device present on this host? (QEMU dev boxes and
-/// non-SNP hosts have no such device: the channel degrades to tpm2-only.)
-pub fn device_present() -> bool {
-    Path::new(DEV_SEV_GUEST).exists()
-}
+// `device_present()` DELETED (gate unification (4)): `Path::exists()`
+// swallows every stat errno, so a denial rendered as absence (the ABSENCE
+// LAW violation). The replacement is `channel::probe_device`
+// (errno-classified), driven by the `Snp` channel's configured path — the
+// only presence probe production uses.
 
 /// Issue `SNP_GET_EXT_REPORT` in-process against `/dev/sev-guest` with the
 /// caller's 64-byte `report_data` (the challenge binding) and the requested

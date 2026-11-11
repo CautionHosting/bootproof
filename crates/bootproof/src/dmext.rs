@@ -100,10 +100,14 @@ fn snp_gate() -> anyhow::Result<()> {
     use crate::channel::Channel;
 
     let ch = Snp::new();
-    if !ch.detect() {
+    // Fail-closed over the full Presence enum: only Present releases.
+    // Absent (ENOENT) and Denied (a stat refusal) BOTH refuse the key —
+    // a refusal is not a presence, and an absence never reaches the ioctl.
+    if !matches!(ch.detect(), crate::channel::Presence::Present) {
         anyhow::bail!(
-            "snp gate: /dev/sev-guest not present — refusing to release the key \
-             outside a confidential VM"
+            "snp gate: {} not present — refusing to release the key \
+             outside a confidential VM",
+            ch.device().display()
         );
     }
     let mut nonce = [0u8; 64];

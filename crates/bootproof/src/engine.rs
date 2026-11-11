@@ -295,7 +295,20 @@ pub fn verify_bundle(
         let (value, status) = match &st.outcome {
             crate::wire::ChannelOutcome::Collected => continue,
             crate::wire::ChannelOutcome::Absent => (
-                "daemon report: hardware absent at collect".to_string(),
+                // The absence reason rides the render (the ABSENCE LAW:
+                // an honest absence is SPECIFIC — it names the probed path
+                // and says ENOENT — so the page shows WHICH device was
+                // probed, and a config divergence is auditable from the
+                // page. A reasonless absence is what the bool-detect era
+                // produced; it no longer exists at the type level).
+                format!(
+                    "daemon report: hardware absent at collect: {}",
+                    if st.reason.is_empty() {
+                        "(no reason given)"
+                    } else {
+                        &st.reason
+                    }
+                ),
                 crate::wire::Status::Degraded,
             ),
             crate::wire::ChannelOutcome::Failed => (
@@ -487,8 +500,15 @@ mod tests {
         fn name(&self) -> &'static str {
             self.name
         }
-        fn detect(&self) -> bool {
-            self.present
+        fn detect(&self) -> crate::channel::Presence {
+            if self.present {
+                crate::channel::Presence::Present
+            } else {
+                crate::channel::probe_device(
+                    &format!("/nonexistent/bootproof-test/{}", self.name),
+                    crate::channel::is_chardev,
+                )
+            }
         }
         fn collect(
             &self,
@@ -621,7 +641,7 @@ mod tests {
         let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "416c88a378114a2001ce3fb942620c97a8018d26191aacc341f972550ae1ee12",
+            "8f5770c827361b9438cfe379e21ee362b57061aad1761d6d03e158689ea0a4c0",
             "the assembled bundle bytes digest moved: the assembly layout is a frozen contract, re-pin ONLY with the golden fixtures in the same commit"
         );
         // (Supersession edge: 3a9e8c47...459dd66 -> 416c88a3...0ae1ee12 at
@@ -629,6 +649,14 @@ mod tests {
         // serializes its Absent status row into the bundle bytes, which is
         // exactly the preserve-and-mark contract: the degradation is
         // data, not silence.)
+        // (Supersession edge 2: 416c88a3...0ae1ee12 -> 8f5770c8...9ea0a4c0
+        // at the ABSENCE-LAW landing — the Absent row's reason is no longer
+        // the bare "hardware absent": the law requires it to name the
+        // probed path + ENOENT, so the aws-cp mock's absence reason changed
+        // bytes. The golden fixtures carry ONLY Collected rows, so they are
+        // byte-stable across this change (re-generated fixtures match);
+        // the reason-text change is the point of the fix: an absence that
+        // cannot say WHY + WHERE is not honest, it is just short.)
         assert_eq!(b.channel_status.len(), 3, "every registered channel accounted");
         assert!(b.channel_status.iter().any(|s| s.channel == "aws-cp"
             && s.outcome == crate::wire::ChannelOutcome::Absent));

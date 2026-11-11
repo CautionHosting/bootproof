@@ -25,14 +25,13 @@
 //! TPM2B  per_pcr         (concatenated per-PCR digests, ascending index)
 //! ```
 
-use std::path::Path;
 
 use sha2::Sha256;
 use digest::Digest;
 
 use bootproof_tpm::{PcrSelection, Tpm, constants::alg};
 
-use crate::channel::{Channel, Collected};
+use crate::channel::{Channel, Collected, Presence};
 use crate::wire::{B64, Evidence, KeyInfo, Keys};
 
 /// The slot link PCR: the tpm2 channel extends it with the hash of the
@@ -85,8 +84,29 @@ impl Channel for Tpm2 {
         "tpm2"
     }
 
-    fn detect(&self) -> bool {
-        self.open().is_ok()
+    fn detect(&self) -> Presence {
+        // THE PRESENCE LAW (unification): the old shape was `self.open()
+        // .is_ok()` — open-then-decide, which (a) conflated presence with
+        // access (a DAC/seam-rot EACCES on the chardev rendered as
+        // "hardware absent" on the wire) and (b) opened the TPM twice per
+        // collect. Now: a metadata probe of the CONFIGURED chardev, with
+        // the ABSENCE LAW's errno rule (ENOENT is the only honest absence;
+        // every other stat errno is Denied -> a LOUD Failed row). The
+        // access verdict moved to collect(), where `self.open()` already
+        // produces an Err(reason) -> Failed row.
+        //
+        // The swtpm-over-TCP variant has NO device node to stat: presence
+        // there is an operator configuration, not a hardware question. It
+        // reports Present (the config says so) and any endpoint failure
+        // renders LOUD at collect as Failed — a TCP refusal is a denial,
+        // never an absence.
+        match &self.tcp {
+            Some(_) => Presence::Present,
+            None => crate::channel::probe_device(
+                &self.device.to_string_lossy(),
+                crate::channel::is_chardev,
+            ),
+        }
     }
 
     fn collect(&self, nonce: &[u8; 64], other_docs: &[Vec<u8>]) -> Result<Collected, String> {
@@ -280,12 +300,32 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-/// Detect whether a TPM is present on the usual device path.
+/// Detect which TPM device to register, THE ABSENCE LAW applied to the
+/// registration gate (the old shape used `Path::exists()`, which swallows
+/// every stat errno — a denial on the node or a parent traversal silently
+/// became "no TPM, channel inactive": absence dressed as a lie).
+///
+/// Registration rule:
+/// - first `Presence::Present` candidate wins (normal operation);
+/// - else the first `Presence::Denied` candidate is registered ANYWAY —
+///   "cannot prove absence" is NOT absence, and an unregistered channel
+///   would erase the row entirely; registered, it renders a LOUD Failed
+///   row naming the denial and the probed path;
+/// - else (every candidate answered ENOENT) the honest absence: the tpm2
+///   channel is not registered, and the required-channel gap on the
+///   verifier side owns the mandatory verdict.
 pub fn detect_device() -> Option<std::path::PathBuf> {
+    let mut denied: Option<std::path::PathBuf> = None;
     for p in ["/dev/tpm0", "/dev/tpmrm0"] {
-        if Path::new(p).exists() {
-            return Some(std::path::PathBuf::from(p));
+        match crate::channel::probe_device(p, crate::channel::is_chardev) {
+            Presence::Present => return Some(std::path::PathBuf::from(p)),
+            Presence::Denied(_) => {
+                if denied.is_none() {
+                    denied = Some(std::path::PathBuf::from(p));
+                }
+            }
+            Presence::Absent(_) => {}
         }
     }
-    None
+    denied
 }

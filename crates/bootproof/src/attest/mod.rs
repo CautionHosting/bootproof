@@ -34,7 +34,7 @@ use tower_service::Service;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, info, warn};
 
-use crate::channel::{challenge_from_nonce, Channel, Collected};
+use crate::channel::{challenge_from_nonce, Channel, Collected, Presence};
 use crate::collect::Transport;
 use crate::spki::pin_of_cert;
 use crate::wire::{B64, Bundle, Info, BUNDLE_V};
@@ -379,20 +379,48 @@ fn cors() -> CorsLayer {
         .allow_headers([CONTENT_TYPE])
 }
 
-/// Build the channel set for this host from an optional swtpm TCP endpoint.
-/// This is the SINGLE place the hardware-touching channels (/dev/tpm0,
-/// /dev/sev-guest) are registered on the host. It is used by the `collect`
-/// daemon (the SOLE device owner). The `attest` node itself never calls
-/// this: it routes challenges to the collect daemon over the UDS.
-pub fn build_channels(tcp: Option<&str>) -> Vec<Box<dyn Channel + Send + Sync>> {
+/// Build the channel set for this host from an optional swtpm TCP endpoint
+/// and the CONFIGURED device paths (gate unification (2): the configured
+/// path is the ONE thing presence probes and the serve path share — a
+/// default here silently probing a different device than the platform
+/// configured is the BUG-12 lineage, so callers thread their config and
+/// `None` is the honest default path).
+///
+/// This is the SINGLE place the hardware-touching channels (`/dev/tpm0`,
+/// `/dev/sev-guest`) are registered on the host. It is used by the
+/// `collect` daemon (the SOLE device owner). The `attest` node itself never
+/// calls this: it routes challenges to the collect daemon over the UDS.
+pub fn build_channels(
+    tcp: Option<&str>,
+    tpm_device: Option<&str>,
+    sev_device: Option<&str>,
+) -> Vec<Box<dyn Channel + Send + Sync>> {
     let mut channels: Vec<Box<dyn Channel + Send + Sync>> = Vec::new();
     match tcp {
         Some(addr) => {
-            channels.push(Box::new(tpm2::Tpm2::new("/dev/tpm0").with_tcp(addr.to_string())));
+            channels.push(Box::new(
+                tpm2::Tpm2::new(tpm_device.unwrap_or("/dev/tpm0")).with_tcp(addr.to_string()),
+            ));
             info!(tcp = %addr, "channel tpm2 active (swtpm over tcp)");
         }
         _ => {
-            if let Some(dev) = tpm2::detect_device() {
+            // With a configured path, probe THAT path (the absence law via
+            // `detect_device`'s law-gated scan for the default candidates).
+            // A configured path that is Denied registers anyway — the
+            // denial renders LOUD as a Failed row, never an absence.
+            let dev = match tpm_device {
+                Some(p) => match crate::channel::probe_device(p, crate::channel::is_chardev) {
+                    Presence::Absent(a) => {
+                        let reason = a.reason().to_string();
+                        info!(%reason, "configured TPM absent (ENOENT); tpm2 inactive");
+                        None
+                    }
+                    // Present or Denied: register (Denied -> loud Failed).
+                    _ => Some(std::path::PathBuf::from(p)),
+                },
+                None => tpm2::detect_device(),
+            };
+            if let Some(dev) = dev {
                 channels.push(Box::new(tpm2::Tpm2::new(dev)));
                 info!("channel tpm2 active");
             } else {
@@ -400,14 +428,22 @@ pub fn build_channels(tcp: Option<&str>) -> Vec<Box<dyn Channel + Send + Sync>> 
             }
         }
     }
-    // The snp channel is per-challenge in-process (SNP_GET_EXT_REPORT against
-    // /dev/sev-guest). Register it only when the device is present; on a
-    // non-SNP host the node serves tpm2-only and degrades gracefully.
-    if crate::snp::device_present() {
-        channels.push(Box::new(snp::Snp::new()));
-        info!("channel snp active (/dev/sev-guest)");
-    } else {
-        info!("no /dev/sev-guest; the snp channel is inactive");
+    // The snp channel is per-challenge in-process (SNP_GET_EXT_REPORT). The
+    // registration gate is the presence law on the CONFIGURED path: honest
+    // ENOENT absence degrades to tpm2-only; a Denied probe registers so
+    // the denial renders LOUD ("cannot prove absence" is NOT absence).
+    let sev = snp::Snp::at(sev_device.unwrap_or(crate::snp::DEV_SEV_GUEST));
+    // Capture the display string before the move into the boxed channel.
+    let sev_display = sev.device().display().to_string();
+    match <snp::Snp as Channel>::detect(&sev) {
+        Presence::Absent(a) => {
+            let reason = a.reason().to_string();
+            info!(%reason, "snp device absent; the snp channel is inactive");
+        }
+        Presence::Present | Presence::Denied(_) => {
+            channels.push(Box::new(sev));
+            info!(device = %sev_display, "channel snp active");
+        }
     }
     channels
 }
@@ -595,8 +631,8 @@ mod tests {
         fn name(&self) -> &'static str {
             "snp"
         }
-        fn detect(&self) -> bool {
-            true
+        fn detect(&self) -> crate::channel::Presence {
+            crate::channel::Presence::Present
         }
         fn collect(&self, nonce: &[u8; 64], _od: &[Vec<u8>]) -> Result<Collected, String> {
             let mut doc = Vec::new();

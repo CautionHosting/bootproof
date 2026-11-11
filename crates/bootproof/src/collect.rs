@@ -323,8 +323,19 @@ mod tests {
         fn name(&self) -> &'static str {
             self.name
         }
-        fn detect(&self) -> bool {
-            self.detect
+        fn detect(&self) -> crate::channel::Presence {
+            // The honest shape: a present mock reports Present; an absent
+            // mock probes a path that truly does not exist, so its Absent
+            // rides the real absence law (ENOENT through Absence::honest),
+            // never a fabricated reason.
+            if self.detect {
+                crate::channel::Presence::Present
+            } else {
+                crate::channel::probe_device(
+                    &format!("/nonexistent/bootproof-test/{}", self.name),
+                    crate::channel::is_chardev,
+                )
+            }
         }
         fn collect(&self, nonce: &[u8; 64], other_docs: &[Vec<u8>]) -> Result<Collected, String> {
             let _ = nonce;
