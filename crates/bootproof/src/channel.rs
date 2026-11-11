@@ -441,6 +441,19 @@ mod absence_law_tests {
         // makes the kernel answer EACCES for the traversal. This process
         // runs WITHOUT DAC_OVERRIDE (no capabilities), so the refusal is
         // the same class a sealed daemon hits on a locked /dev tree.
+        //
+        // Why THIS cell is the ONLY cell (chipmunk's ruling, closed
+        // unreachable-by-construction): under a METADATA probe, stat EACCES
+        // arises from PARENT-TRAVERSAL denial only — a node's own mode bits
+        // gate open, not stat (DAC on the node is an open-time question).
+        // The EACCES-on-the-node-itself cell was reachable under the
+        // RETIRED open-based detect: it is a property of the dead code. This
+        // cell does not merely prove the Err arm of metadata(); it proves
+        // the ONLY arm that arm can take. Caveat that keeps it honest: the
+        // cell becomes reachable again the moment any production path
+        // re-introduces opens-to-verify — the sensor inventory's remaining
+        // access-based rows are exactly what would resurrect it, so the
+        // inventory keeps this property checkable.
         let dir = scratch("trav");
         let locked = dir.join("locked");
         fs::create_dir(&locked).unwrap();
